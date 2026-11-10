@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+.env
+.env.*
+!.env.example
+.scan-results/
+.DS_Store
+*.sarif
+.idea/
+# Recorded MCP traffic from agent-latch-runtime (trace, payloads, events, gate results).
+# Ignore this output folder only. A pattern of "runtime/" would also hide the source
+# package src/agent_latch/runtime/, and these logs must not land in that package.
+runtime-logs/
+
+# Local-only testing tooling (attack demo modes, ad-hoc flags). Never committed.
+local/
