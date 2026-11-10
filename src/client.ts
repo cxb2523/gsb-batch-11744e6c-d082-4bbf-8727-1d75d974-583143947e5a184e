@@ -1,0 +1,2941 @@
+import { path } from './deps.ts';
+import { mkdir, writeFile, readFileSync } from './polyfill.ts';
+import { fetchRetry } from './utils.ts';
+import * as errors from './errors.ts';
+import type { ScrapeConfig } from './scrapeconfig.ts';
+import type { ScreenshotConfig } from './screenshotconfig.ts';
+import type { ExtractionConfig } from './extractionconfig.ts';
+import { BrowserConfig } from './browserconfig.ts';
+import { type AccountData, type ClassifyOptions, type ClassifyResult, ExtractionResult, ScrapeResult, ScreenshotResult } from './result.ts';
+import { log } from './logger.ts';
+import type {
+  Rec,
+  Vault,
+  VaultItem,
+  VaultItemCreate,
+  VaultLinkedService,
+  VaultLinkedServiceValue,
+  VaultProbeResult,
+  VaultProbeVault,
+  VaultSecret,
+  VaultServiceLink,
+  VaultServiceUpdate,
+  VaultSyncReport,
+} from './types.ts';
+import type { CrawlerConfig, CrawlerContentFormat } from './crawlerconfig.ts';
+import { REFRESH_MAX_INTERVAL, REFRESH_MIN_INTERVAL } from './crawlerconfig.ts';
+import {
+  CrawlerArtifact,
+  type CrawlerArtifactType,
+  CrawlerContents,
+  type CrawlerExtractResponse,
+  type CrawlerPromptAnswer,
+  type CrawlerPromptEvent,
+  type CrawlerRefreshEntry,
+  type CrawlerRefreshState,
+  type CrawlerSearchMode,
+  CrawlerSearchResponse,
+  CrawlerStatus,
+  CrawlerUrls,
+  parseCrawlerPromptStream,
+  parseCrawlerRefreshState,
+} from './crawlerresult.ts';
+import {
+  formatMonitoringDate,
+  type CloudBrowserMonitoringOptions,
+  type MonitoringMetricsOptions,
+  type MonitoringTargetMetricsOptions,
+} from './monitoringconfig.ts';
+import {
+  ScheduleAPIError,
+  type CreateScheduleRequest,
+  type ListSchedulesOptions,
+  type Schedule,
+  type UpdateScheduleRequest,
+} from './schedule.ts';
+
+/** ERR::<RESOURCE>::* → error-class taxonomy. */
+const RESOURCE_TO_ERROR: Record<string, new (message: string, args: Record<string, any>) => errors.ScrapflyError> = {
+  SCRAPE: errors.ScrapflyScrapeError,
+  WEBHOOK: errors.ScrapflyWebhookError,
+  PROXY: errors.ScrapflyProxyError,
+  SCHEDULE: errors.ScrapflyScheduleError,
+  ASP: errors.ScrapflyAspError,
+  SESSION: errors.ScrapflySessionError,
+  THROTTLE: errors.ScrapflyThrottleError,
+  CRAWLER: errors.ScrapflyCrawlerError,
+};
+
+/**
+ * Main entry point for the Scrapfly SDK.
+ *
+ * A single `ScrapflyClient` can be used to call every Scrapfly API
+ * (scrape, screenshot, extraction, crawler, monitoring, cloud browser).
+ * It is safe to share one instance across concurrent calls.
+ */
+export class ScrapflyClient {
+  /** Base URL of the Scrapfly REST API. */
+  public HOST = 'https://api.scrapfly.io';
+  /** Default Cloud Browser WebSocket host. */
+  public CLOUD_BROWSER_HOST = 'wss://browser.scrapfly.io';
+  /** Default Cloud Browser REST host (derived from the WS host). */
+  public CLOUD_BROWSER_API_HOST = 'https://browser.scrapfly.io';
+  private key: string;
+  private ua: string;
+  private cloudBrowserHost: string;
+  private cloudBrowserApiHost: string;
+  /** `fetch` implementation used by the client. Override for custom retries/tracing. */
+  fetch: typeof fetchRetry = fetchRetry;
+
+  /**
+   * Create a Scrapfly client.
+   *
+   * @param options.key Scrapfly API key.
+   * @param options.host Optional override for the REST API host.
+   * @param options.cloudBrowserHost Optional override for the Cloud Browser WS host.
+   * @throws {@link errors.BadApiKeyError} if `options.key` is not a non-empty string.
+   */
+  constructor(options: { key: string; host?: string; cloudBrowserHost?: string }) {
+    if (typeof options.key !== 'string' || options.key.trim() === '') {
+      throw new errors.BadApiKeyError('Invalid key. Key must be a non-empty string');
+    }
+    this.key = options.key;
+    if (options.host) {
+      // Trim trailing slash so callers can pass either form
+      this.HOST = options.host.replace(/\/+$/, '');
+    }
+    this.ua = 'Typescript Scrapfly SDK';
+    this.cloudBrowserHost = options.cloudBrowserHost || this.CLOUD_BROWSER_HOST;
+    this.cloudBrowserApiHost = options.cloudBrowserHost
+      ? options.cloudBrowserHost.replace('wss://', 'https://')
+      : this.CLOUD_BROWSER_API_HOST;
+  }
+
+  /**
+   * Raise appropriate error for given response and scrape result
+   */
+  errResult(response: Response, result: ScrapeResult): errors.ScrapflyError {
+    const error = result.result.error;
+    const message = error?.message ?? '';
+    // When success=false the authoritative error code lives in result.result.error.code
+    // (e.g. "ERR::SCRAPE::BAD_UPSTREAM_RESPONSE"). result.result.status is only "DONE"
+    // or a job-level error and does not carry the upstream-failure code.
+    const effectiveCode = (result.result.success === false && error?.code)
+      ? error.code
+      : result.result.status;
+    const args = {
+      code: effectiveCode,
+      http_status_code: result.result.status_code,
+      is_retryable: error?.retryable ?? false,
+      api_response: result,
+      resource: effectiveCode ? effectiveCode.split('::')[1] : null,
+      retry_delay: error?.retryable ? 5 : response.headers.get('X-Retry') ?? 5,
+      retry_times: 3,
+      documentation_url: error?.doc_url ?? 'https://scrapfly.io/docs/scrape-api/errors#api',
+    };
+    if (result.result.success === true) {
+      switch (args.http_status_code) {
+        case 500:
+          return new errors.ApiHttpServerError(message, args);
+        case 401:
+          return new errors.BadApiKeyError(message, args);
+        case 429:
+          return new errors.TooManyRequests(message, args);
+      }
+      const ResourceError = args.resource ? RESOURCE_TO_ERROR[args.resource] : undefined;
+      if (ResourceError) {
+        return new ResourceError(message, args);
+      }
+      if (args.resource) {
+        return new errors.ApiHttpClientError(message, args);
+      }
+    } else {
+      if (args.code === 'ERR::SCRAPE::BAD_UPSTREAM_RESPONSE') {
+        if (args.http_status_code >= 400 && args.http_status_code < 500) {
+          return new errors.UpstreamHttpClientError(message, args);
+        }
+        if (args.http_status_code >= 500 && args.http_status_code < 600) {
+          return new errors.UpstreamHttpServerError(message, args);
+        }
+      }
+      const ResourceError = args.resource ? RESOURCE_TO_ERROR[args.resource] : undefined;
+      if (ResourceError) {
+        return new ResourceError(message, args);
+      }
+    }
+    return new errors.ScrapflyError(message, args);
+  }
+
+  /** Build the typed per-part error for an API-generated batch error body. */
+  private batchApiErrorPartToError(
+    parsed: Record<string, unknown>,
+    partHeaders: Record<string, string>,
+  ): errors.ScrapflyError {
+    const code = typeof parsed.code === 'string' ? parsed.code : '';
+    const message = String(parsed.message ?? parsed.reason ?? 'API error');
+    const httpStatusCode =
+      typeof parsed.http_code === 'number'
+        ? parsed.http_code
+        : parseInt(partHeaders['x-scrapfly-scrape-status'] ?? '500', 10) || 500;
+    const isRetryable = parsed.retryable === true;
+
+    let documentationUrl: string | undefined;
+    if (parsed.links && typeof parsed.links === 'object' && !Array.isArray(parsed.links)) {
+      const values = Object.values(parsed.links as Record<string, string>);
+      if (values.length) documentationUrl = values[0];
+    }
+
+    const args = {
+      code,
+      http_status_code: httpStatusCode,
+      is_retryable: isRetryable,
+      resource: code ? code.split('::')[1] : null,
+      documentation_url: documentationUrl,
+    };
+
+    const ResourceError = args.resource ? RESOURCE_TO_ERROR[args.resource] : undefined;
+    if (ResourceError) {
+      return new ResourceError(message, args);
+    }
+
+    switch (httpStatusCode) {
+      case 401:
+        return new errors.BadApiKeyError(message, args);
+      case 429:
+        return new errors.TooManyRequests(message, args);
+    }
+
+    return httpStatusCode >= 500
+      ? new errors.ApiHttpServerError(message, args)
+      : new errors.ApiHttpClientError(message, args);
+  }
+
+  /**
+   * Handle clob and blob large objects
+   */
+  async handleLargeObjects(result: any, format: 'clob' | 'blob'): Promise<ScrapeResult> {
+    let response: Response;
+
+    try {
+      const url = new URL(result.content);
+      url.searchParams.set('key', this.key);
+      response = await this.fetch({
+        url: url.toString(),
+        method: 'GET',
+        headers: {
+          'user-agent': this.ua,
+          'accept-encoding': 'gzip, deflate, br',
+          accept: 'application/json',
+        },
+      });
+    } catch (e) {
+      log.error('error', e);
+      throw e;
+    }
+
+    if (!response.ok) {
+      const body = await response.text();
+      let parsed: unknown = null;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        // Not an API error: a proxy's page, say.
+      }
+      const envelope = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : { message: body.slice(0, 500) || response.statusText };
+      throw this.batchApiErrorPartToError(envelope, { 'x-scrapfly-scrape-status': String(response.status) });
+    }
+
+    let content;
+
+    if (format === 'clob') {
+      content = await response.text();
+      result.format = 'text';
+    }
+
+    if (format === 'blob') {
+      content = new Uint8Array(await response.arrayBuffer());
+      result.format = 'binary';
+    }
+
+    result.content = content;
+    return result;
+  }
+
+  /**
+   * Turn scrapfly API response to ScrapeResult or raise one of ScrapflyError
+   */
+  handleResponse(response: Response, result: ScrapeResult): ScrapeResult {
+    // success
+    log.debug('scrape log url: ', result.result.log_url);
+    // QUEUED: a scrape with a webhook, delivered to it later.
+    if (result.result.status === 'QUEUED' || (result.result.status === 'DONE' && result.result.success === true)) {
+      return result;
+    }
+    // something went wrong
+    throw this.errResult(response, result);
+  }
+
+  /**
+   * Retrieve Scrapfly account details
+   */
+  async account(): Promise<AccountData> {
+    log.debug('retrieving account info');
+    let response: Response;
+    try {
+      const url = new URL(this.HOST + '/account');
+      const params = { key: this.key };
+      url.search = new URLSearchParams(params).toString();
+      response = await this.fetch({
+        url: url.toString(),
+        method: 'GET',
+        headers: {
+          'user-agent': this.ua,
+          'accept-encoding': 'gzip, deflate, br',
+          accept: 'application/json',
+        },
+      });
+    } catch (e) {
+      log.error('error', e);
+      throw e;
+    }
+    const data: Rec<any> = await response.json() as Rec<any>;
+    if ('error_id' in data || Object.keys(data).length === 0) {
+      if (data.http_code == 401 || response.status == 401) {
+        throw new errors.BadApiKeyError(JSON.stringify(data));
+      }
+      throw new errors.ApiHttpClientError(JSON.stringify(data));
+    }
+    return data as AccountData;
+  }
+
+  /**
+   * Classify an already-fetched HTTP response for anti-bot blocking.
+   *
+   * Runs the same anti-bot detection pipeline used by live Scrapfly
+   * scrapes against a response you already have (from your own proxy,
+   * cache, etc). 1 API credit per call. See
+   * https://scrapfly.io/docs/scrape-api/classify for the full contract.
+   */
+  async classify(options: ClassifyOptions): Promise<ClassifyResult> {
+    if (!options || !options.url) {
+      throw new errors.ScrapflyError('classify: url is required');
+    }
+    if (
+      typeof options.statusCode !== 'number' ||
+      options.statusCode < 100 ||
+      options.statusCode > 599
+    ) {
+      throw new errors.ScrapflyError(
+        'classify: status_code must be a valid HTTP status in [100, 599]',
+      );
+    }
+
+    const body: Rec<unknown> = {
+      url: options.url,
+      status_code: options.statusCode,
+      method: options.method ?? 'GET',
+    };
+    if (options.headers && Object.keys(options.headers).length > 0) {
+      const hdrs: Rec<string> = {};
+      for (const [k, v] of Object.entries(options.headers)) {
+        hdrs[String(k)] = String(v);
+      }
+      body.headers = hdrs;
+    }
+    if (options.body !== undefined && options.body !== null) {
+      body.body = options.body;
+    }
+
+    const url = new URL(this.HOST + '/classify');
+    url.search = new URLSearchParams({ key: this.key }).toString();
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'POST',
+      headers: {
+        'user-agent': this.ua,
+        'accept-encoding': 'gzip, deflate, br',
+        accept: 'application/json',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+
+    const data = (await response.json()) as Rec<unknown>;
+    if (response.status >= 400 || 'error_id' in data) {
+      if (response.status == 401) {
+        throw new errors.BadApiKeyError(JSON.stringify(data));
+      }
+      throw new errors.ApiHttpClientError(JSON.stringify(data));
+    }
+
+    return {
+      blocked: Boolean(data.blocked),
+      antibot: (data.antibot ?? null) as string | null,
+      cost: Number(data.cost ?? 0),
+    };
+  }
+
+  // ── Monitoring API (Enterprise+ plan only) ──────────────────────
+  // The Monitoring API exposes per-product aggregates and per-target
+  // timeseries. Web Scraping / Screenshot / Extraction / Crawler share
+  // one shape (request-based) but live under different URL prefixes;
+  // Cloud Browser is session-based and exposes a distinct shape.
+  // See https://scrapfly.io/docs/monitoring#api
+
+  /** Dispatch an HTTP GET against a Monitoring API path with the given query params, parsing errors. */
+  private async monitoringRequest(path: string, params: Rec<string>): Promise<Rec<any>> {
+    const url = new URL(this.HOST + path);
+    url.search = new URLSearchParams(params).toString();
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'GET',
+      headers: {
+        'user-agent': this.ua,
+        'accept-encoding': 'gzip, deflate, br',
+        accept: 'application/json',
+      },
+    });
+    const data: Rec<any> = (await response.json()) as Rec<any>;
+    if ('error_id' in data) {
+      if (data.http_code == 401 || response.status == 401) {
+        throw new errors.BadApiKeyError(JSON.stringify(data));
+      }
+      throw new errors.ApiHttpClientError(JSON.stringify(data));
+    }
+    return data;
+  }
+
+  /** Build the query string for a request-based Monitoring API metrics endpoint. */
+  private buildMetricsParams(options: MonitoringMetricsOptions): Rec<string> {
+    const params: Rec<string> = {
+      key: this.key,
+      format: options.format ?? 'structured',
+    };
+    if (options.period !== undefined) params.period = options.period;
+    if (options.aggregation !== undefined && options.aggregation.length > 0) {
+      params.aggregation = options.aggregation.join(',');
+    }
+    if (options.includeWebhook) params.include_webhook = 'true';
+    return params;
+  }
+
+  /** Build the query string for a per-target Monitoring API endpoint. */
+  private buildTargetParams(options: MonitoringTargetMetricsOptions): Rec<string> {
+    if ((options.start && !options.end) || (!options.start && options.end)) {
+      throw new Error('You must provide both start and end date');
+    }
+    const params: Rec<string> = {
+      key: this.key,
+      domain: options.domain,
+      group_subdomain: String(options.groupSubdomain ?? false),
+    };
+    if (options.start && options.end) {
+      params.start = formatMonitoringDate(options.start);
+      params.end = formatMonitoringDate(options.end);
+    } else if (options.period !== undefined) {
+      params.period = options.period;
+    } else {
+      params.period = 'last24h';
+    }
+    if (options.includeWebhook) params.include_webhook = 'true';
+    return params;
+  }
+
+  /** Fetch Web Scraping API monitoring metrics (aggregate). */
+  async getMonitoringMetrics(options: MonitoringMetricsOptions = {}): Promise<Rec<any>> {
+    return this.monitoringRequest('/scrape/monitoring/metrics', this.buildMetricsParams(options));
+  }
+
+  /** Fetch Web Scraping API monitoring metrics for a single target domain. */
+  async getMonitoringTargetMetrics(options: MonitoringTargetMetricsOptions): Promise<Rec<any>> {
+    return this.monitoringRequest('/scrape/monitoring/metrics/target', this.buildTargetParams(options));
+  }
+
+  /** Fetch Screenshot API monitoring metrics (aggregate). */
+  async getScreenshotMonitoringMetrics(options: MonitoringMetricsOptions = {}): Promise<Rec<any>> {
+    return this.monitoringRequest('/screenshot/monitoring/metrics', this.buildMetricsParams(options));
+  }
+
+  /** Fetch Screenshot API monitoring metrics for a single target domain. */
+  async getScreenshotMonitoringTargetMetrics(options: MonitoringTargetMetricsOptions): Promise<Rec<any>> {
+    return this.monitoringRequest('/screenshot/monitoring/metrics/target', this.buildTargetParams(options));
+  }
+
+  /** Fetch Extraction API monitoring metrics (aggregate). */
+  async getExtractionMonitoringMetrics(options: MonitoringMetricsOptions = {}): Promise<Rec<any>> {
+    return this.monitoringRequest('/extraction/monitoring/metrics', this.buildMetricsParams(options));
+  }
+
+  /** Fetch Extraction API monitoring metrics for a single target domain. */
+  async getExtractionMonitoringTargetMetrics(options: MonitoringTargetMetricsOptions): Promise<Rec<any>> {
+    return this.monitoringRequest('/extraction/monitoring/metrics/target', this.buildTargetParams(options));
+  }
+
+  /** Fetch Crawler API monitoring metrics (aggregate). */
+  async getCrawlerMonitoringMetrics(options: MonitoringMetricsOptions = {}): Promise<Rec<any>> {
+    return this.monitoringRequest('/crawl/monitoring/metrics', this.buildMetricsParams(options));
+  }
+
+  /** Fetch Crawler API monitoring metrics for a single target domain. */
+  async getCrawlerMonitoringTargetMetrics(options: MonitoringTargetMetricsOptions): Promise<Rec<any>> {
+    return this.monitoringRequest('/crawl/monitoring/metrics/target', this.buildTargetParams(options));
+  }
+
+  /** Fetch Cloud Browser monitoring metrics (session-based aggregate). */
+  async getBrowserMonitoringMetrics(
+    options: CloudBrowserMonitoringOptions = {},
+  ): Promise<Rec<any>> {
+    return this.monitoringRequest('/browser/monitoring/metrics', this.buildBrowserParams(options));
+  }
+
+  /** Fetch Cloud Browser monitoring timeseries (per-minute session usage). */
+  async getBrowserMonitoringTimeseries(
+    options: CloudBrowserMonitoringOptions = {},
+  ): Promise<Rec<any>> {
+    return this.monitoringRequest('/browser/monitoring/metrics/timeseries', this.buildBrowserParams(options));
+  }
+
+  /** Build the query string for the session-based Cloud Browser Monitoring endpoints. */
+  private buildBrowserParams(options: CloudBrowserMonitoringOptions): Rec<string> {
+    if ((options.start && !options.end) || (!options.start && options.end)) {
+      throw new Error('You must provide both start and end date');
+    }
+    const params: Rec<string> = { key: this.key };
+    if (options.start && options.end) {
+      params.start = formatMonitoringDate(options.start);
+      params.end = formatMonitoringDate(options.end);
+    } else if (options.period !== undefined) {
+      params.period = options.period;
+    }
+    if (options.proxyPool !== undefined) params.proxy_pool = options.proxyPool;
+    return params;
+  }
+
+  /**
+   * Issue a single scrape command from a given scrape configuration
+   */
+  async scrape(config: ScrapeConfig): Promise<ScrapeResult | Response> {
+    log.debug('scraping', { method: config.method, url: config.url });
+    let response;
+    try {
+      const url = new URL(this.HOST + '/scrape');
+      const params = config.toApiParams({ key: this.key });
+      url.search = new URLSearchParams(params).toString();
+      response = await this.fetch({
+        url: url.toString(),
+        method: config.method,
+        headers: {
+          'user-agent': this.ua,
+          'content-type': config.method === 'POST'
+            ? config.headers?.['content-type'] ?? 'application/json'
+            : 'application/json',
+          'accept-encoding': 'gzip, deflate, br',
+          accept: 'application/json',
+        },
+        body: config.body,
+      });
+    } catch (e) {
+      log.error('error', e);
+      // Attach the scrape config to the thrown error for debuggability.
+      // The error is typed as `unknown` since TypeScript 4.4 strict catch
+      // clause variables, so we narrow to a mutable object before tagging.
+      if (e !== null && typeof e === 'object') {
+        (e as Record<string, unknown>).scrapeConfig = config;
+      }
+      throw e;
+    }
+    // Proxified mode: the API returns the raw upstream response (target's
+    // status, headers, body) instead of the JSON envelope. Return the raw
+    // fetch Response so callers can drive it like any HTTP response.
+    //
+    // DO NOT throw on non-2xx: the response status is the UPSTREAM target's
+    // status, not a Scrapfly system error. A 503 from the target is a
+    // legitimate proxified response, not an API failure.
+    //
+    // Callers inspect:
+    //   response.status — the upstream status
+    //   response.headers.get("x-scrapfly-reject-code") — Scrapfly error (if any)
+    //   response.headers.get("x-scrapfly-api-cost") — credits charged
+    if (config.proxified_response === true) {
+      // Error restoration: if X-Scrapfly-Reject-Code is present, the
+      // scrape failed. Reconstruct a typed error from the headers so
+      // callers get the same error interface as non-proxified mode.
+      const rejectCode = response.headers.get('x-scrapfly-reject-code');
+      if (rejectCode) {
+        const rejectDesc = response.headers.get('x-scrapfly-reject-description') ?? '';
+        const rejectRetryable = response.headers.get('x-scrapfly-reject-retryable') === 'true';
+        const retryAfter = rejectRetryable ? parseInt(response.headers.get('retry-after') ?? '0', 10) : 0;
+        const err = new errors.ApiHttpClientError(
+          `Proxified scrape error: ${rejectCode} — ${rejectDesc}`
+        );
+        (err as any).code = rejectCode;
+        (err as any).httpStatusCode = response.status;
+        (err as any).retryable = rejectRetryable;
+        (err as any).retryAfter = retryAfter;
+        (err as any).response = response;
+        throw err;
+      }
+      return response;
+    }
+    // HEAD responses have no body per HTTP spec — the API returns headers
+    // only. Build a ScrapeResult from the HTTP response headers and the
+    // local config, mirroring the Python SDK's HEAD handler.
+    if (config.method === 'HEAD') {
+      const responseHeaders: Record<string, string> = {};
+      response.headers.forEach((v, k) => { responseHeaders[k] = v; });
+      return this.handleResponse(
+        response,
+        new ScrapeResult({
+          config: config.toApiParams({ key: this.key }) as any,
+          context: {} as any,
+          result: {
+            status_code: response.status,
+            content: '',
+            format: 'text',
+            success: response.status >= 200 && response.status < 300,
+            status: 'DONE',
+            response_headers: responseHeaders,
+            request_headers: {},
+          } as any,
+          uuid: '',
+        }),
+      );
+    }
+    const data: Rec<any> = await response.json() as Rec<any>;
+    if ('error_id' in data || Object.keys(data).length === 0) {
+      if (data.http_code == 401 || response.status == 401) {
+        throw new errors.BadApiKeyError(JSON.stringify(data));
+      }
+      throw new errors.ApiHttpClientError(JSON.stringify(data));
+    }
+
+    const content_format = data.result.format;
+    if (content_format === 'clob' || content_format === 'blob') {
+      data.result = await this.handleLargeObjects(data.result, content_format);
+    }
+
+    const result = this.handleResponse(
+      response,
+      new ScrapeResult({
+        config: data.config,
+        context: data.context,
+        result: data.result,
+        uuid: data.uuid,
+      }),
+    );
+    return result;
+  }
+
+  /**
+  Concurrently scrape multiple configs
+  This is a async generator call it like this:
+
+    const results = [];
+    const errors = [];
+    for await (const resultOrError of client.concurrentScrape(configs)) {
+        if (resultOrError instanceof Error) {
+            errors.push(resultOrError);
+        } else {
+            results.push(resultOrError);
+        }
+    }
+
+  @param concurrencyLimit: if not set it will be taken from your account info
+  */
+  async *concurrentScrape(
+    configs: ScrapeConfig[],
+    concurrencyLimit?: number,
+  ): AsyncGenerator<ScrapeResult | Error | undefined, void, undefined> {
+    if (concurrencyLimit === undefined) {
+      const account = await this.account();
+      concurrencyLimit = account.subscription.usage.scrape.concurrent_limit;
+      log.info(`concurrency not provided - setting it to ${concurrencyLimit} from account info`);
+    }
+    const activePromises = new Set<Promise<ScrapeResult | Error>>();
+    const configsIterator = configs[Symbol.iterator]();
+
+    // Helper function to start a new scrape and add it to activePromises
+    const startNewScrape = () => {
+      const { value: config, done } = configsIterator.next();
+      if (done) return; // No more configs
+
+      const promise = this.scrape(config).catch((error) => error); // Catch errors and return them
+      activePromises.add(promise);
+
+      promise.finally(() => {
+        activePromises.delete(promise);
+        // After each scrape, start a new one if there are remaining configs
+        startNewScrape();
+      });
+    };
+
+    // Initially start as many scrapes as the concurrency limit
+    for (let i = 0; i < concurrencyLimit; i++) {
+      startNewScrape();
+    }
+
+    // As each scrape finishes, yield the result or error and start a new one if there are remaining configs
+    while (activePromises.size > 0) {
+      log.debug(`concurrently scraping ${activePromises.size}/${configs.length}}`);
+      const resultOrError = await Promise.race(activePromises);
+      yield resultOrError;
+    }
+  }
+
+  /**
+   * Issue a single batch request against POST /scrape/batch and
+   * stream results back as each scrape completes.
+   *
+   * Yields `[correlation_id, resultOrError]` tuples. Results arrive
+   * OUT OF ORDER — whichever scrape finishes first is yielded first.
+   * Every ScrapeConfig MUST carry a unique `correlation_id`; missing
+   * or duplicate values are caught client-side before the batch is
+   * sent (so callers fail fast on misconfiguration).
+   *
+   * Usage:
+   *   for await (const [id, result] of client.scrapeBatch(configs)) {
+   *     if (result instanceof errors.ScrapflyError) { ... }
+   *     else { ... }
+   *   }
+   */
+  async *scrapeBatch(
+    configs: ScrapeConfig[],
+    options: { format?: 'json' | 'msgpack' } = {},
+  ): AsyncGenerator<[string, ScrapeResult | Response | errors.ScrapflyError], void, undefined> {
+    const wireFormat = options.format ?? 'json';
+    const acceptHeader =
+      wireFormat === 'msgpack' ? 'application/msgpack' : 'application/json';
+    // Lazy-load the parser to avoid pulling Web Streams polyfills
+    // into the module graph for users who never call scrapeBatch.
+    const { iterBatchParts, decodePartBody, buildProxifiedResponseFromPart } = await import('./batch.ts');
+
+    if (!configs || configs.length === 0) {
+      throw new errors.ScrapflyError('scrapeBatch: configs list is empty');
+    }
+    if (configs.length > 100) {
+      throw new errors.ScrapflyError(
+        `scrapeBatch: max 100 configs per batch (got ${configs.length})`,
+      );
+    }
+
+    const seen = new Map<string, number>();
+    const configByCorrelation = new Map<string, ScrapeConfig>();
+    const bodyConfigs: Record<string, unknown>[] = [];
+
+    for (let i = 0; i < configs.length; i++) {
+      const cfg = configs[i];
+      const correlationId = (cfg as unknown as Record<string, string>).correlation_id;
+      if (!correlationId) {
+        throw new errors.ScrapflyError(
+          `scrapeBatch: configs[${i}] is missing correlation_id (required for matching streamed parts)`,
+        );
+      }
+      if (seen.has(correlationId)) {
+        throw new errors.ScrapflyError(
+          `scrapeBatch: correlation_id ${JSON.stringify(correlationId)} reused by configs[${seen.get(correlationId)}] and configs[${i}]`,
+        );
+      }
+      seen.set(correlationId, i);
+      configByCorrelation.set(correlationId, cfg);
+
+      // Reuse toApiParams to guarantee wire parity with /scrape.
+      // Drop `key` (batch key is in the URL).
+      const params = cfg.toApiParams({ key: this.key }) as Record<string, unknown>;
+      delete params.key;
+      // What a single scrape sends as the request itself: the API reads
+      // both keys of a batch entry and runs a GET without them.
+      params.method = cfg.method;
+      if (cfg.body !== undefined) {
+        params.body = cfg.body;
+      }
+      bodyConfigs.push(params);
+    }
+
+    const url = new URL(this.HOST + '/scrape/batch');
+    url.search = new URLSearchParams({ key: this.key }).toString();
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'POST',
+      headers: {
+        'user-agent': this.ua,
+        'content-type': 'application/json',
+        // gzip is universally supported in fetch runtimes; skip zstd
+        // for streaming compatibility (Node < 22 / browsers don't
+        // auto-decompress zstd yet).
+        'accept-encoding': 'gzip',
+        accept: acceptHeader,
+      },
+      body: JSON.stringify({ configs: bodyConfigs }),
+    });
+
+    if (response.status !== 200) {
+      const body = await response.text();
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        parsed = { message: body, code: 'ERR::API::INTERNAL_ERROR' };
+      }
+      throw new errors.ApiHttpServerError(
+        `scrapeBatch: ${parsed.code ?? 'error'} (HTTP ${response.status}): ${parsed.message ?? body}`,
+      );
+    }
+
+    for await (const part of iterBatchParts(response)) {
+      const correlationId = part.headers['x-scrapfly-correlation-id'] ?? '';
+
+      // Proxified-response parts: the part body is the raw upstream
+      // bytes, not a JSON envelope. Surface a native fetch Response
+      // so callers get the same shape as a single proxified scrape
+      // (which returns Response from .scrape()).
+      if (part.headers['x-scrapfly-proxified'] === 'true') {
+        try {
+          const proxResponse = buildProxifiedResponseFromPart(part);
+          yield [correlationId, proxResponse];
+        } catch (proxErr) {
+          yield [
+            correlationId,
+            new errors.ScrapflyError(
+              `scrapeBatch: failed to build proxified response for correlation_id=${JSON.stringify(correlationId)}: ${proxErr}`,
+            ),
+          ];
+        }
+        continue;
+      }
+
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = decodePartBody(part);
+      } catch (decodeErr) {
+        yield [
+          correlationId,
+          new errors.ScrapflyError(
+            `scrapeBatch: failed to decode part for correlation_id=${JSON.stringify(correlationId)}: ${decodeErr}`,
+          ),
+        ];
+        continue;
+      }
+
+      // API-generated error parts carry status >= 400 and an error body
+      // instead of the scrape envelope — surface them as typed errors.
+      const partStatus = parseInt(part.headers['x-scrapfly-scrape-status'] ?? '0', 10) || 0;
+      if (
+        partStatus >= 400 &&
+        parsed &&
+        typeof parsed === 'object' &&
+        !Array.isArray(parsed) &&
+        !('result' in parsed) &&
+        !('config' in parsed)
+      ) {
+        yield [correlationId, this.batchApiErrorPartToError(parsed, part.headers)];
+        continue;
+      }
+
+      try {
+        // A config with a webhook is answered by its enqueue ack, the scrape's answer under `result`.
+        const envelope = (parsed as any).enqueued === true && (parsed as any).result ? (parsed as any).result : parsed;
+        const result = new ScrapeResult({
+          config: envelope.config,
+          context: envelope.context,
+          result: envelope.result,
+          uuid: envelope.uuid,
+        });
+        yield [correlationId, result];
+      } catch (resultErr) {
+        yield [
+          correlationId,
+          resultErr instanceof errors.ScrapflyError
+            ? resultErr
+            : new errors.ScrapflyError(`scrapeBatch: ${resultErr}`),
+        ];
+      }
+    }
+  }
+
+  /**
+   * Save screenshot response to a file
+   */
+  async saveScreenshot(result: ScreenshotResult, name: string, savePath?: string): Promise<any> {
+    if (!result.image || result.image.byteLength === 0) {
+      throw new Error('Screenshot binary does not exist');
+    }
+
+    const extension_name = result.metadata.extension_name;
+    let file_path;
+
+    if (savePath) {
+      await mkdir(savePath, { recursive: true });
+      file_path = path.join(savePath, `${name}.${extension_name}`);
+    } else {
+      file_path = `${name}.${extension_name}`;
+    }
+
+    const content = new Uint8Array(result.image);
+
+    // Use Deno's write file method
+    await writeFile(file_path, content);
+  }
+
+  /**
+   * Turn scrapfly screenshot API response to ScreenshotResult or raise one of ScrapflyError
+   */
+  async handleScreenshotResponse(response: Response): Promise<ScreenshotResult> {
+    // A JSON answer is never an image: an error, or the 201 of a screenshot with a webhook.
+    // A Response body can only be consumed once, so it is read as text and parsed from that.
+    const isJson = (response.headers.get('content-type') ?? '').startsWith('application/json');
+    if (isJson || response.status === 201) {
+      const text = await response.text();
+      let jsonData: Rec<any> | null = null;
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed !== null && typeof parsed === 'object') {
+          jsonData = parsed as Rec<any>;
+        }
+      } catch {
+        jsonData = null;
+      }
+      const message = jsonData ? JSON.stringify(jsonData) : text || `API returned status ${response.status}`;
+      if (response.status == 401 || jsonData?.http_code == 401) {
+        throw new errors.BadApiKeyError(message);
+      }
+      if (jsonData) {
+        if ('error_id' in jsonData) {
+          throw new errors.ScreenshotApiError(JSON.stringify(jsonData));
+        }
+        // 201: a screenshot with a webhook, delivered to it later.
+        const job = jsonData.job_uuid;
+        if (response.status === 201 && jsonData.webhook_enqueued === true && typeof job === 'string' && job !== '') {
+          return new ScreenshotResult(response, new ArrayBuffer(0), job);
+        }
+      }
+      throw new errors.ScreenshotApiError(message);
+    }
+    if (!response.ok) {
+      throw new errors.ScreenshotApiError((await response.text()) || `API returned status ${response.status}`);
+    }
+    const data = await response.arrayBuffer();
+    const result = new ScreenshotResult(response, data);
+    return result;
+  }
+
+  /**
+   * Take a screenshot
+   */
+  async screenshot(config: ScreenshotConfig): Promise<ScreenshotResult> {
+    let response;
+    try {
+      const url = new URL(this.HOST + '/screenshot');
+      const params = config.toApiParams({ key: this.key });
+      url.search = new URLSearchParams(params).toString();
+      response = await this.fetch({
+        url: url.toString(),
+        method: 'GET',
+        headers: {
+          'user-agent': this.ua,
+          'accept-encoding': 'gzip, deflate, br',
+          accept: 'application/json',
+        },
+      });
+    } catch (e) {
+      log.error('error', e);
+      throw e;
+    }
+    const result = await this.handleScreenshotResponse(response);
+    return result;
+  }
+
+  /**
+   * Turn scrapfly Extraction API response to ExtractionResult or raise one of ScrapflyError
+   */
+  async handleExtractionResponse(response: Response): Promise<ExtractionResult> {
+    // Body can only be consumed once — reuse the parsed JSON on the
+    // error path instead of re-reading, which would fail with
+    // "body stream already read".
+    const data: Rec<any> = (await response.json()) as Rec<any>;
+    if ('error_id' in data) {
+      if (data.http_code == 401 || response.status == 401) {
+        throw new errors.BadApiKeyError(JSON.stringify(data));
+      }
+      throw new errors.ExtractionApiError(JSON.stringify(data));
+    }
+    if (!response.ok) {
+      throw new errors.ApiHttpClientError(JSON.stringify(data));
+    }
+    const result = new ExtractionResult({
+      data: data.data,
+      content_type: data.content_type,
+    });
+    return result;
+  }
+
+  /**
+   * Extract structured data from a web page
+   */
+  async extract(config: ExtractionConfig): Promise<ExtractionResult> {
+    log.debug('extacting data from', { content_type: config.content_type });
+    let response;
+    try {
+      const url = new URL(this.HOST + '/extraction');
+      const params = config.toApiParams({ key: this.key });
+      url.search = new URLSearchParams(params).toString();
+      const headers: Record<string, string> = {
+        'user-agent': this.ua,
+        'accept-encoding': 'gzip, deflate, br',
+        'content-type': config.content_type,
+        'accept': 'application/json',
+      };
+      if (config.document_compression_format && config.document_compression_format) {
+        headers['content-encoding'] = config.document_compression_format;
+      }
+      response = await this.fetch({
+        url: url.toString(),
+        method: 'POST',
+        headers: headers,
+        body: config.body,
+      });
+    } catch (e) {
+      log.error('error', e);
+      throw e;
+    }
+    const result = await this.handleExtractionResponse(response);
+    return result;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Crawler API
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Throw a typed error for a crawler JSON error envelope.
+   *
+   * The crawler endpoints (status, urls, contents, artifact, cancel) return either
+   * a clean JSON body on success or an error envelope `{error_id, http_code, message, ...}`.
+   * Use this to map the envelope to one of `BadApiKeyError` / `ScrapflyCrawlerError` /
+   * `ApiHttpClientError`.
+   */
+  private throwCrawlerError(response: Response, data: Rec<any>): never {
+    const httpCode = data.http_code ?? response.status;
+    const code = (data.code ?? '') as string;
+    // The engine relays its own failures as `{error, code}`.
+    const message = data.message ?? (typeof data.error === 'string' ? data.error : JSON.stringify(data));
+    if (httpCode === 401) {
+      throw new errors.BadApiKeyError(message, { http_status_code: httpCode, code, api_response: data });
+    }
+    if (httpCode === 429) {
+      throw new errors.TooManyRequests(message, { http_status_code: httpCode, code, api_response: data });
+    }
+    // Any ERR::CRAWLER::* code → typed crawler error
+    if (typeof code === 'string' && code.includes('::CRAWLER::')) {
+      throw new errors.ScrapflyCrawlerError(message, { http_status_code: httpCode, code, api_response: data });
+    }
+    throw new errors.ApiHttpClientError(message, { http_status_code: httpCode, code, api_response: data });
+  }
+
+  /**
+   * Schedule a new crawler job.
+   *
+   * `POST /crawl` — returns `{crawler_uuid, status}` on success. On failure throws
+   * `ScrapflyCrawlerError`, `BadApiKeyError`, or `ApiHttpClientError`.
+   */
+  async crawl(config: CrawlerConfig): Promise<{ crawler_uuid: string; status: string }> {
+    log.debug('crawling', { url: config.url });
+    let response: Response;
+    try {
+      const url = new URL(this.HOST + '/crawl');
+      url.search = new URLSearchParams({ key: this.key }).toString();
+      // POST /crawl accepts two body formats:
+      //   - application/json: the entire crawler configuration as JSON.
+      //     Used for seed-URL crawls and remote_url_list crawls.
+      //   - multipart/form-data: a 'config' JSON part and a 'urls' text
+      //     part (one URL per line). Used only when the caller provides
+      //     an in-memory url_list, so the URLs can be uploaded as a
+      //     streamed file payload instead of inlined into the JSON body.
+      const params = config.toApiParams() as Rec<any>;
+      const urlList: string[] | undefined = Array.isArray(params.url_list) && params.url_list.length > 0
+        ? (params.url_list as string[])
+        : undefined;
+      if (urlList !== undefined) {
+        // Strip url_list from the JSON config — the URLs go through the
+        // 'urls' multipart part instead, which the API gateway streams
+        // straight through to the scraping backend.
+        delete params.url_list;
+        const form = new FormData();
+        const configBlob = new Blob([JSON.stringify(params)], { type: 'application/json' });
+        form.append('config', configBlob, 'config.json');
+        const urlsBlob = new Blob([urlList.join('\n')], { type: 'text/plain' });
+        form.append('urls', urlsBlob, 'urls.txt');
+        response = await this.fetch({
+          url: url.toString(),
+          method: 'POST',
+          headers: {
+            'user-agent': this.ua,
+            // Intentionally omit content-type — fetch fills in the
+            // multipart boundary itself when given a FormData body.
+            'accept-encoding': 'gzip, deflate, br',
+            accept: 'application/json',
+          },
+          body: form,
+        });
+      } else {
+        response = await this.fetch({
+          url: url.toString(),
+          method: 'POST',
+          headers: {
+            'user-agent': this.ua,
+            'content-type': 'application/json',
+            'accept-encoding': 'gzip, deflate, br',
+            accept: 'application/json',
+          },
+          body: JSON.stringify(params),
+        });
+      }
+    } catch (e) {
+      log.error('error', e);
+      throw e;
+    }
+    const data: Rec<any> = (await response.json()) as Rec<any>;
+    if ('error_id' in data || data.http_code !== undefined) {
+      this.throwCrawlerError(response, data);
+    }
+    if (typeof data.uuid !== 'string' && typeof data.crawler_uuid !== 'string') {
+      throw new errors.ApiHttpClientError(
+        `Crawler API returned no uuid: ${JSON.stringify(data).slice(0, 500)}`,
+      );
+    }
+    return {
+      crawler_uuid: (data.crawler_uuid ?? data.uuid) as string,
+      status: (data.status ?? 'PENDING') as string,
+    };
+  }
+
+  /**
+   * Get the current status of a crawler job.
+   *
+   * `GET /crawl/{uuid}/status`
+   */
+  async crawlStatus(uuid: string): Promise<CrawlerStatus> {
+    let response: Response;
+    try {
+      const url = new URL(`${this.HOST}/crawl/${encodeURIComponent(uuid)}/status`);
+      url.search = new URLSearchParams({ key: this.key }).toString();
+      response = await this.fetch({
+        url: url.toString(),
+        method: 'GET',
+        headers: {
+          'user-agent': this.ua,
+          'accept-encoding': 'gzip, deflate, br',
+          accept: 'application/json',
+        },
+      });
+    } catch (e) {
+      log.error('error', e);
+      throw e;
+    }
+    const data: Rec<any> = (await response.json()) as Rec<any>;
+    if ('error_id' in data || data.http_code !== undefined) {
+      this.throwCrawlerError(response, data);
+    }
+    return new CrawlerStatus(data);
+  }
+
+  /**
+   * List crawled URLs for a job, optionally filtered by status and paginated.
+   *
+   * `GET /crawl/{uuid}/urls?status=<filter>&page=<n>&per_page=<n>`
+   *
+   * The server streams the response as `text/plain` — one record per line.
+   * JSON is intentionally NOT used here because this endpoint is expected to
+   * scale to millions of URLs per job, and materialising that as JSON would
+   * be prohibitively expensive on both the server and the client. See
+   * {@link CrawlerUrls.fromText} for the exact line format.
+   *
+   * Pagination: the wire protocol carries no global `total`. Request further
+   * pages by incrementing `page` until a response contains no records.
+   */
+  async crawlUrls(
+    uuid: string,
+    opts?: { status?: 'visited' | 'pending' | 'failed' | 'skipped'; page?: number; per_page?: number },
+  ): Promise<CrawlerUrls> {
+    const statusHint = opts?.status ?? 'visited';
+    const page = opts?.page ?? 1;
+    const perPage = opts?.per_page ?? 100;
+
+    let response: Response;
+    try {
+      const url = new URL(`${this.HOST}/crawl/${encodeURIComponent(uuid)}/urls`);
+      const params: Record<string, string> = { key: this.key };
+      if (opts?.status) params.status = opts.status;
+      if (opts?.page !== undefined) params.page = String(opts.page);
+      if (opts?.per_page !== undefined) params.per_page = String(opts.per_page);
+      url.search = new URLSearchParams(params).toString();
+      response = await this.fetch({
+        url: url.toString(),
+        method: 'GET',
+        headers: {
+          'user-agent': this.ua,
+          'accept-encoding': 'gzip, deflate, br',
+          // text/plain is the canonical format; we also accept JSON because
+          // error envelopes come back as JSON regardless of the success type.
+          accept: 'text/plain, application/json',
+        },
+      });
+    } catch (e) {
+      log.error('error', e);
+      throw e;
+    }
+
+    // Error envelopes are always JSON, even for text endpoints. Detect by
+    // content-type before consuming the body as text.
+    const ct = response.headers.get('content-type') ?? '';
+    if (ct.includes('application/json')) {
+      const data: Rec<any> = (await response.json()) as Rec<any>;
+      if ('error_id' in data || data.http_code !== undefined) {
+        this.throwCrawlerError(response, data);
+      }
+      // Unexpected: the server sent JSON on a success response for the text
+      // endpoint. Surface this as a client error so users see the mismatch
+      // instead of getting silent empty results.
+      throw new errors.ApiHttpClientError(
+        `crawlUrls expected text/plain, got JSON: ${JSON.stringify(data).slice(0, 500)}`,
+      );
+    }
+
+    const body = await response.text();
+    return CrawlerUrls.fromText(body, statusHint, page, perPage);
+  }
+
+  /**
+   * Get crawled content from a crawler job.
+   *
+   * Two modes:
+   *
+   * 1. **JSON mode** (default, `plain` omitted or false): returns a {@link CrawlerContents}
+   *    with a `contents` map (URL → format → content) and pagination links. Useful for
+   *    bulk retrieval. Honors `limit` (max 50, default 10) and `offset`.
+   *
+   * 2. **Plain mode** (`plain: true`): returns the raw content for a single URL/format
+   *    as a `string`, with content-type matching the format. Requires `url`. Useful for
+   *    piping markdown/text directly. **New in this SDK** (not in Python SDK as of 0.8.27).
+   *
+   * `GET /crawl/{uuid}/contents`
+   */
+  async crawlContents(
+    uuid: string,
+    opts: {
+      format: CrawlerContentFormat;
+      url?: string;
+      plain?: boolean;
+      limit?: number;
+      offset?: number;
+    },
+  ): Promise<CrawlerContents | string> {
+    if (opts.plain && !opts.url) {
+      throw new errors.CrawlerConfigError('plain=true requires a single `url` argument');
+    }
+    let response: Response;
+    try {
+      const url = new URL(`${this.HOST}/crawl/${encodeURIComponent(uuid)}/contents`);
+      // Note: the server query param is `formats` (plural), not `format`. The
+      // public docs say `format` but the actual server only accepts `formats`.
+      // We expose `format` (singular) as the SDK option since that's what users
+      // expect from the docs, and translate it here.
+      const params: Record<string, string> = { key: this.key, formats: opts.format };
+      if (opts.url) params.url = opts.url;
+      if (opts.plain) params.plain = 'true';
+      if (opts.limit !== undefined) params.limit = String(opts.limit);
+      if (opts.offset !== undefined) params.offset = String(opts.offset);
+      url.search = new URLSearchParams(params).toString();
+      response = await this.fetch({
+        url: url.toString(),
+        method: 'GET',
+        headers: {
+          'user-agent': this.ua,
+          'accept-encoding': 'gzip, deflate, br',
+          // In plain mode the server returns the raw content with a format-matching
+          // content-type (text/markdown, text/html, etc.); accept anything.
+          accept: opts.plain ? '*/*' : 'application/json',
+        },
+      });
+    } catch (e) {
+      log.error('error', e);
+      throw e;
+    }
+
+    if (opts.plain) {
+      // Plain mode: server returns raw text. Error envelopes still come back as JSON,
+      // so detect that by content-type before reading the body as text.
+      const ct = response.headers.get('content-type') ?? '';
+      if (ct.includes('application/json')) {
+        const data: Rec<any> = (await response.json()) as Rec<any>;
+        if ('error_id' in data || data.http_code !== undefined) {
+          this.throwCrawlerError(response, data);
+        }
+        // JSON came back without an error envelope — caller asked for plain but server
+        // returned JSON anyway (e.g. format=json). Stringify so the return type is stable.
+        return JSON.stringify(data);
+      }
+      return await response.text();
+    }
+
+    const data: Rec<any> = (await response.json()) as Rec<any>;
+    if ('error_id' in data || data.http_code !== undefined) {
+      this.throwCrawlerError(response, data);
+    }
+    return new CrawlerContents(data);
+  }
+
+  /**
+   * Batch-retrieve crawled content for up to 100 URLs in one round-trip.
+   *
+   * `POST /crawl/{uuid}/contents/batch`
+   *
+   * The request body is a newline-separated list of URLs (`text/plain`). The response
+   * is a `multipart/related` (RFC 2387) document with one part per found URL. Each
+   * part has `Content-Type` (matching the format) and `Content-Location` (the URL).
+   *
+   * Returns a map of `url → format → content`. Formats not requested for a given URL
+   * are simply absent from its inner map.
+   */
+  async crawlContentsBatch(
+    uuid: string,
+    urls: string[],
+    formats: CrawlerContentFormat[],
+  ): Promise<Record<string, Record<string, string>>> {
+    if (urls.length === 0) {
+      throw new errors.CrawlerConfigError('crawlContentsBatch requires at least one url');
+    }
+    if (urls.length > 100) {
+      throw new errors.CrawlerConfigError('crawlContentsBatch is limited to 100 urls per request');
+    }
+    if (formats.length === 0) {
+      throw new errors.CrawlerConfigError('crawlContentsBatch requires at least one format');
+    }
+    let response: Response;
+    try {
+      const url = new URL(`${this.HOST}/crawl/${encodeURIComponent(uuid)}/contents/batch`);
+      url.search = new URLSearchParams({ key: this.key, formats: formats.join(',') }).toString();
+      response = await this.fetch({
+        url: url.toString(),
+        method: 'POST',
+        headers: {
+          'user-agent': this.ua,
+          'content-type': 'text/plain',
+          'accept-encoding': 'gzip, deflate, br',
+          accept: 'multipart/related, application/json',
+        },
+        body: urls.join('\n'),
+      });
+    } catch (e) {
+      log.error('error', e);
+      throw e;
+    }
+
+    const ct = response.headers.get('content-type') ?? '';
+    if (ct.includes('application/json')) {
+      // Error envelope
+      const data: Rec<any> = (await response.json()) as Rec<any>;
+      if ('error_id' in data || data.http_code !== undefined) {
+        this.throwCrawlerError(response, data);
+      }
+      throw new errors.ApiHttpClientError(
+        `crawlContentsBatch expected multipart/related, got JSON: ${JSON.stringify(data).slice(0, 500)}`,
+      );
+    }
+
+    const text = await response.text();
+    return parseMultipartRelated(text, ct, formats);
+  }
+
+  /**
+   * Download a crawler job's WARC or HAR artifact as raw bytes.
+   *
+   * `GET /crawl/{uuid}/artifact?type=warc|har`
+   *
+   * The SDK does NOT bundle WARC/HAR parsers — use a dedicated library (e.g. `warcio`
+   * on npm) to walk the records. The returned {@link CrawlerArtifact} provides a
+   * `save(path)` helper for the common case of writing the artifact to disk.
+   */
+  async crawlArtifact(uuid: string, type: CrawlerArtifactType = 'warc'): Promise<CrawlerArtifact> {
+    let response: Response;
+    try {
+      const url = new URL(`${this.HOST}/crawl/${encodeURIComponent(uuid)}/artifact`);
+      url.search = new URLSearchParams({ key: this.key, type }).toString();
+      response = await this.fetch({
+        url: url.toString(),
+        method: 'GET',
+        headers: {
+          'user-agent': this.ua,
+          // Accept the artifact's binary content type plus JSON for error envelopes
+          accept: type === 'har' ? 'application/json, application/octet-stream' : 'application/gzip, application/octet-stream',
+        },
+      });
+    } catch (e) {
+      log.error('error', e);
+      throw e;
+    }
+
+    // Error envelope check (server returns JSON on errors regardless of artifact type)
+    const ct = response.headers.get('content-type') ?? '';
+    if (ct.includes('application/json') && type !== 'har') {
+      // For warc, JSON responses are always errors. For har, JSON IS the artifact —
+      // we need to peek at the body to distinguish.
+      const data: Rec<any> = (await response.json()) as Rec<any>;
+      if ('error_id' in data || data.http_code !== undefined) {
+        this.throwCrawlerError(response, data);
+      }
+      // Should not reach here for warc; treat as unexpected JSON.
+      throw new errors.ApiHttpClientError(
+        `crawlArtifact(${type}) expected binary, got JSON: ${JSON.stringify(data).slice(0, 500)}`,
+      );
+    }
+
+    const buf = new Uint8Array(await response.arrayBuffer());
+
+    // For HAR, the body IS JSON — but we still need to detect error envelopes
+    // (which set http_code or error_id at the top level of the JSON object).
+    if (type === 'har') {
+      try {
+        const text = new TextDecoder().decode(buf);
+        const parsed = JSON.parse(text) as Rec<any>;
+        if ('error_id' in parsed || parsed.http_code !== undefined) {
+          this.throwCrawlerError(response, parsed);
+        }
+      } catch (e) {
+        // If JSON parse fails, the body is not an error envelope — treat as raw HAR bytes.
+        if (e instanceof errors.ScrapflyError) throw e;
+      }
+    }
+
+    return new CrawlerArtifact(type, buf);
+  }
+
+  /**
+   * Cancel a running crawler job.
+   *
+   * `POST /crawl/{uuid}/cancel` — returns `true` on success. The endpoint
+   * is idempotent: cancelling a crawl that has already finished is a no-op
+   * and still returns success.
+   *
+   * Note: earlier versions of this SDK called `DELETE /crawl/{uuid}`, which
+   * is not a valid public route — that path silently 404'd against the
+   * public API. Fixed in 0.8.0 to use the correct documented endpoint.
+   */
+  async crawlCancel(uuid: string): Promise<boolean> {
+    let response: Response;
+    try {
+      const url = new URL(`${this.HOST}/crawl/${encodeURIComponent(uuid)}/cancel`);
+      url.search = new URLSearchParams({ key: this.key }).toString();
+      response = await this.fetch({
+        url: url.toString(),
+        method: 'POST',
+        headers: {
+          'user-agent': this.ua,
+          'accept-encoding': 'gzip, deflate, br',
+          accept: 'application/json',
+        },
+      });
+    } catch (e) {
+      log.error('error', e);
+      throw e;
+    }
+    // Empty body or JSON
+    const ct = response.headers.get('content-type') ?? '';
+    if (ct.includes('application/json')) {
+      const data: Rec<any> = (await response.json()) as Rec<any>;
+      if ('error_id' in data || data.http_code !== undefined) {
+        this.throwCrawlerError(response, data);
+      }
+    }
+    return response.ok;
+  }
+
+  /**
+   * Run one refresh of an existing crawl immediately, without waiting for the
+   * next scheduled period.
+   *
+   * `POST /crawl/{uuid}/refresh` re-scrapes the crawl's own URLs in place:
+   * same `crawler_uuid`, same artifacts, same search index. Only pages whose
+   * content actually changed are re-indexed and pages that disappeared are
+   * dropped, so everything already pointing at this crawl keeps working.
+   *
+   * A refresh bills the pages it re-scrapes, exactly like the original crawl.
+   * What unchanged pages save is the embedding and the index write.
+   *
+   * The call returns as soon as the run is accepted; poll `crawlStatus` or
+   * `crawlRefreshHistory` for the outcome. Do not retry it blindly: a retry
+   * starts a second re-scrape of the whole site.
+   */
+  async crawlRefreshNow(uuid: string): Promise<CrawlerRefreshState> {
+    if (!uuid) {
+      throw new errors.ScrapflyCrawlerError('uuid must be a non-empty string');
+    }
+    let response: Response;
+    try {
+      const url = new URL(`${this.HOST}/crawl/${encodeURIComponent(uuid)}/refresh`);
+      url.search = new URLSearchParams({ key: this.key }).toString();
+      // One attempt: the server may have accepted the billable refresh even
+      // when its response is lost or replaced by a gateway error.
+      response = await this.fetch(
+        {
+          url: url.toString(),
+          method: 'POST',
+          headers: {
+            'user-agent': this.ua,
+            'accept-encoding': 'gzip, deflate, br',
+            accept: 'application/json',
+          },
+        },
+        1,
+      );
+    } catch (e) {
+      log.error('error', e);
+      throw e;
+    }
+    const data: Rec<any> = (await response.json()) as Rec<any>;
+    if ('error_id' in data || data.http_code !== undefined) {
+      this.throwCrawlerError(response, data);
+    }
+    return parseCrawlerRefreshState(data);
+  }
+
+  /**
+   * Change the refresh schedule of an existing crawl.
+   *
+   * `PATCH /crawl/{uuid}/refresh` — only the fields passed are changed, so
+   * turning a crawl off keeps its interval for when it is turned back on.
+   *
+   * Turning refresh on for a crawl started without it is allowed: the crawl
+   * already holds the URL index a refresh walks.
+   */
+  async crawlRefreshSettings(
+    uuid: string,
+    settings: { enabled?: boolean; interval_seconds?: number },
+  ): Promise<CrawlerRefreshState> {
+    if (!uuid) {
+      throw new errors.ScrapflyCrawlerError('uuid must be a non-empty string');
+    }
+    if (settings?.enabled === undefined && settings?.interval_seconds === undefined) {
+      throw new errors.ScrapflyCrawlerError('pass at least one of enabled, interval_seconds');
+    }
+    if (
+      settings.interval_seconds !== undefined &&
+      (settings.interval_seconds < REFRESH_MIN_INTERVAL || settings.interval_seconds > REFRESH_MAX_INTERVAL)
+    ) {
+      throw new errors.ScrapflyCrawlerError(
+        `interval_seconds must be between ${REFRESH_MIN_INTERVAL} and ${REFRESH_MAX_INTERVAL} seconds`,
+      );
+    }
+
+    // Wire keys are the ones POST /crawl already takes, so a crawl body and a
+    // later PATCH name the same things. The enabled/interval_seconds spelling
+    // belongs to the state block this call answers with, not to its request;
+    // the API decodes the body with unknown fields rejected.
+    const payload: Rec<any> = {};
+    if (settings.enabled !== undefined) payload.refresh = settings.enabled;
+    if (settings.interval_seconds !== undefined) payload.refresh_interval = settings.interval_seconds;
+
+    let response: Response;
+    try {
+      const url = new URL(`${this.HOST}/crawl/${encodeURIComponent(uuid)}/refresh`);
+      url.search = new URLSearchParams({ key: this.key }).toString();
+      response = await this.fetch({
+        url: url.toString(),
+        method: 'PATCH',
+        headers: {
+          'user-agent': this.ua,
+          'content-type': 'application/json',
+          'accept-encoding': 'gzip, deflate, br',
+          accept: 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+    } catch (e) {
+      log.error('error', e);
+      throw e;
+    }
+    const data: Rec<any> = (await response.json()) as Rec<any>;
+    if ('error_id' in data || data.http_code !== undefined) {
+      this.throwCrawlerError(response, data);
+    }
+    return parseCrawlerRefreshState(data);
+  }
+
+  /**
+   * Read a crawl's refresh timeline, newest last.
+   *
+   * `GET /crawl/{uuid}/refresh/history` — the server keeps the 50 most recent
+   * runs; older rows are trimmed rather than paged, because the timeline
+   * exists to show recent activity.
+   */
+  async crawlRefreshHistory(uuid: string, opts?: { limit?: number }): Promise<CrawlerRefreshEntry[]> {
+    if (!uuid) {
+      throw new errors.ScrapflyCrawlerError('uuid must be a non-empty string');
+    }
+    let response: Response;
+    try {
+      const url = new URL(`${this.HOST}/crawl/${encodeURIComponent(uuid)}/refresh/history`);
+      const params: Rec<string> = { key: this.key };
+      if (opts?.limit !== undefined) params.limit = String(opts.limit);
+      url.search = new URLSearchParams(params).toString();
+      response = await this.fetch({
+        url: url.toString(),
+        method: 'GET',
+        headers: {
+          'user-agent': this.ua,
+          'accept-encoding': 'gzip, deflate, br',
+          accept: 'application/json',
+        },
+      });
+    } catch (e) {
+      log.error('error', e);
+      throw e;
+    }
+    const data: Rec<any> = (await response.json()) as Rec<any>;
+    if ('error_id' in data || data.http_code !== undefined) {
+      this.throwCrawlerError(response, data);
+    }
+    return parseCrawlerRefreshState(data).history ?? [];
+  }
+
+  /**
+   * Search across the search indexes of one or more crawls.
+   *
+   * `POST /crawl/search`: the collection endpoint is the real API and
+   * {@link crawl.Crawl.search} is sugar over a one-element list so the two
+   * cannot drift.
+   *
+   * Only crawls started with `search: true` whose index reached `READY` or
+   * `PARTIAL` contribute. The rest come back in `skipped` with a reason and
+   * never fail the call, so inspect `skipped` before concluding a crawl had
+   * no match.
+   */
+  async crawlSearch(
+    crawlIds: string[],
+    query: string,
+    opts?: {
+      /** 1-50 (server cap). Unset uses the server default. */
+      limit?: number;
+      mode?: CrawlerSearchMode;
+      /**
+       * Flat filter map: `url_prefix`, `host`, `source_format`,
+       * `content_type`, `http_status`, `crawler_uuid`. Filters are pushed down
+       * per crawl before its top-K, so they never cost recall. Unknown keys
+       * are rejected server-side rather than ignored.
+       */
+      filters?: Rec<any>;
+      /** Next-page token from a previous response. */
+      cursor?: string;
+    },
+  ): Promise<CrawlerSearchResponse> {
+    if (!Array.isArray(crawlIds) || crawlIds.length === 0) {
+      throw new errors.ScrapflyCrawlerError('crawl_ids must contain at least one crawler UUID');
+    }
+    if (!query) {
+      throw new errors.ScrapflyCrawlerError('query must be a non-empty string');
+    }
+
+    const payload: Rec<any> = { query, crawl_ids: crawlIds };
+    if (opts?.limit !== undefined) payload.limit = opts.limit;
+    if (opts?.mode !== undefined) payload.mode = opts.mode;
+    if (opts?.filters !== undefined) payload.filters = opts.filters;
+    if (opts?.cursor !== undefined) payload.cursor = opts.cursor;
+
+    let response: Response;
+    try {
+      const url = new URL(`${this.HOST}/crawl/search`);
+      url.search = new URLSearchParams({ key: this.key }).toString();
+      response = await this.fetch({
+        url: url.toString(),
+        method: 'POST',
+        headers: {
+          'user-agent': this.ua,
+          'content-type': 'application/json',
+          'accept-encoding': 'gzip, deflate, br',
+          accept: 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+    } catch (e) {
+      log.error('error', e);
+      throw e;
+    }
+    const data: Rec<any> = (await response.json()) as Rec<any>;
+    if ('error_id' in data || data.http_code !== undefined) {
+      this.throwCrawlerError(response, data);
+    }
+    return new CrawlerSearchResponse(data);
+  }
+
+  /**
+   * Ask a question answered from the content of one or more crawls, streaming
+   * the answer as it is generated.
+   *
+   * `POST /crawl/prompt`: the collection endpoint is the real API and
+   * {@link crawl.Crawl.prompt} is sugar over a one-element list.
+   *
+   * Yields `source` frames, then `token` frames, then one `done`. An
+   * `event: error` frame is thrown as `ScrapflyCrawlerError` rather than
+   * yielded, and can arrive after tokens were already yielded because
+   * generation fails mid-stream.
+   *
+   * Consume with `for await`; abandoning the iterator early cancels the body.
+   *
+   * Do not consume this with `EventSource`: it reconnects on close and would
+   * silently re-run the whole fan-out and generation.
+   */
+  async *crawlPrompt(
+    crawlIds: string[],
+    prompt: string,
+    opts?: {
+      /** Retrieval overrides. Unset uses the server defaults. */
+      search?: { limit?: number; mode?: CrawlerSearchMode; filters?: Rec<any> };
+      /** Generation model id. Unset uses the server default. */
+      model?: string;
+    },
+  ): AsyncGenerator<CrawlerPromptEvent, void, undefined> {
+    if (!Array.isArray(crawlIds) || crawlIds.length === 0) {
+      throw new errors.ScrapflyCrawlerError('crawl_ids must contain at least one crawler UUID');
+    }
+    if (!prompt) {
+      throw new errors.ScrapflyCrawlerError('prompt must be a non-empty string');
+    }
+
+    const generation: Rec<any> = { stream: true };
+    if (opts?.model !== undefined) generation.model = opts.model;
+    const payload: Rec<any> = { prompt, crawl_ids: crawlIds, generation };
+    if (opts?.search !== undefined) payload.search = opts.search;
+
+    const url = new URL(`${this.HOST}/crawl/prompt`);
+    url.search = new URLSearchParams({ key: this.key }).toString();
+    // One attempt only: the request runs a fan-out and a generation, both
+    // billable, so a retry doubles the bill.
+    const response = await this.fetch(
+      {
+        url: url.toString(),
+        method: 'POST',
+        headers: {
+          'user-agent': this.ua,
+          'content-type': 'application/json',
+          accept: 'text/event-stream',
+        },
+        body: JSON.stringify(payload),
+      },
+      1,
+    );
+
+    if (!response.ok) {
+      const data: Rec<any> = (await response.json().catch(() => ({}))) as Rec<any>;
+      this.throwCrawlerError(response, data);
+    }
+    if (response.body === null) {
+      throw new errors.ScrapflyCrawlerError('prompt response carried no body');
+    }
+
+    yield* parseCrawlerPromptStream(response.body);
+  }
+
+  /**
+   * Ask a question answered from the content of one or more crawls, and get
+   * the whole answer in one object once generation completes.
+   *
+   * `POST /crawl/prompt` with `generation.stream: false`: the same facts as
+   * the frames of {@link crawlPrompt}. {@link crawl.Crawl.promptAnswer} is
+   * sugar over a one-element list.
+   */
+  async crawlPromptAnswer(
+    crawlIds: string[],
+    prompt: string,
+    opts?: {
+      /** Retrieval overrides. Unset uses the server defaults. */
+      search?: { limit?: number; mode?: CrawlerSearchMode; filters?: Rec<any> };
+      /** Generation model id. Unset uses the server default. */
+      model?: string;
+    },
+  ): Promise<CrawlerPromptAnswer> {
+    if (!Array.isArray(crawlIds) || crawlIds.length === 0) {
+      throw new errors.ScrapflyCrawlerError('crawl_ids must contain at least one crawler UUID');
+    }
+    if (!prompt) {
+      throw new errors.ScrapflyCrawlerError('prompt must be a non-empty string');
+    }
+
+    const generation: Rec<any> = { stream: false };
+    if (opts?.model !== undefined) generation.model = opts.model;
+    const payload: Rec<any> = { prompt, crawl_ids: crawlIds, generation };
+    if (opts?.search !== undefined) payload.search = opts.search;
+
+    return (await this.postCrawlerJson('/crawl/prompt', payload)) as CrawlerPromptAnswer;
+  }
+
+  /**
+   * Extract a structured object from the content of one or more crawls.
+   *
+   * `POST /crawl/extract` retrieves like {@link crawlPromptAnswer} and answers
+   * with `data` shaped by `schema`, a JSON Schema handed to the model as its
+   * response schema. There is no streaming variant. {@link crawl.Crawl.extract}
+   * is sugar over a one-element list.
+   */
+  async crawlExtract<T = any>(
+    crawlIds: string[],
+    prompt: string,
+    schema: Rec<any>,
+    opts?: {
+      /** Retrieval overrides. Unset uses the server defaults. */
+      search?: { limit?: number; mode?: CrawlerSearchMode; filters?: Rec<any> };
+    },
+  ): Promise<CrawlerExtractResponse<T>> {
+    if (!Array.isArray(crawlIds) || crawlIds.length === 0) {
+      throw new errors.ScrapflyCrawlerError('crawl_ids must contain at least one crawler UUID');
+    }
+    if (!prompt) {
+      throw new errors.ScrapflyCrawlerError('prompt must be a non-empty string');
+    }
+    if (typeof schema !== 'object' || schema === null || Array.isArray(schema) || Object.keys(schema).length === 0) {
+      throw new errors.ScrapflyCrawlerError('schema must be a non-empty JSON Schema object');
+    }
+
+    const payload: Rec<any> = { prompt, crawl_ids: crawlIds, schema };
+    if (opts?.search !== undefined) payload.search = opts.search;
+
+    return (await this.postCrawlerJson('/crawl/extract', payload)) as CrawlerExtractResponse<T>;
+  }
+
+  /** POST a JSON body to a crawler endpoint that generates, once, and return its JSON answer. */
+  private async postCrawlerJson(path: string, payload: Rec<any>): Promise<Rec<any>> {
+    const url = new URL(`${this.HOST}${path}`);
+    url.search = new URLSearchParams({ key: this.key }).toString();
+    // One attempt only: a retry re-runs the fan-out and the generation.
+    const response = await this.fetch(
+      {
+        url: url.toString(),
+        method: 'POST',
+        headers: {
+          'user-agent': this.ua,
+          'content-type': 'application/json',
+          accept: 'application/json',
+        },
+        body: JSON.stringify(payload),
+      },
+      1,
+    );
+
+    if (!response.ok) {
+      const data: Rec<any> = (await response.json().catch(() => ({}))) as Rec<any>;
+      this.throwCrawlerError(response, data);
+    }
+    return (await response.json()) as Rec<any>;
+  }
+
+  // --- Cloud Browser ---
+
+  /**
+   * Get the WebSocket URL for a Cloud Browser session.
+   *
+   * On rejection the server sends a JSON error frame then a close frame
+   * with code 1008/1011/1013 and a "ERR::BROWSER::CODE: reason" string.
+   * See https://scrapfly.io/docs/cloud-browser-api/errors#websocket-close-frame
+   */
+  cloudBrowser(config?: BrowserConfig): string {
+    const browserConfig = config || new BrowserConfig();
+    return browserConfig.websocketUrl(this.key, this.cloudBrowserHost);
+  }
+
+  /**
+   * Return the deterministic project salt for this client's api_key. Matches
+   * the `X-Browser-Project-Salt` response header returned on VNC-enabled
+   * Cloud Browser upgrades, where the salt is also the VNC password prefix.
+   */
+  async cloudBrowserProjectSalt(): Promise<string> {
+    return BrowserConfig.projectSalt(this.key);
+  }
+
+  /**
+   * Return the password a native VNC client must type to attach to a session
+   * created with `config`: `<projectSalt>-<vnc_password>`.
+   *
+   * Copy this value into your VNC client when connecting to the TCP endpoint
+   * (port 5901). The WebSocket endpoint `/run/<run_id>/vnc` takes the raw
+   * `vnc_password` instead.
+   */
+  async cloudBrowserVncPassword(config: BrowserConfig): Promise<string> {
+    return config.vncClientPassword(this.key);
+  }
+
+  /**
+   * Call the Cloud Browser Unblock API.
+   *
+   * Unblock always uses a residential proxy (no proxy pool selection) and
+   * always performs a GET — the endpoint's purpose is to harvest cookies /
+   * clearance tokens via an Unblocker navigation, not to proxy arbitrary
+   * HTTP requests.
+   */
+  async cloudBrowserUnblock(options: {
+    url: string;
+    country?: string;
+    os?: string;
+    browser_brand?: string;
+    session?: string;
+    timeout?: number;
+    browser_timeout?: number;
+    enable_mcp?: boolean;
+    debug?: boolean;
+  }): Promise<{ ws_url: string; session_id: string; run_id: string; mcp_endpoint?: string }> {
+    const jsonBody: Record<string, unknown> = { url: options.url };
+    if (options.country) jsonBody.country = options.country;
+    if (options.os) jsonBody.os = options.os;
+    if (options.browser_brand) jsonBody.browser_brand = options.browser_brand;
+    if (options.session) jsonBody.session = options.session;
+    if (options.timeout) jsonBody.timeout = options.timeout;
+    if (options.browser_timeout) jsonBody.browser_timeout = options.browser_timeout;
+    if (options.enable_mcp !== undefined) jsonBody.enable_mcp = options.enable_mcp;
+    if (options.debug !== undefined) jsonBody.debug = options.debug;
+
+    const url = new URL(this.cloudBrowserApiHost + '/unblock');
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'user-agent': this.ua,
+      },
+      body: JSON.stringify(jsonBody),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Unblock failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as { ws_url: string; session_id: string; run_id: string };
+  }
+
+  /**
+   * Stop a Cloud Browser session.
+   */
+  async cloudBrowserSessionStop(sessionId: string): Promise<void> {
+    const url = new URL(this.cloudBrowserApiHost + '/session/' + sessionId + '/stop');
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'POST',
+      headers: { 'user-agent': this.ua },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Session stop failed: ${response.status} ${await response.text()}`);
+    }
+  }
+
+  /**
+   * List all browser extensions.
+   */
+  async cloudBrowserExtensionList(): Promise<{ extensions: any[]; quota: { used: number; limit: number } }> {
+    const url = new URL(this.cloudBrowserApiHost + '/extension');
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'GET',
+      headers: { 'user-agent': this.ua },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Extension list failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as { extensions: any[]; quota: { used: number; limit: number } };
+  }
+
+  /**
+   * Delete a browser extension.
+   */
+  async cloudBrowserExtensionDelete(extensionId: string): Promise<{ success: boolean; message: string }> {
+    const url = new URL(this.cloudBrowserApiHost + '/extension/' + extensionId);
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'DELETE',
+      headers: { 'user-agent': this.ua },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Extension delete failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as { success: boolean; message: string };
+  }
+
+  /**
+   * Get details of a specific browser extension.
+   */
+  async cloudBrowserExtensionGet(extensionId: string): Promise<Record<string, any>> {
+    const url = new URL(this.cloudBrowserApiHost + '/extension/' + extensionId);
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'GET',
+      headers: { 'user-agent': this.ua },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Extension get failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as Record<string, any>;
+  }
+
+  /**
+   * Upload a browser extension from a local file (.zip or .crx).
+   * Pass a file path — the file is read and sent as multipart/form-data.
+   */
+  async cloudBrowserExtensionUpload(filePath: string): Promise<{ extension: Record<string, any>; is_update: boolean }> {
+    const fileBytes = readFileSync(filePath);
+    const fileName = filePath.split('/').pop() || filePath.split('\\').pop() || 'extension.zip';
+    const boundary = '----ScrapflyBoundary' + Date.now();
+
+    const encoder = new TextEncoder();
+    const header = encoder.encode(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`
+    );
+    const footer = encoder.encode(`\r\n--${boundary}--\r\n`);
+
+    const body = new Uint8Array(header.length + fileBytes.length + footer.length);
+    body.set(header, 0);
+    body.set(fileBytes, header.length);
+    body.set(footer, header.length + fileBytes.length);
+
+    const url = new URL(this.cloudBrowserApiHost + '/extension');
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'POST',
+      headers: {
+        'content-type': `multipart/form-data; boundary=${boundary}`,
+        'user-agent': this.ua,
+      },
+      body: body,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Extension upload failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as { extension: Record<string, any>; is_update: boolean };
+  }
+
+  /**
+   * Install a browser extension from a URL (.crx file).
+   * URL-based extensions auto-update on each browser session start.
+   */
+  async cloudBrowserExtensionUploadFromUrl(extensionUrl: string): Promise<{ extension: Record<string, any>; is_update: boolean }> {
+    const url = new URL(this.cloudBrowserApiHost + '/extension');
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'user-agent': this.ua,
+      },
+      body: JSON.stringify({ extension_url: extensionUrl }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Extension upload from URL failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as { extension: Record<string, any>; is_update: boolean };
+  }
+
+  // ----- Cloud Browser Credential Vault -------------------------------------
+  // Server contract documented in the Vault API reference.
+  //
+  // SECURITY: the vault key is the customer-held secret that decrypts every
+  // item in the vault. The server emits it ONCE on POST /vault and POST
+  // /vault/{id}/rotate; never log it, never include it in error messages,
+  // never put it in a breadcrumb, and never echo it back to a caller.
+
+  /**
+   * Create a new Cloud Browser Credential Vault. The response contains a
+   * one-time `key` that the caller MUST save locally — the server cannot
+   * recover it. Pair the key with the returned vault id when opening
+   * sessions or creating items.
+   */
+  async cloudBrowserVaultCreate(opts: {
+    name: string;
+    description?: string;
+  }): Promise<{ vault: Vault; key: string; message: string }> {
+    const url = new URL(this.cloudBrowserApiHost + '/vault');
+    url.searchParams.set('key', this.key);
+
+    const body: Record<string, unknown> = { name: opts.name };
+    if (opts.description !== undefined) body.description = opts.description;
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'user-agent': this.ua,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Vault create failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as { vault: Vault; key: string; message: string };
+  }
+
+  /** List every vault on the account. */
+  async cloudBrowserVaultList(): Promise<{ vaults: Vault[] }> {
+    const url = new URL(this.cloudBrowserApiHost + '/vault');
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'GET',
+      headers: { 'user-agent': this.ua },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Vault list failed: ${response.status} ${await response.text()}`);
+    }
+    const json = await response.json() as { vaults: Vault[] | null };
+    return { vaults: json.vaults ?? [] };
+  }
+
+  /** Get a single vault by id. Does not return any secret material. */
+  async cloudBrowserVaultGet(vaultId: string): Promise<{ vault: Vault }> {
+    const url = new URL(this.cloudBrowserApiHost + '/vault/' + encodeURIComponent(vaultId));
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'GET',
+      headers: { 'user-agent': this.ua },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Vault get failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as { vault: Vault };
+  }
+
+  /** Update vault metadata (name / description). Does not require the vault key. */
+  async cloudBrowserVaultUpdate(
+    vaultId: string,
+    opts: { name?: string; description?: string },
+  ): Promise<{ vault: Vault; message?: string }> {
+    const url = new URL(this.cloudBrowserApiHost + '/vault/' + encodeURIComponent(vaultId));
+    url.searchParams.set('key', this.key);
+
+    const body: Record<string, unknown> = {};
+    if (opts.name !== undefined) body.name = opts.name;
+    if (opts.description !== undefined) body.description = opts.description;
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        'user-agent': this.ua,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Vault update failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as { vault: Vault; message?: string };
+  }
+
+  /** Delete a vault and every item in it. Does not require the vault key. */
+  async cloudBrowserVaultDelete(vaultId: string): Promise<{ success: boolean; message: string }> {
+    const url = new URL(this.cloudBrowserApiHost + '/vault/' + encodeURIComponent(vaultId));
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'DELETE',
+      headers: { 'user-agent': this.ua },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Vault delete failed: ${response.status} ${await response.text()}`);
+    }
+    const body = await response.json() as Record<string, any>;
+    return {
+      success: body.success !== undefined ? Boolean(body.success) : true,
+      message: typeof body.message === 'string' ? body.message : '',
+    };
+  }
+
+  /**
+   * Rotate the vault key. The caller MUST pass the CURRENT key in
+   * `currentVaultKey`; the server returns a fresh `key` exactly once. After
+   * this call the old key cannot decrypt any row in the vault.
+   */
+  async cloudBrowserVaultRotate(
+    vaultId: string,
+    currentVaultKey: string,
+  ): Promise<{ key: string; message: string }> {
+    const url = new URL(
+      this.cloudBrowserApiHost + '/vault/' + encodeURIComponent(vaultId) + '/rotate',
+    );
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'POST',
+      headers: {
+        'user-agent': this.ua,
+        'X-Vault-Key': currentVaultKey,
+      },
+    });
+
+    if (!response.ok) {
+      // Body may include the X-Vault-Key error message — safe to surface
+      // because the server message names the header but not its value.
+      throw new Error(`Vault rotate failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as { key: string; message: string };
+  }
+
+  /** List items in a vault. Items carry only opaque ciphertext, no plaintext. */
+  async cloudBrowserVaultItemList(vaultId: string): Promise<{ items: VaultItem[] }> {
+    const url = new URL(
+      this.cloudBrowserApiHost + '/vault/' + encodeURIComponent(vaultId) + '/item',
+    );
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'GET',
+      headers: { 'user-agent': this.ua },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Vault item list failed: ${response.status} ${await response.text()}`);
+    }
+    const json = await response.json() as { items: VaultItem[] | null };
+    return { items: json.items ?? [] };
+  }
+
+  /**
+   * Add a credential to a vault. Requires the vault key in the X-Vault-Key
+   * header so the server can encrypt the secret payload at rest.
+   */
+  async cloudBrowserVaultItemCreate(
+    vaultId: string,
+    vaultKey: string,
+    item: VaultItemCreate,
+  ): Promise<{ item: VaultItem; message: string }> {
+    const url = new URL(
+      this.cloudBrowserApiHost + '/vault/' + encodeURIComponent(vaultId) + '/item',
+    );
+    url.searchParams.set('key', this.key);
+
+    const body: Record<string, unknown> = {
+      type: item.type,
+      label: item.label,
+      origin: item.origin,
+      secret: item.secret,
+    };
+    if (item.username !== undefined) body.username = item.username;
+    if (item.metadata !== undefined) body.metadata = item.metadata;
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'user-agent': this.ua,
+        'X-Vault-Key': vaultKey,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Vault item create failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as { item: VaultItem; message: string };
+  }
+
+  /**
+   * Patch an item's metadata or rotate its secret. The server only requires
+   * X-Vault-Key when `secret` is supplied (ciphertext rotation). Passing
+   * `vaultKey` without `secret` is a no-op on the server side and is allowed
+   * for caller convenience.
+   */
+  async cloudBrowserVaultItemUpdate(
+    vaultId: string,
+    itemId: string,
+    opts: {
+      vaultKey?: string;
+      type?: VaultItem['type'];
+      label?: string;
+      origin?: string;
+      username?: string;
+      secret?: VaultSecret;
+      metadata?: Record<string, unknown>;
+    },
+  ): Promise<{ item?: VaultItem; message: string }> {
+    if (opts.secret !== undefined && (opts.vaultKey === undefined || opts.vaultKey === '')) {
+      throw new Error(
+        'cloudBrowserVaultItemUpdate: vaultKey is required when rotating the item secret',
+      );
+    }
+    if (opts.secret !== undefined && opts.type === undefined) {
+      throw new Error(
+        'cloudBrowserVaultItemUpdate: type is required when rotating the item secret',
+      );
+    }
+    const url = new URL(
+      this.cloudBrowserApiHost +
+        '/vault/' +
+        encodeURIComponent(vaultId) +
+        '/item/' +
+        encodeURIComponent(itemId),
+    );
+    url.searchParams.set('key', this.key);
+
+    const body: Record<string, unknown> = {};
+    if (opts.type !== undefined) body.type = opts.type;
+    if (opts.label !== undefined) body.label = opts.label;
+    if (opts.origin !== undefined) body.origin = opts.origin;
+    if (opts.username !== undefined) body.username = opts.username;
+    if (opts.metadata !== undefined) body.metadata = opts.metadata;
+    if (opts.secret !== undefined) body.secret = opts.secret;
+
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+      'user-agent': this.ua,
+    };
+    if (opts.vaultKey !== undefined && opts.vaultKey !== '') {
+      headers['X-Vault-Key'] = opts.vaultKey;
+    }
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Vault item update failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as { item?: VaultItem; message: string };
+  }
+
+  /** Delete a single vault item. Does not require the vault key. */
+  async cloudBrowserVaultItemDelete(
+    vaultId: string,
+    itemId: string,
+  ): Promise<{ success: boolean; message: string }> {
+    const url = new URL(
+      this.cloudBrowserApiHost +
+        '/vault/' +
+        encodeURIComponent(vaultId) +
+        '/item/' +
+        encodeURIComponent(itemId),
+    );
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'DELETE',
+      headers: { 'user-agent': this.ua },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Vault item delete failed: ${response.status} ${await response.text()}`);
+    }
+    const body = await response.json() as Record<string, any>;
+    return {
+      success: body.success !== undefined ? Boolean(body.success) : true,
+      message: typeof body.message === 'string' ? body.message : '',
+    };
+  }
+
+  // ----- Vault ↔ linked secret manager (1Password) ---------------------------
+  // A linked vault mirrors an upstream secret manager instead of holding
+  // operator-entered items. The provider's service-account token is sealed
+  // under the vault key like any other secret, so every endpoint that carries
+  // a token also carries X-Vault-Key: the server verifies the key BEFORE
+  // sealing, because a well-formed wrong key would link the vault and leave a
+  // token every later sync fails to open.
+
+  /**
+   * Link a vault to a secret manager. The token is sealed under `vaultKey`, so
+   * the key is mandatory here. The vault must not already be linked and must
+   * hold no rows owned by a previous service (the server answers 409).
+   */
+  async cloudBrowserVaultServiceLink(
+    vaultId: string,
+    vaultKey: string,
+    link: VaultServiceLink,
+  ): Promise<{ vault: Vault; message: string }> {
+    if (!link.token) {
+      throw new Error('cloudBrowserVaultServiceLink: token is required when linking a service');
+    }
+    // Same rule as the server's linked_service_data validation; caught here so a
+    // malformed link does not cost a round trip.
+    if (!link.linked_service_data?.vault_id && !link.linked_service_data?.vault_name) {
+      throw new Error(
+        'cloudBrowserVaultServiceLink: linked_service_data requires vault_id or vault_name',
+      );
+    }
+    const url = new URL(
+      this.cloudBrowserApiHost + '/vault/' + encodeURIComponent(vaultId) + '/service',
+    );
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'user-agent': this.ua,
+        'X-Vault-Key': vaultKey,
+      },
+      body: JSON.stringify({
+        linked_service: link.linked_service,
+        token: link.token,
+        linked_service_data: link.linked_service_data,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Vault service link failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as { vault: Vault; message: string };
+  }
+
+  /**
+   * Update a link: edit the non-secret selection rules, rotate the token, or
+   * both. `vaultKey` is required only when `token` is supplied, mirroring
+   * `cloudBrowserVaultItemUpdate`; a config-only edit needs no key.
+   *
+   * A token rotation also clears the server's one-hour auth back-off, so a link
+   * broken by a dead token syncs again on the next round.
+   */
+  async cloudBrowserVaultServiceUpdate(
+    vaultId: string,
+    opts: VaultServiceUpdate & { vaultKey?: string },
+  ): Promise<{ vault: Vault; message: string }> {
+    if (opts.token !== undefined && opts.token !== '' && (opts.vaultKey === undefined || opts.vaultKey === '')) {
+      throw new Error(
+        'cloudBrowserVaultServiceUpdate: vaultKey is required when rotating the service token',
+      );
+    }
+    const url = new URL(
+      this.cloudBrowserApiHost + '/vault/' + encodeURIComponent(vaultId) + '/service',
+    );
+    url.searchParams.set('key', this.key);
+
+    const body: Record<string, unknown> = {};
+    if (opts.token !== undefined) body.token = opts.token;
+    if (opts.linked_service_data !== undefined) body.linked_service_data = opts.linked_service_data;
+
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+      'user-agent': this.ua,
+    };
+    if (opts.vaultKey !== undefined && opts.vaultKey !== '') {
+      headers['X-Vault-Key'] = opts.vaultKey;
+    }
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Vault service update failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as { vault: Vault; message: string };
+  }
+
+  /**
+   * Unlink the provider. `keepItems` governs only the mirrored rows — kept as
+   * plain manual items, or deleted — while the sealed token is removed either
+   * way, so no vault key is needed.
+   *
+   * Dropping the rows is irreversible, so the default is to keep them and the
+   * flag always goes on the wire explicitly rather than relying on a default at
+   * either end.
+   */
+  async cloudBrowserVaultServiceUnlink(
+    vaultId: string,
+    opts: { keepItems?: boolean } = {},
+  ): Promise<{ success: boolean; message: string }> {
+    const url = new URL(
+      this.cloudBrowserApiHost + '/vault/' + encodeURIComponent(vaultId) + '/service',
+    );
+    url.searchParams.set('key', this.key);
+    url.searchParams.set('keep_items', (opts.keepItems ?? true) ? 'true' : 'false');
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'DELETE',
+      headers: { 'user-agent': this.ua },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Vault service unlink failed: ${response.status} ${await response.text()}`);
+    }
+    const body = await response.json() as Record<string, any>;
+    return {
+      success: body.success !== undefined ? Boolean(body.success) : true,
+      message: typeof body.message === 'string' ? body.message : '',
+    };
+  }
+
+  /**
+   * Force a reconcile against the provider now, bypassing the sync TTL and the
+   * back-off a failed round leaves behind. Requires the vault key: the server
+   * opens the sealed token with it and re-seals every mirrored row.
+   *
+   * The server budget is 25s; the SDK pins no per-call timeout, so the runtime's
+   * own fetch default applies.
+   */
+  async cloudBrowserVaultServiceSync(vaultId: string, vaultKey: string): Promise<VaultSyncReport> {
+    const url = new URL(
+      this.cloudBrowserApiHost + '/vault/' + encodeURIComponent(vaultId) + '/service/sync',
+    );
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'POST',
+      headers: {
+        'user-agent': this.ua,
+        'X-Vault-Key': vaultKey,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Vault service sync failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as VaultSyncReport;
+  }
+
+  /**
+   * Probe the provider: proves a token is live and lists the upstream vaults it
+   * can read. Writes nothing, so it never moves the vault's sync state.
+   *
+   * With no `token` the sealed token of an existing link is probed (the vault
+   * key opens it). Passing an unsaved `token` instead enumerates the upstream
+   * vaults BEFORE a link exists, which is how a caller picks `vault_id`.
+   *
+   * `linkedService` stays optional and undefaulted here: this is the one endpoint
+   * whose empty discriminator the server itself resolves to 1Password, and a
+   * client-side default would send a field the bodyless stored-token path must
+   * not carry.
+   *
+   * The server budget is 10s; the SDK pins no per-call timeout, so the runtime's
+   * own fetch default applies.
+   */
+  async cloudBrowserVaultServiceTest(
+    vaultId: string,
+    vaultKey: string,
+    opts: { linkedService?: VaultLinkedServiceValue; token?: string } = {},
+  ): Promise<VaultProbeResult> {
+    const url = new URL(
+      this.cloudBrowserApiHost + '/vault/' + encodeURIComponent(vaultId) + '/service/test',
+    );
+    url.searchParams.set('key', this.key);
+
+    const headers: Record<string, string> = {
+      'user-agent': this.ua,
+      'X-Vault-Key': vaultKey,
+    };
+    // A bodyless request is what selects the stored-token path server-side, so
+    // send a body only when the caller supplied something to probe with.
+    let body: string | undefined;
+    if (opts.token !== undefined || opts.linkedService !== undefined) {
+      const payload: Record<string, unknown> = {};
+      if (opts.linkedService !== undefined) payload.linked_service = opts.linkedService;
+      if (opts.token !== undefined) payload.token = opts.token;
+      body = JSON.stringify(payload);
+      headers['content-type'] = 'application/json';
+    }
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'POST',
+      headers,
+      body,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Vault service test failed: ${response.status} ${await response.text()}`);
+    }
+    const json = await response.json() as VaultProbeResult & { vaults_visible: VaultProbeVault[] | null };
+    return { ...json, vaults_visible: json.vaults_visible ?? [] };
+  }
+
+  /**
+   * Download a debug session recording video.
+   * Returns the video as an ArrayBuffer (stream from server).
+   */
+  async cloudBrowserVideo(runId: string): Promise<{ data: ArrayBuffer; filename: string }> {
+    const url = new URL(this.cloudBrowserApiHost + '/run/' + runId + '/video');
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'GET',
+      headers: { 'user-agent': this.ua },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Video download failed: ${response.status} ${await response.text()}`);
+    }
+
+    const filename = runId + '.webm';
+    return { data: await response.arrayBuffer(), filename };
+  }
+
+  /**
+   * Get playback info for a debug session recording. The returned object
+   * carries `available`, `status` ('ready' | 'uploading' | 'unavailable' |
+   * 'disabled'), `metadata`, `video_url`, and `retry_after_ms`.
+   */
+  async cloudBrowserPlayback(runId: string): Promise<Record<string, any>> {
+    const url = new URL(this.cloudBrowserApiHost + '/run/' + runId + '/playback');
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'GET',
+      headers: { 'user-agent': this.ua },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Playback get failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as Record<string, any>;
+  }
+
+  /**
+   * Poll the playback endpoint until the recording resolves to a terminal
+   * state ('ready' or 'unavailable') or the timeout elapses. Honours the
+   * server-side retry_after_ms hint when present.
+   */
+  async cloudBrowserWaitForPlayback(
+    runId: string,
+    opts: { timeoutMs?: number; pollIntervalFallbackMs?: number } = {},
+  ): Promise<Record<string, any>> {
+    const timeoutMs = opts.timeoutMs ?? 180_000;
+    const fallbackMs = opts.pollIntervalFallbackMs ?? 3_000;
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      const playback = await this.cloudBrowserPlayback(runId);
+      if (playback.status !== 'uploading') return playback;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return playback;
+      const retryAfter = Number(playback.retry_after_ms) || fallbackMs;
+      const sleepFor = Math.min(retryAfter, remaining);
+      await new Promise((resolve) => setTimeout(resolve, sleepFor));
+    }
+  }
+
+  /**
+   * List all running Cloud Browser sessions.
+   */
+  async cloudBrowserSessions(): Promise<{ sessions: any[]; total: number }> {
+    const url = new URL(this.cloudBrowserApiHost + '/sessions');
+    url.searchParams.set('key', this.key);
+
+    const response = await this.fetch({
+      url: url.toString(),
+      method: 'GET',
+      headers: { 'user-agent': this.ua },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Sessions list failed: ${response.status} ${await response.text()}`);
+    }
+    return await response.json() as { sessions: any[]; total: number };
+  }
+
+  // -------------------------------------------------------------------------
+  // Public schedule endpoints — /scrape/schedules, /screenshot/schedules,
+  // /crawl/schedules, /schedules. The kind-specific config is supplied to the
+  // matching `create*Schedule` method; the cross-kind list/get/update/delete/
+  // pause/resume/execute methods work regardless of kind.
+  // -------------------------------------------------------------------------
+
+  /** Create a Web Scraping API schedule. `scrape_config` is the same shape
+   *  accepted by `/scrape` (e.g. `{ url, render_js, asp, ... }`). This dict is
+   *  forwarded to the API verbatim, so its keys are wire keys, not the SDK
+   *  option names. The anti-bot bypass may be spelled either way here: the API
+   *  folds `unblocker` into `asp` on the STORED config, with the same precedence
+   *  the SDK uses (a supplied `asp` wins; `unblocker` is read only when `asp` is
+   *  absent, `null` or `""`), so both names reach the replayed scrape. */
+  async createScrapeSchedule(
+    scrapeConfig: Record<string, unknown>,
+    request: CreateScheduleRequest,
+  ): Promise<Schedule> {
+    return await this.scheduleRequest(
+      'POST',
+      '/scrape/schedules',
+      undefined,
+      this.buildCreateBody('scrape_config', scrapeConfig, request),
+    ) as Schedule;
+  }
+
+  /** Create a Screenshot API schedule. */
+  async createScreenshotSchedule(
+    screenshotConfig: Record<string, unknown>,
+    request: CreateScheduleRequest,
+  ): Promise<Schedule> {
+    return await this.scheduleRequest(
+      'POST',
+      '/screenshot/schedules',
+      undefined,
+      this.buildCreateBody('screenshot_config', screenshotConfig, request),
+    ) as Schedule;
+  }
+
+  /** Create a Crawler API schedule. `crawler_config` is forwarded verbatim and
+   *  its keys are wire keys, not the SDK option names. As with
+   *  `createScrapeSchedule`, the anti-bot bypass may be spelled `asp` or
+   *  `unblocker`: the API folds the alias into `asp` on the stored config before
+   *  it is ever replayed. */
+  async createCrawlerSchedule(
+    crawlerConfig: Record<string, unknown>,
+    request: CreateScheduleRequest,
+  ): Promise<Schedule> {
+    return await this.scheduleRequest(
+      'POST',
+      '/crawl/schedules',
+      undefined,
+      this.buildCreateBody('crawler_config', crawlerConfig, request),
+    ) as Schedule;
+  }
+
+  /** Return a schedule by id. Works across all kinds. */
+  async getSchedule(id: string): Promise<Schedule> {
+    return await this.scheduleRequest('GET', `/schedules/${encodeURIComponent(id)}`) as Schedule;
+  }
+
+  /** List every schedule on the account, optionally filtered by kind/status. */
+  async listSchedules(opts?: ListSchedulesOptions): Promise<Schedule[]> {
+    return await this.scheduleRequest(
+      'GET',
+      '/schedules',
+      opts as Record<string, string | undefined> | undefined,
+    ) as Schedule[];
+  }
+
+  async listScrapeSchedules(opts?: { status?: string }): Promise<Schedule[]> {
+    return await this.scheduleRequest('GET', '/scrape/schedules', opts) as Schedule[];
+  }
+
+  async listScreenshotSchedules(opts?: { status?: string }): Promise<Schedule[]> {
+    return await this.scheduleRequest('GET', '/screenshot/schedules', opts) as Schedule[];
+  }
+
+  async listCrawlerSchedules(opts?: { status?: string }): Promise<Schedule[]> {
+    return await this.scheduleRequest('GET', '/crawl/schedules', opts) as Schedule[];
+  }
+
+  /** Patch an active schedule. Only fields set in `request` change. */
+  async updateSchedule(id: string, request: UpdateScheduleRequest): Promise<Schedule> {
+    return await this.scheduleRequest(
+      'PATCH',
+      `/schedules/${encodeURIComponent(id)}`,
+      undefined,
+      request as Record<string, unknown>,
+    ) as Schedule;
+  }
+
+  /** Cancel a schedule. Cancellation is terminal (returns no body). */
+  async cancelSchedule(id: string): Promise<void> {
+    await this.scheduleRequest('DELETE', `/schedules/${encodeURIComponent(id)}`);
+  }
+
+  async pauseSchedule(id: string): Promise<Schedule> {
+    return await this.scheduleRequest(
+      'POST',
+      `/schedules/${encodeURIComponent(id)}/pause`,
+    ) as Schedule;
+  }
+
+  async resumeSchedule(id: string): Promise<Schedule> {
+    return await this.scheduleRequest(
+      'POST',
+      `/schedules/${encodeURIComponent(id)}/resume`,
+    ) as Schedule;
+  }
+
+  /** Fire a schedule immediately, regardless of next_scheduled_date. */
+  async executeSchedule(id: string): Promise<Schedule> {
+    return await this.scheduleRequest(
+      'POST',
+      `/schedules/${encodeURIComponent(id)}/execute`,
+    ) as Schedule;
+  }
+
+  private buildCreateBody(
+    configKey: string,
+    config: Record<string, unknown>,
+    request: CreateScheduleRequest,
+  ): Record<string, unknown> {
+    const body: Record<string, unknown> = {
+      [configKey]: config,
+      webhook_name: request.webhook_name,
+      allow_concurrency: request.allow_concurrency ?? false,
+      retry_on_failure: request.retry_on_failure ?? false,
+    };
+    if (request.recurrence) body.recurrence = request.recurrence;
+    if (request.scheduled_date) body.scheduled_date = request.scheduled_date;
+    if (typeof request.max_retries === 'number') body.max_retries = request.max_retries;
+    if (request.notes) body.notes = request.notes;
+    return body;
+  }
+
+  private async scheduleRequest(
+    method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
+    path: string,
+    query?: Record<string, string | undefined>,
+    body?: Record<string, unknown>,
+  ): Promise<unknown> {
+    const url = new URL(this.HOST + path);
+    const params = new URLSearchParams();
+    params.set('key', this.key);
+    if (query) {
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined && v !== '') params.set(k, v);
+      }
+    }
+    url.search = params.toString();
+
+    const init: { url: string; method: string; headers: Record<string, string>; body?: string } = {
+      url: url.toString(),
+      method,
+      headers: {
+        'user-agent': this.ua,
+        accept: 'application/json',
+      },
+    };
+    if (body !== undefined) {
+      init.body = JSON.stringify(body);
+      init.headers['content-type'] = 'application/json';
+    }
+
+    const response = await this.fetch(init as any);
+
+    if (response.status === 204) return undefined;
+    if (!response.ok) {
+      let envelope: { error?: string; message?: string; reason?: string; details?: unknown } = {};
+      try {
+        envelope = await response.json() as typeof envelope;
+      } catch {
+        // body wasn't JSON; fall through with the empty envelope
+      }
+      const code = envelope.error ?? 'ERR::SCHEDULER::BACKEND_ERROR';
+      let message = envelope.message ?? '';
+      if (envelope.reason) {
+        message = message ? `${message} (${envelope.reason})` : envelope.reason;
+      }
+      if (!message) message = `HTTP ${response.status}`;
+      throw new ScheduleAPIError({
+        code,
+        message,
+        httpStatusCode: response.status,
+        details: envelope.details,
+      });
+    }
+    return await response.json();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// multipart/related parser
+// ---------------------------------------------------------------------------
+//
+// Tiny inline parser for the response of `POST /crawl/{uuid}/contents/batch`.
+// Avoids pulling in a multipart npm dep so the SDK stays dependency-free.
+//
+// Each part has at minimum a `Content-Location: <url>` header and a body. The
+// `Content-Type` may also be set, indicating the format. We map URL → format → body
+// using the `formats` argument as the inferred-format fallback when the part has
+// no `Content-Type`.
+
+function parseMultipartRelated(
+  body: string,
+  contentType: string,
+  formats: string[],
+): Record<string, Record<string, string>> {
+  const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;\s]+))/);
+  if (!boundaryMatch) {
+    throw new errors.ApiHttpClientError(
+      `crawlContentsBatch: response has no multipart boundary in content-type "${contentType}"`,
+    );
+  }
+  const boundary = boundaryMatch[1] ?? boundaryMatch[2];
+  const delimiter = `--${boundary}`;
+  const result: Record<string, Record<string, string>> = {};
+
+  // Split on the delimiter; first segment is the preamble (ignored), last is the
+  // closing `--` (also ignored).
+  const segments = body.split(delimiter);
+  for (let i = 1; i < segments.length; i++) {
+    let segment = segments[i];
+    // Strip leading CRLF after the boundary
+    if (segment.startsWith('\r\n')) segment = segment.slice(2);
+    else if (segment.startsWith('\n')) segment = segment.slice(1);
+    // The closing boundary is `--{boundary}--`; segment starts with `--` then EOL
+    if (segment.startsWith('--')) break;
+    // Trim trailing CRLF before the next boundary
+    if (segment.endsWith('\r\n')) segment = segment.slice(0, -2);
+    else if (segment.endsWith('\n')) segment = segment.slice(0, -1);
+
+    // Header/body split: first blank line
+    const headerEnd = segment.indexOf('\r\n\r\n');
+    const altHeaderEnd = headerEnd === -1 ? segment.indexOf('\n\n') : headerEnd;
+    if (altHeaderEnd === -1) continue;
+    const headersRaw = segment.slice(0, altHeaderEnd);
+    const partBody = segment.slice(altHeaderEnd + (headerEnd === -1 ? 2 : 4));
+
+    // Parse headers
+    let url: string | undefined;
+    let format: string | undefined;
+    for (const line of headersRaw.split(/\r?\n/)) {
+      const colon = line.indexOf(':');
+      if (colon === -1) continue;
+      const name = line.slice(0, colon).trim().toLowerCase();
+      const value = line.slice(colon + 1).trim();
+      if (name === 'content-location') url = value;
+      else if (name === 'content-type') format = inferFormatFromContentType(value);
+    }
+    if (!url) continue;
+    if (!format) {
+      // Fall back to the first requested format if the part has no content-type
+      format = formats[0];
+    }
+    if (!result[url]) result[url] = {};
+    result[url][format] = partBody;
+  }
+  return result;
+}
+
+function inferFormatFromContentType(ct: string): string | undefined {
+  const lc = ct.toLowerCase().split(';')[0].trim();
+  if (lc === 'text/html') return 'html';
+  if (lc === 'text/markdown') return 'markdown';
+  if (lc === 'text/plain') return 'text';
+  if (lc === 'application/json') return 'json';
+  return undefined;
+}

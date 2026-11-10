@@ -1,0 +1,28 @@
+{
+    "compilerOptions": {
+        "declaration": true,
+        "target": "es2022",
+        "types": ["node", "jest"],
+        "skipLibCheck": true,
+        "module": "ESNext",
+        "lib": ["ES2022", "ESNext", "dom"],
+        "moduleResolution": "Node",
+        "rootDir": ".",
+        "outDir": "build",
+        "allowSyntheticDefaultImports": true,
+        "importHelpers": true,
+        "alwaysStrict": true,
+        "sourceMap": true,
+        "forceConsistentCasingInFileNames": true,
+        "noFallthroughCasesInSwitch": true,
+        "noImplicitReturns": true,
+        "noUnusedLocals": true,
+        "noUnusedParameters": true,
+        "noImplicitAny": false,
+        "noImplicitThis": false,
+        "strictNullChecks": false,
+        "esModuleInterop": true
+    },
+    "include": ["src/**/*", "__tests__/**/*", "typings.d.ts"],
+    "exclude": ["examples/**/*", "build", "node_modules"]
+}
