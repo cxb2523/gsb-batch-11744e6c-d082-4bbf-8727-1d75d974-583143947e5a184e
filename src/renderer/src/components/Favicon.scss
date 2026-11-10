@@ -1,0 +1,12 @@
+.favicon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--ink-3);
+
+  img {
+    border-radius: 3px;
+    object-fit: contain;
+  }
+}

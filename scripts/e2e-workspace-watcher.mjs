@@ -1,0 +1,778 @@
+import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
+import fs from 'node:fs'
+import net from 'node:net'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import electronPath from 'electron'
+import { _electron as electron } from 'playwright-core'
+
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+// Workspace registration uses realpath; /var is a symlink on macOS.
+const testRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'melo-watcher-e2e-')))
+const workspace = path.join(testRoot, 'workspace')
+const profile = path.join(testRoot, 'profile')
+const LARGE_FOLDER_COUNT = Number(process.env.MELO_E2E_FOLDER_COUNT ?? 2500)
+const screenshotPath = process.env.MELO_E2E_SCREENSHOT
+const browseScreenshotPath = process.env.MELO_E2E_BROWSE_SCREENSHOT
+const clipScreenshotPath = process.env.MELO_E2E_CLIP_SCREENSHOT
+const smartScreenshotPath = process.env.MELO_E2E_SMART_SCREENSHOT
+const outlineScreenshotPath = process.env.MELO_E2E_OUTLINE_SCREENSHOT
+const tableScreenshotPath = process.env.MELO_E2E_TABLE_SCREENSHOT
+const smartBuilderScreenshotPath = process.env.MELO_E2E_SMART_BUILDER_SCREENSHOT
+const logs = []
+let app
+let socketServer
+
+const note = (title, body, source) =>
+  `${source ? `---\nsource: ${source}\ncreated: 2026-08-09T00:00:00Z\n---\n\n` : ''}# ${title}\n\n${body}\n`
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function waitUntil(label, check, timeout = 20000) {
+  const deadline = Date.now() + timeout
+  let lastError
+  while (Date.now() < deadline) {
+    try {
+      if (await check()) return
+    } catch (error) {
+      lastError = error
+    }
+    await sleep(100)
+  }
+  throw new Error(`${label} timed out${lastError ? `: ${lastError.message}` : ''}`)
+}
+
+const treeRow = (page, baseName) =>
+  page.locator('.tree-row', {
+    has: page.locator('.tree-name', { hasText: baseName }),
+  })
+
+function seedWorkspace() {
+  fs.mkdirSync(workspace, { recursive: true })
+  fs.mkdirSync(profile, { recursive: true })
+  fs.writeFileSync(
+    path.join(profile, 'preferences.json'),
+    JSON.stringify({ lastDirectory: workspace }, null, 2),
+  )
+  fs.writeFileSync(
+    path.join(workspace, 'captured.md'),
+    note('Captured', 'A note with source metadata.', 'https://www.example.com/article').replace(
+      '---\n\n',
+      'favicon: ".assets/favicons/example #1.svg"\n---\n\n',
+    ),
+  )
+  fs.mkdirSync(path.join(workspace, '.assets', 'favicons'), { recursive: true })
+  fs.writeFileSync(
+    path.join(workspace, '.assets', 'favicons', 'example #1.svg'),
+    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" rx="3" fill="#356ef6"/></svg>',
+  )
+  fs.writeFileSync(path.join(workspace, 'delete-me.md'), note('Delete Me', 'Remove externally.'))
+  fs.writeFileSync(
+    path.join(workspace, 'table-alignment.md'),
+    note(
+      'Table alignment',
+      '| Item | Status |\n| :--- | ---: |\n| First | One |\n| Second | Two |',
+    ),
+  )
+  fs.mkdirSync(path.join(workspace, '00 Parent', '00 Child', '00 Target', '00 Deep'), {
+    recursive: true,
+  })
+
+  for (let index = 0; index < LARGE_FOLDER_COUNT; index += 1) {
+    const folder = path.join(workspace, `Folder-${String(index).padStart(4, '0')}`)
+    fs.mkdirSync(folder)
+    fs.writeFileSync(path.join(folder, 'note.md'), note(`Note ${index}`, `Body ${index}`))
+    fs.writeFileSync(path.join(folder, 'one.txt'), `one ${index}`)
+    fs.writeFileSync(path.join(folder, 'two.txt'), `two ${index}`)
+  }
+}
+
+async function run() {
+  seedWorkspace()
+  // Mirrors folders such as svc/mysql/mysql.sock. It must be ignored as a
+  // special entry rather than watched, indexed, or surfaced as a document.
+  const socketPath = path.join(workspace, 'mysql.sock')
+  socketServer = net.createServer()
+  await new Promise((resolve, reject) => {
+    socketServer.once('error', reject)
+    socketServer.listen(socketPath, resolve)
+  })
+  const startedAt = Date.now()
+  app = await electron.launch({
+    executablePath: electronPath,
+    args: [projectRoot],
+    cwd: projectRoot,
+    env: {
+      ...process.env,
+      MELO_USER_DATA: profile,
+      ELECTRON_DISABLE_SECURITY_WARNINGS: '1',
+    },
+    timeout: 30000,
+  })
+
+  app.process().stdout?.on('data', (chunk) => logs.push(String(chunk)))
+  app.process().stderr?.on('data', (chunk) => logs.push(String(chunk)))
+
+  const page = await app.firstWindow({ timeout: 30000 })
+  page.on('console', (message) => {
+    if (message.type() === 'error' || message.type() === 'warning') {
+      logs.push(`[renderer:${message.type()}] ${message.text()}\n`)
+    }
+  })
+  page.on('pageerror', (error) => logs.push(`[renderer:pageerror] ${error.stack ?? error}\n`))
+
+  await page.locator('.sidebar').waitFor({ state: 'visible', timeout: 30000 })
+  if (process.platform === 'darwin') {
+    const nativeLabels = await app.evaluate(({ Menu }) =>
+      Menu.getApplicationMenu()
+        .items[0].submenu.items.filter((item) => ['about', 'hide', 'quit'].includes(item.role))
+        .map((item) => item.label),
+    )
+    assert.deepEqual(nativeLabels, ['About Melo', 'Hide Melo', 'Quit Melo'])
+  }
+  assert.equal(
+    await page.locator('.ws-opener').count(),
+    0,
+    'workspace should restore without a dialog',
+  )
+  await page.locator('.sf-row').first().waitFor({ state: 'visible', timeout: 30000 })
+  assert.deepEqual(
+    await page.locator('.sf-row-label').allTextContents(),
+    ['Recent', 'Web Clips', 'PDFs'],
+    'default smart folders should load on a cold start',
+  )
+  await page.locator('.sf-row').first().click()
+  const smartResults = page.locator('.sf-results')
+  await smartResults.waitFor({ state: 'visible', timeout: 30000 })
+  await page.locator('.res-row').first().waitFor({ state: 'visible', timeout: 30000 })
+
+  await page.locator('.sf-row', { hasText: 'Web Clips' }).click()
+  const smartNote = page.locator(`.res-row[data-path="${path.join(workspace, 'captured.md')}"]`)
+  await smartNote.click({ button: 'right' })
+  const smartMenu = page.locator('.ctx-menu')
+  await smartMenu.waitFor({ state: 'visible' })
+  assert.equal(await smartMenu.locator('.ctx-head').count(), 0)
+  assert.equal(await smartMenu.locator(':scope > :first-child .ctx-lbl').innerText(), 'Rename…')
+  await page.keyboard.press('Escape')
+  await smartMenu.waitFor({ state: 'hidden' })
+  assert(await smartResults.isVisible(), 'closing the file menu must keep the Smart Folder open')
+  await smartNote.click()
+  const outlineToggle = page.getByRole('button', { name: 'Toggle outline', exact: true })
+  const outline = page.locator('.outline')
+  await outlineToggle.click()
+  await outline.waitFor({ state: 'visible' })
+  await waitUntil('the outline should follow the open Smart Folder result', async () =>
+    (await outline.locator('.ol-label').allTextContents()).includes('Captured'),
+  )
+  assert(await smartResults.isVisible(), 'showing the outline should keep the results visible')
+  assert.equal(await page.locator('.app').getAttribute('data-outline'), 'shown')
+
+  await outlineToggle.click()
+  await outline.waitFor({ state: 'detached' })
+  assert.equal(await page.locator('.app').getAttribute('data-outline'), 'hidden')
+  await outlineToggle.click()
+  await outline.waitFor({ state: 'visible' })
+
+  await treeRow(page, 'delete-me').first().click()
+  await page.locator('.smart-view').waitFor({ state: 'detached' })
+  await waitUntil(
+    'workspace browsing should preserve the outline and update its headings',
+    async () => (await outline.locator('.ol-label').allTextContents()).includes('Delete Me'),
+  )
+  const prose = page.locator('.ProseMirror')
+  const originalBlocks = await prose.locator(':scope > *').count()
+  const beforeBlankClick = await prose.innerText()
+  const modifier = process.platform === 'darwin' ? 'Meta' : 'Control'
+  await prose.locator(':scope > p').last().click()
+  await page.keyboard.press(modifier === 'Meta' ? 'Meta+ArrowRight' : 'End')
+  await page.keyboard.press('Enter')
+  await waitUntil(
+    'Enter should split a paragraph and place the caret in the new paragraph',
+    async () =>
+      (await prose.locator(':scope > *').count()) === originalBlocks + 1 &&
+      (await prose.locator(':scope > p:last-child').textContent()) === '',
+  )
+  await page.keyboard.press(`${modifier}+Z`)
+  await waitUntil(
+    'paragraph splitting should undo',
+    async () =>
+      (await prose.locator(':scope > *').count()) === originalBlocks &&
+      (await prose.innerText()) === beforeBlankClick,
+  )
+  for (const target of ['ed-page', 'ed-scroll', 'ed-page']) {
+    const point = await page.evaluate((target) => {
+      const editor = document.querySelector('.ProseMirror').getBoundingClientRect()
+      const surface = document.querySelector('.ed-scroll').getBoundingClientRect()
+      return {
+        x: editor.left + 80,
+        y: target === 'ed-page' ? editor.bottom + 40 : surface.bottom - 24,
+      }
+    }, target)
+    assert(
+      await page.evaluate(
+        ({ x, y, target }) => document.elementFromPoint(x, y)?.classList.contains(target),
+        { ...point, target },
+      ),
+      `fixture should expose blank space in ${target}`,
+    )
+    await prose.locator('h1').click()
+    await page.keyboard.press('ArrowRight')
+    await page.keyboard.press(`${modifier}+B`)
+    await page.mouse.click(point.x, point.y)
+    await waitUntil('blank-space click should focus an empty final paragraph', () =>
+      page.evaluate(() => {
+        const editor = document.querySelector('.ProseMirror')
+        const last = editor.lastElementChild
+        const selection = window.getSelection()
+        return (
+          document.activeElement === editor &&
+          last.tagName === 'P' &&
+          last.textContent === '' &&
+          selection?.isCollapsed &&
+          last.contains(selection.anchorNode)
+        )
+      }),
+    )
+    assert.equal(
+      await prose.locator(':scope > *').count(),
+      originalBlocks + 1,
+      'repeated blank-space clicks must reuse the empty final paragraph',
+    )
+  }
+  await page.keyboard.type('Blank-click continuation.')
+  assert.equal(
+    await prose.locator(':scope > p:last-child').innerHTML(),
+    'Blank-click continuation.',
+    'the new paragraph must not inherit bold or heading formatting',
+  )
+  await waitUntil('typing after a blank-space click should persist as a new paragraph', () =>
+    fs
+      .readFileSync(path.join(workspace, 'delete-me.md'), 'utf8')
+      .trimEnd()
+      .endsWith('Remove externally.\n\nBlank-click continuation.'),
+  )
+  await page.keyboard.press(`${modifier}+Z`)
+  await waitUntil(
+    'typing should undo normally',
+    async () => !(await prose.innerText()).includes('Blank-click continuation.'),
+  )
+  // Typing may share the insertion's history group if it begins immediately.
+  const separateInsertion = (await prose.locator(':scope > *').count()) > originalBlocks
+  if (separateInsertion) {
+    await page.keyboard.press(`${modifier}+Z`)
+  }
+  await waitUntil(
+    'the empty paragraph insertion should also undo',
+    async () =>
+      (await prose.locator(':scope > *').count()) === originalBlocks &&
+      (await prose.innerText()) === beforeBlankClick,
+  )
+  await page.keyboard.press(`${modifier}+Shift+Z`)
+  if (separateInsertion) await page.keyboard.press(`${modifier}+Shift+Z`)
+  await waitUntil(
+    'redo should restore the new paragraph',
+    async () =>
+      (await prose.locator(':scope > p:last-child').innerHTML()) === 'Blank-click continuation.',
+  )
+  await treeRow(page, 'captured').first().click()
+  await waitUntil('switch away from the edited document', async () =>
+    (await prose.innerText()).includes('A note with source metadata.'),
+  )
+  await treeRow(page, 'delete-me').first().click()
+  await waitUntil(
+    'reopening should preserve the new paragraph without extra blanks',
+    async () =>
+      (await prose.locator(':scope > *').count()) === originalBlocks + 1 &&
+      (await prose.locator(':scope > p:last-child').innerHTML()) === 'Blank-click continuation.',
+  )
+
+  const tableFile = path.join(workspace, 'table-alignment.md')
+  const tableAlignments = () =>
+    prose
+      .locator('tr')
+      .evaluateAll((rows) =>
+        rows.map((row) =>
+          Array.from(row.querySelectorAll('th p, td p'), (p) => getComputedStyle(p).textAlign),
+        ),
+      )
+  const expectedAlignments = (alignment) => Array.from({ length: 3 }, () => [alignment, 'right'])
+  for (const alignment of ['center', 'right', 'left']) {
+    await treeRow(page, 'table-alignment').first().click()
+    const row = alignment === 'right' ? 0 : 1
+    await prose.locator('tr').nth(row).locator('th, td').first().click()
+    await page.getByRole('button', { name: 'Cell options', exact: true }).click()
+    await page.getByRole('menuitem', { name: `Align ${alignment}`, exact: true }).click()
+    await waitUntil(
+      `the whole column should align ${alignment}`,
+      async () =>
+        JSON.stringify(await tableAlignments()) === JSON.stringify(expectedAlignments(alignment)),
+    )
+    if (alignment === 'center') {
+      await prose.locator('td').first().click()
+      await page.keyboard.press(`${modifier}+Z`)
+      assert.deepEqual(await tableAlignments(), expectedAlignments('left'))
+      await page.keyboard.press(`${modifier}+Shift+Z`)
+      assert.deepEqual(await tableAlignments(), expectedAlignments('center'))
+      if (tableScreenshotPath) await page.screenshot({ path: tableScreenshotPath })
+    }
+    await page.keyboard.press(`${modifier}+S`)
+    await waitUntil('alignment should persist in the Markdown delimiter row', () => {
+      const separator = fs
+        .readFileSync(tableFile, 'utf8')
+        .split('\n')
+        .find((line) => /^\|\s*:?-{3,}:?\s*\|/u.test(line))
+      return alignment === 'center'
+        ? /^\|\s*:-+:\s*\|/u.test(separator ?? '')
+        : alignment === 'right'
+          ? /^\|\s*-+:\s*\|/u.test(separator ?? '')
+          : /^\|\s*:-+\s*\|/u.test(separator ?? '')
+    })
+    await treeRow(page, 'captured').first().click()
+    await prose.locator('h1', { hasText: 'Captured' }).waitFor()
+    await treeRow(page, 'table-alignment').first().click()
+    await waitUntil(
+      'alignment should survive reopening the document',
+      async () =>
+        JSON.stringify(await tableAlignments()) === JSON.stringify(expectedAlignments(alignment)),
+    )
+  }
+  await treeRow(page, 'captured').first().click()
+  await page.locator('.sf-row', { hasText: 'Web Clips' }).click()
+  await smartResults.waitFor({ state: 'visible' })
+  await waitUntil('returning to Smart Folders should preserve the visible outline', async () =>
+    (await outline.locator('.ol-label').allTextContents()).includes('Captured'),
+  )
+
+  const originalWindowSize = await app.evaluate(({ BrowserWindow }) =>
+    BrowserWindow.getAllWindows()[0].getSize(),
+  )
+  const originalListWidth = (await page.locator('.smart-view').boundingBox()).width
+  const preferredWidths = await page.evaluate(() => ({
+    sidebar: localStorage.getItem('melo.sidebarWidth'),
+    smartList: localStorage.getItem('melo.smartListWidth'),
+  }))
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(800, 860))
+  await waitUntil(
+    'a narrow Smart Folder should collapse the sidebar',
+    async () => (await page.locator('.app').getAttribute('data-sidebar')) === 'hidden',
+  )
+  assert(
+    (await page.locator('.center-pane').boundingBox()).width >= 320,
+    'showing the outline at 800px should preserve usable editor space',
+  )
+  assert(
+    (await page.locator('.smart-view').boundingBox()).width >= 240,
+    'the Smart Folder list should retain its minimum width',
+  )
+  assert(
+    await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+    'the narrow layout should fit without horizontal overflow',
+  )
+
+  await app.evaluate(({ BrowserWindow }) =>
+    BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(1.25),
+  )
+  await waitUntil('the zoomed layout should fit beside the outline', async () => {
+    const editor = await page.locator('.center-pane').boundingBox()
+    const outlineBox = await outline.boundingBox()
+    return (
+      editor.width > 0 &&
+      editor.x + editor.width <= outlineBox.x &&
+      (await page.evaluate(() => window.innerWidth < 800))
+    )
+  })
+  await app.evaluate(({ BrowserWindow }) =>
+    BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(1),
+  )
+  await waitUntil('resetting zoom should restore the CSS viewport', () =>
+    page.evaluate(() => window.innerWidth >= 800),
+  )
+
+  await page.getByRole('button', { name: 'Toggle files', exact: true }).click()
+  await outline.waitFor({ state: 'detached' })
+  await waitUntil(
+    'explicitly opening the sidebar should make room by closing the outline',
+    async () => (await page.locator('.app').getAttribute('data-sidebar')) === 'shown',
+  )
+
+  await app.evaluate(({ BrowserWindow }) =>
+    BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(1.25),
+  )
+  await waitUntil(
+    'zooming in should adapt to the smaller CSS viewport',
+    async () => (await page.locator('.app').getAttribute('data-sidebar')) === 'hidden',
+  )
+  await page.getByRole('button', { name: 'Toggle files', exact: true }).click()
+  await page.locator('.smart-view').waitFor({ state: 'detached' })
+  await page.locator('.sidebar').waitFor({ state: 'visible' })
+  await app.evaluate(({ BrowserWindow }) =>
+    BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(1),
+  )
+  await page.locator('.sf-row', { hasText: 'Web Clips' }).click()
+  await smartResults.waitFor({ state: 'visible' })
+  await outlineToggle.click()
+  await outline.waitFor({ state: 'visible' })
+  await app.evaluate(
+    ({ BrowserWindow }, [width, height]) => BrowserWindow.getAllWindows()[0].setSize(width, height),
+    originalWindowSize,
+  )
+  await waitUntil(
+    'widening the window should restore the sidebar',
+    async () => (await page.locator('.app').getAttribute('data-sidebar')) === 'shown',
+  )
+  assert.equal((await page.locator('.smart-view').boundingBox()).width, originalListWidth)
+  assert.deepEqual(
+    await page.evaluate(() => ({
+      sidebar: localStorage.getItem('melo.sidebarWidth'),
+      smartList: localStorage.getItem('melo.smartListWidth'),
+    })),
+    preferredWidths,
+    'responsive layout should not overwrite preferred pane widths',
+  )
+  if (outlineScreenshotPath) {
+    await page.screenshot({ path: outlineScreenshotPath, fullPage: true })
+  }
+  await outlineToggle.click()
+  await outline.waitFor({ state: 'detached' })
+
+  await page.locator('.sf-row', { hasText: 'Recent' }).click()
+  await smartResults.waitFor({ state: 'visible' })
+  await page.locator('.res-row').first().waitFor({ state: 'visible' })
+
+  const sortButton = page.locator('.sf-sort')
+  await sortButton.click()
+  await page.locator('.pop-opt', { hasText: 'Oldest first' }).click()
+  await waitUntil('smart-folder sort should persist', () => {
+    const views = JSON.parse(fs.readFileSync(path.join(workspace, '.melo', 'views.json'), 'utf8'))
+    return views.find((view) => view.id === 'recent')?.sort === 'Oldest first'
+  })
+  await page.locator('.sf-row', { hasText: 'Web Clips' }).click()
+  await page.locator('.sf-row', { hasText: 'Recent' }).click()
+  await waitUntil('smart-folder sort should survive switching views', async () =>
+    (await sortButton.innerText()).includes('Oldest first'),
+  )
+  await sortButton.click()
+  await page.locator('.pop-opt', { hasText: 'Newest first' }).click()
+  await waitUntil('restored sort should persist', () => {
+    const views = JSON.parse(fs.readFileSync(path.join(workspace, '.melo', 'views.json'), 'utf8'))
+    return views.find((view) => view.id === 'recent')?.sort === 'Newest first'
+  })
+
+  await page.locator('.sv-iconbtn').click()
+  const addRule = page.locator('.smart-modal .rule-add')
+  for (let ruleNumber = 1; ruleNumber <= 20; ruleNumber += 1) {
+    await addRule.scrollIntoViewIfNeeded()
+    await addRule.click()
+    await page.locator('.smart-modal .pop-opt', { hasText: /^Kind$/ }).click()
+  }
+  assert(await addRule.isDisabled(), 'the builder should stop at the shared 20-rule limit')
+  assert.match(
+    (await addRule.getAttribute('title')) ?? '',
+    /20/,
+    'the disabled rule control should explain its limit',
+  )
+  if (smartBuilderScreenshotPath) {
+    await page.screenshot({ path: smartBuilderScreenshotPath, fullPage: true })
+  }
+  await page.locator('.smart-modal .modal-close').click()
+  await page.locator('.smart-modal').waitFor({ state: 'detached' })
+
+  let smartHeight = await smartResults.evaluate((element) => element.scrollHeight)
+  // Initial 50 + four more pages proves the view continues beyond the old
+  // 200-result ceiling without making the DOM grow with every loaded row.
+  for (let pageNumber = 2; pageNumber <= 5; pageNumber += 1) {
+    const previousHeight = smartHeight
+    await smartResults.evaluate((element) => {
+      element.scrollTop = element.scrollHeight
+      element.dispatchEvent(new Event('scroll'))
+    })
+    await waitUntil(`recent page ${pageNumber} should load while scrolling`, async () => {
+      smartHeight = await smartResults.evaluate((element) => element.scrollHeight)
+      return smartHeight > previousHeight
+    })
+  }
+  assert(
+    smartHeight > 10_000,
+    `Recent should contain more than 200 loaded rows; scroll height is ${smartHeight}px`,
+  )
+  const mountedSmartRows = await smartResults.locator('.res-row').count()
+  assert(
+    mountedSmartRows < 60,
+    `recent items should virtualize loaded pages; mounted ${mountedSmartRows} rows`,
+  )
+  if (smartScreenshotPath) {
+    await smartResults.evaluate((element) => {
+      element.scrollTop = 0
+      element.dispatchEvent(new Event('scroll'))
+    })
+    await page.screenshot({ path: smartScreenshotPath, fullPage: true })
+  }
+  assert.equal(await treeRow(page, 'mysql').count(), 0, 'Unix sockets must not appear in the tree')
+
+  // This is the regression that the split index/filesystem event introduced:
+  // source metadata must appear after the initial index finishes.
+  const capturedRow = treeRow(page, 'captured').first()
+  await capturedRow.waitFor({ state: 'attached', timeout: 30000 })
+  const clipIcon = capturedRow.locator('.tree-file-icon.ft-clip')
+  await clipIcon.waitFor({
+    state: 'attached',
+    timeout: 30000,
+  })
+  assert.match(
+    (await clipIcon.locator('title').textContent()) ?? '',
+    /Web clipping|网页剪藏/,
+    'a sourced note should identify itself as a web clipping',
+  )
+  assert.match(
+    (await clipIcon.locator('title').textContent()) ?? '',
+    /example\.com/,
+    'the clip icon tooltip should name the source host',
+  )
+  assert.equal(
+    await capturedRow.locator('.tree-source-dot').count(),
+    0,
+    'source initials should not appear as a separate status marker',
+  )
+  await capturedRow.click()
+  const bannerFavicon = page.locator('.ed-clip .favicon img')
+  await waitUntil('the captured local favicon should load in the document', () =>
+    bannerFavicon.evaluate((image) => image.complete && image.naturalWidth > 0),
+  )
+  await capturedRow.click({ button: 'right' })
+  await page.locator('.ctx-item', { hasText: 'Properties' }).click()
+  const propertiesFavicon = page.locator('.prop-card .favicon img')
+  await waitUntil(
+    'properties should reuse the same local favicon',
+    async () =>
+      (await propertiesFavicon.getAttribute('src')) === (await bannerFavicon.getAttribute('src')) &&
+      (await propertiesFavicon.evaluate((image) => image.complete && image.naturalWidth > 0)),
+  )
+  if (clipScreenshotPath) {
+    await page.screenshot({
+      path: clipScreenshotPath.replace(/\.png$/, '-properties.png'),
+      fullPage: true,
+    })
+  }
+  await page.locator('.prop-close').click()
+  if (clipScreenshotPath) {
+    await capturedRow.scrollIntoViewIfNeeded()
+    await page.screenshot({ path: clipScreenshotPath, fullPage: true })
+  }
+
+  // External create → tree, editor, and full-text index.
+  const externalPath = path.join(workspace, 'external-added.md')
+  fs.writeFileSync(
+    externalPath,
+    note('External Added', 'The first external body uses amberwatchertoken.'),
+  )
+  const externalRow = treeRow(page, 'external-added').first()
+  await externalRow.waitFor({ state: 'attached', timeout: 20000 })
+  await externalRow.scrollIntoViewIfNeeded()
+  await externalRow.click()
+  await waitUntil('external file should open in the editor', async () =>
+    (await page.locator('.ProseMirror').innerText()).includes('amberwatchertoken'),
+  )
+
+  // External update → a clean active document reloads, and the updated body is
+  // searchable through the real renderer→IPC→SQLite path.
+  fs.writeFileSync(
+    externalPath,
+    note('External Added', 'The updated external body uses ceruleanwatchertoken.'),
+  )
+  await waitUntil('external edit should reconcile the active document', async () =>
+    (await page.locator('.ProseMirror').innerText()).includes('ceruleanwatchertoken'),
+  )
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+K' : 'Control+K')
+  await page.locator('.sf-input').fill('ceruleanwatchertoken')
+  await page
+    .locator('.pb-row-title', { hasText: /external-added/i })
+    .first()
+    .waitFor({ state: 'visible', timeout: 20000 })
+  await page.keyboard.press('Escape')
+
+  // External deletion and a populated directory import exercise remove and
+  // parent-first subtree compaction.
+  fs.unlinkSync(path.join(workspace, 'delete-me.md'))
+  await treeRow(page, 'delete-me').first().waitFor({ state: 'detached', timeout: 20000 })
+
+  const imported = path.join(workspace, 'Imported')
+  fs.mkdirSync(imported)
+  fs.writeFileSync(path.join(imported, 'inside.md'), note('Inside Imported', 'Imported child.'))
+  const importedRow = treeRow(page, 'Imported').first()
+  await importedRow.waitFor({ state: 'attached', timeout: 20000 })
+  await importedRow.scrollIntoViewIfNeeded()
+  await importedRow.click()
+  await treeRow(page, 'inside').first().waitFor({ state: 'visible', timeout: 10000 })
+
+  // Move To opens one searchable folder picker. Its browse list stays virtual
+  // even at the workspace root, search understands full paths, and confirming
+  // moves the real active file while keeping its open tab attached.
+  await externalRow.scrollIntoViewIfNeeded()
+  await externalRow.click({ button: 'right' })
+  const fileMenu = page.locator('.ctx-menu')
+  await fileMenu.waitFor({ state: 'visible' })
+  assert.equal(await fileMenu.locator('.ctx-head').count(), 0)
+  assert.equal(await fileMenu.locator(':scope > :first-child .ctx-lbl').innerText(), 'Rename…')
+  const moveTrigger = page
+    .locator('.ctx-item')
+    .filter({ hasText: /Move to|移动到/ })
+    .first()
+  await moveTrigger.click()
+  const moveDialog = page.locator('.move-dialog')
+  await moveDialog.waitFor({ state: 'visible', timeout: 10000 })
+  assert.equal(await page.locator('.ctx-submenu').count(), 0, 'Move To should not open a submenu')
+  const dialogBox = await moveDialog.boundingBox()
+  assert(dialogBox, 'Move To dialog should have a layout box')
+  assert(dialogBox.width <= 496, `Move To dialog is unexpectedly wide: ${dialogBox.width}px`)
+  const moveList = moveDialog.locator('.move-dialog-list')
+  const mountedAtTop = await moveList.locator('.move-dialog-row').count()
+  assert(
+    mountedAtTop > 0 && mountedAtTop < 30,
+    `Move picker should virtualize ${LARGE_FOLDER_COUNT} folders; mounted ${mountedAtTop}`,
+  )
+  const moveButton = moveDialog.locator('.move-dialog-confirm')
+  assert(
+    await moveButton.isDisabled(),
+    'Move here should be disabled for the source current parent',
+  )
+  assert.equal(
+    await moveList.locator('.move-dialog-row.active').count(),
+    0,
+    'browse mode should not make the first folder look selected',
+  )
+  if (browseScreenshotPath) {
+    await page.screenshot({ path: browseScreenshotPath, fullPage: true })
+  }
+  await moveList.evaluate((element) => {
+    element.scrollTop = element.scrollHeight
+    element.dispatchEvent(new Event('scroll'))
+  })
+  await waitUntil('virtual move picker should reach its final folder', async () => {
+    const text = await moveList.innerText()
+    return text.includes(`Folder-${String(LARGE_FOLDER_COUNT - 1).padStart(4, '0')}`)
+  })
+  assert((await moveList.locator('.move-dialog-row').count()) < 30, 'move list should stay bounded')
+
+  await moveList.evaluate((element) => {
+    element.scrollTop = 0
+    element.dispatchEvent(new Event('scroll'))
+  })
+  const parentFolderRow = moveDialog.locator('.move-dialog-row', { hasText: '00 Parent' })
+  await parentFolderRow.waitFor({ state: 'visible' })
+  await parentFolderRow.click()
+  await moveDialog
+    .locator('.move-dialog-row', { hasText: '00 Child' })
+    .waitFor({ state: 'visible' })
+  const workspaceCrumb = moveDialog.locator('.move-dialog-breadcrumbs button').first()
+  await workspaceCrumb.click()
+  await parentFolderRow.waitFor({ state: 'visible' })
+
+  const moveSearch = moveDialog.locator('.move-dialog-search input')
+  await moveSearch.fill('folder that does not exist')
+  assert(await moveButton.isDisabled(), 'Move here should be disabled when search has no results')
+  await moveSearch.fill('00 Deep')
+  const deepResult = moveDialog.locator('.move-dialog-row', { hasText: '00 Deep' })
+  await deepResult.waitFor({ state: 'visible' })
+  assert.equal(
+    await deepResult.locator('.move-dialog-row-path').innerText(),
+    '00 Parent / 00 Child / 00 Target',
+    'search results should show the complete parent path',
+  )
+  assert(!(await moveButton.isDisabled()), 'the highlighted search result should be confirmable')
+  assert.equal(
+    await moveDialog.locator('.move-dialog-destination strong').innerText(),
+    '00 Parent / 00 Child / 00 Target / 00 Deep',
+  )
+  const searchListBox = await moveList.boundingBox()
+  assert(
+    searchListBox?.height === 36,
+    `single search result should use a 36px list, got ${searchListBox?.height}`,
+  )
+  if (screenshotPath) await page.screenshot({ path: screenshotPath, fullPage: true })
+  await moveSearch.press('Enter')
+  await moveDialog.waitFor({ state: 'detached', timeout: 10000 })
+  const movedPath = path.join(
+    workspace,
+    '00 Parent',
+    '00 Child',
+    '00 Target',
+    '00 Deep',
+    'external-added.md',
+  )
+  await waitUntil('Move To should move the file on disk', () => fs.existsSync(movedPath))
+  assert(!fs.existsSync(externalPath), 'the old source path should be gone after moving')
+  const activeTabPath = await page.locator('.ed-tab[data-active="true"]').getAttribute('title')
+  assert(
+    activeTabPath?.endsWith('/00 Parent/00 Child/00 Target/00 Deep/external-added.md'),
+    `active tab did not follow the moved file: ${activeTabPath}`,
+  )
+  await waitUntil('moved active note should remain open', async () =>
+    (await page.locator('.ProseMirror').innerText()).includes('ceruleanwatchertoken'),
+  )
+
+  await sleep(500)
+  const combinedLogs = logs.join('')
+  assert(!/EMFILE|too many open files/i.test(combinedLogs), `unexpected EMFILE:\n${combinedLogs}`)
+  assert(
+    !/Skipping inaccessible file:.*mysql\.sock/i.test(combinedLogs),
+    `Unix socket should be ignored without an accessibility warning:\n${combinedLogs}`,
+  )
+  assert(
+    !/javascript heap out of memory|allocation failure/i.test(combinedLogs),
+    'renderer OOM detected',
+  )
+  assert(!/renderer:pageerror/i.test(combinedLogs), `renderer page error:\n${combinedLogs}`)
+
+  const rssKb = Number(
+    execFileSync('ps', ['-o', 'rss=', '-p', String(app.process().pid)], {
+      encoding: 'utf8',
+    }).trim(),
+  )
+  console.log(
+    JSON.stringify(
+      {
+        ok: true,
+        folders: LARGE_FOLDER_COUNT,
+        seededFiles: LARGE_FOLDER_COUNT * 3 + 3,
+        elapsedMs: Date.now() - startedAt,
+        mainProcessRssMb: Math.round(rssKb / 1024),
+        moveRowsMounted: mountedAtTop,
+        smartRowsMounted: mountedSmartRows,
+        smartResultsScrollHeight: smartHeight,
+        moveDialogWidth: Math.round(dialogBox.width),
+        moveDialogHeight: Math.round(dialogBox.height),
+        screenshot: screenshotPath ?? null,
+      },
+      null,
+      2,
+    ),
+  )
+}
+
+try {
+  await run()
+} catch (error) {
+  console.error(error)
+  if (logs.length) console.error('\n--- Electron logs ---\n' + logs.join(''))
+  if (app) {
+    const pages = app.windows()
+    if (pages[0]) {
+      await pages[0]
+        .screenshot({ path: path.join(testRoot, 'failure.png'), fullPage: true })
+        .catch(() => {})
+      console.error(`Failure screenshot: ${path.join(testRoot, 'failure.png')}`)
+    }
+  }
+  process.exitCode = 1
+} finally {
+  // macOS apps stay alive after their last window closes. Terminate only this
+  // Playwright-owned Electron process so the test never lingers in the Dock.
+  if (app) await app.evaluate(({ app: electronApp }) => electronApp.exit(0)).catch(() => {})
+  if (socketServer) {
+    await new Promise((resolve) => socketServer.close(resolve)).catch(() => {})
+  }
+  if (process.exitCode) console.error(`Preserved E2E files for diagnosis: ${testRoot}`)
+  else fs.rmSync(testRoot, { recursive: true, force: true })
+}

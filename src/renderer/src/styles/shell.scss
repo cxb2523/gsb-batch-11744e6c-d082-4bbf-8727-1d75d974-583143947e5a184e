@@ -1,0 +1,107 @@
+/* ============================================================
+   App shell — three-column grid: sidebar | editor | outline.
+   Sidebar and outline collapse to 0 via data attributes.
+   ============================================================ */
+
+.app {
+  --sidebar-layout-w: var(--sidebar-w);
+  --outline-layout-w: var(--outline-w);
+  display: grid;
+  grid-template-columns: var(--sidebar-layout-w) minmax(0, 1fr) var(--outline-layout-w);
+  height: 100vh;
+  background: transparent;
+}
+
+.app[data-sidebar='hidden'] {
+  --sidebar-layout-w: 0px;
+}
+
+.app[data-outline='hidden'] {
+  --outline-layout-w: 0px;
+}
+
+/* Keep an automatically collapsed sidebar mounted: it owns document-action
+   listeners and may hold an open dialog. Visibility also removes tab stops. */
+.app[data-sidebar='hidden'] > .sidebar {
+  visibility: hidden;
+}
+
+/* Preserve the preferred widths while reserving room for both center panes.
+   App collapses the sidebar when even its minimum width cannot fit. */
+.app[data-smart][data-sidebar='shown'] {
+  --sidebar-layout-w: min(
+    var(--sidebar-w),
+    calc(100% - var(--outline-layout-w) - var(--smart-list-min-w) - var(--editor-min-w))
+  );
+}
+.app[data-smart] .smart-view {
+  min-width: var(--smart-list-min-w);
+  max-width: calc(100% - var(--editor-min-w));
+}
+.app[data-smart] .center-pane {
+  /* Zoom can reduce the CSS viewport below the native window minimum. */
+  min-width: min(var(--editor-min-w), max(0px, calc(100% - var(--smart-list-min-w))));
+}
+
+/* Region placeholders — replaced by real components per phase.
+   `overflow: hidden` keeps a collapsed column from leaking content. */
+.app-region {
+  min-width: 0;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.app-outline {
+  border-left: 1px solid var(--hairline);
+  background: var(--paper);
+}
+
+/* Zero the placeholder border when collapsed so a 0-width column
+   doesn't leave a 1px sliver. */
+.app[data-outline='hidden'] .app-outline {
+  border-left: 0;
+}
+
+/* When the sidebar is collapsed, the leftmost top bar needs room for
+   macOS traffic lights. If the smart list is visible it's the leftmost
+   element; otherwise the editor top bar is. */
+.app[data-sidebar='hidden'] .ed-top,
+.app[data-sidebar='hidden'] .sv-top {
+  padding-left: 78px;
+}
+.app[data-sidebar='hidden'][data-smart] .ed-top {
+  padding-left: 18px;
+}
+
+/* Smart folder active: center-region becomes horizontal (list | editor).
+   The editor tab bar is redundant — the smart list IS the navigation. */
+.app[data-smart] .center-region {
+  flex-direction: row;
+}
+.app[data-smart] .ed-tabs {
+  display: none;
+}
+
+/* Center cell hosts the editor and the smart-folder view; whichever is
+   hidden keeps its state (the editor must not unmount mid-edit). */
+.center-region {
+  min-width: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--paper);
+}
+.center-region > .center-pane {
+  flex: 1;
+  /* min-width matters in smart mode, where center-region flows as a row:
+     without it the editor pane refuses to shrink below its content and
+     gets clipped at the window edge instead of reflowing. */
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.center-region .editor-col {
+  flex: 1;
+  min-height: 0;
+}

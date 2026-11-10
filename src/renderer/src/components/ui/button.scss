@@ -1,0 +1,98 @@
+.ui-button {
+  display: inline-flex;
+  min-width: 80px;
+  height: 32px;
+  padding: 0 14px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+  transition:
+    background 120ms var(--ease),
+    border-color 120ms var(--ease),
+    color 120ms var(--ease),
+    transform 80ms var(--ease);
+}
+
+.ui-button-small {
+  min-width: 64px;
+  height: 28px;
+  padding: 0 10px;
+}
+
+.ui-button:focus-visible {
+  outline: 2px solid var(--accent-line);
+  outline-offset: 2px;
+}
+
+.ui-button:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.ui-button-secondary {
+  border-color: var(--hairline-2);
+  background: var(--paper);
+  color: var(--ink-2);
+}
+
+.ui-button-secondary:hover:not(:disabled) {
+  border-color: var(--hairline);
+  background: var(--paper-2);
+  color: var(--ink);
+}
+
+.ui-button-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.ui-button-primary:hover:not(:disabled) {
+  border-color: var(--accent-hover);
+  background: var(--accent-hover);
+}
+
+[data-theme='dark'] .ui-button-primary {
+  color: var(--paper);
+}
+
+.ui-button-danger {
+  border-color: transparent;
+  background: var(--danger);
+  color: var(--paper);
+}
+
+.ui-button-danger:hover:not(:disabled) {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--danger) 90%, var(--ink));
+  color: var(--paper);
+}
+
+.ui-button-danger-ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--danger);
+}
+
+.ui-button-danger-ghost:hover:not(:disabled),
+.ui-button-danger-ghost[data-state='open']:not(:disabled) {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--danger) 10%, var(--paper));
+  color: var(--danger);
+}
+
+.ui-button-danger:focus-visible,
+.ui-button-danger-ghost:focus-visible {
+  outline-color: var(--danger);
+}
+
+.ui-button:disabled {
+  cursor: default;
+  border-color: var(--hairline);
+  background: var(--paper-3);
+  color: var(--ink-4);
+}
