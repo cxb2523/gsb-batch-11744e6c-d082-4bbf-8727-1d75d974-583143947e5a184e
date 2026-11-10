@@ -1,0 +1,1172 @@
+:root {
+  color-scheme: light dark;
+  --bg-1: #f2f6fb;
+  --bg-2: #e7eef8;
+  --surface: #ffffff;
+  --surface-2: #eff4fb;
+  --text: #101b2b;
+  --muted: #536074;
+  --border: #d7e1ef;
+  --accent: #2a6fd6;
+  --accent-2: #3a86ff;
+  --shadow: 0 24px 60px rgba(9, 18, 33, 0.14);
+  --glow: 0 0 0 2px rgba(42, 111, 214, 0.15);
+  --grid: rgba(12, 18, 35, 0.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-1: #0b111a;
+    --bg-2: #0f1724;
+    --surface: #141e2c;
+    --surface-2: #1a2536;
+    --text: #e6edf7;
+    --muted: #9fb0c7;
+    --border: #233049;
+    --accent: #3a7de0;
+    --accent-2: #61a8ff;
+    --shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
+    --glow: 0 0 0 2px rgba(97, 168, 255, 0.2);
+    --grid: rgba(255, 255, 255, 0.05);
+  }
+}
+
+html[data-theme="light"],
+.export-document {
+  color-scheme: light;
+  --bg-1: #f2f6fb;
+  --bg-2: #e7eef8;
+  --surface: #ffffff;
+  --surface-2: #eff4fb;
+  --text: #101b2b;
+  --muted: #536074;
+  --border: #d7e1ef;
+  --accent: #2a6fd6;
+  --accent-2: #3a86ff;
+  --shadow: 0 24px 60px rgba(9, 18, 33, 0.14);
+  --glow: 0 0 0 2px rgba(42, 111, 214, 0.15);
+  --grid: rgba(12, 18, 35, 0.05);
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg-1: #0b111a;
+  --bg-2: #0f1724;
+  --surface: #141e2c;
+  --surface-2: #1a2536;
+  --text: #e6edf7;
+  --muted: #9fb0c7;
+  --border: #233049;
+  --accent: #3a7de0;
+  --accent-2: #61a8ff;
+  --shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
+  --glow: 0 0 0 2px rgba(97, 168, 255, 0.2);
+  --grid: rgba(255, 255, 255, 0.05);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Components set their own display, which would otherwise beat the attribute. */
+[hidden] {
+  display: none !important;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: "Sora", "Space Grotesk", "Avenir Next", sans-serif;
+  color: var(--text);
+  background: radial-gradient(1200px 600px at 15% 10%, rgba(66, 149, 255, 0.24), transparent 60%),
+    radial-gradient(900px 500px at 85% 10%, rgba(28, 78, 160, 0.2), transparent 60%),
+    linear-gradient(145deg, var(--bg-1), var(--bg-2));
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background-image: linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 42px 42px;
+  pointer-events: none;
+  opacity: 0.4;
+  z-index: 0;
+}
+
+.backdrop {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 28px 28px 36px;
+  gap: 24px;
+}
+
+.topbar {
+  /* Above the panes: both animate in with a transform, which makes each its own
+     stacking context, and the Export menu must open over the document, not under it. */
+  position: relative;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+  animation: rise 0.7s ease both;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.logo {
+  width: 54px;
+  height: 54px;
+  border-radius: 16px;
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  font-size: 20px;
+  text-transform: uppercase;
+  color: #f5f8ff;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  box-shadow: var(--shadow);
+}
+
+a.logo {
+  text-decoration: none;
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 28px;
+  letter-spacing: -0.02em;
+}
+
+.brand p {
+  margin: 4px 0 0;
+  color: var(--muted);
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  animation: rise 0.7s ease 0.1s both;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 9px 18px;
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.2;
+  text-decoration: none;
+  background: linear-gradient(120deg, var(--accent), var(--accent-2));
+  color: #f5f8ff;
+  cursor: pointer;
+  box-shadow: var(--glow);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 18px rgba(58, 134, 255, 0.35);
+}
+
+.btn--ghost {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.btn--ghost:hover {
+  box-shadow: 0 10px 24px rgba(15, 20, 28, 0.2);
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  min-height: 38px;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--muted);
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.toggle input {
+  accent-color: var(--accent);
+}
+
+.repo {
+  display: inline-flex;
+  align-items: center;
+  min-height: 38px;
+  text-decoration: none;
+  color: var(--text);
+  font-weight: 600;
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  transition: border 0.2s ease, color 0.2s ease;
+}
+
+.repo:hover {
+  color: var(--accent-2);
+  border-color: var(--accent-2);
+}
+
+.split {
+  display: grid;
+  --split-left: 50%;
+  grid-template-columns: minmax(260px, var(--split-left)) 12px minmax(
+      260px,
+      1fr
+    );
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+  align-items: stretch;
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  border-radius: 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  min-height: 0;
+  animation: rise 0.7s ease 0.2s both;
+}
+
+.divider {
+  position: relative;
+  border-radius: 999px;
+  background: linear-gradient(180deg, transparent, rgba(255, 255, 255, 0.12), transparent);
+  cursor: col-resize;
+  margin: 10px 0;
+  user-select: none;
+  touch-action: none;
+  transition: background 0.2s ease;
+}
+
+.divider::before {
+  content: "";
+  position: absolute;
+  inset: 35% 2px;
+  border-radius: 999px;
+  background: rgba(58, 134, 255, 0.7);
+  opacity: 0.65;
+}
+
+.divider.is-active,
+.divider:focus-visible {
+  background: rgba(58, 134, 255, 0.2);
+}
+
+.divider:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.pane__header {
+  padding: 14px 18px;
+  font-weight: 600;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+
+textarea {
+  flex: 1;
+  width: 100%;
+  resize: none;
+  border: none;
+  padding: 20px;
+  font-size: 15px;
+  line-height: 1.6;
+  font-family: "JetBrains Mono", "Fira Code", "IBM Plex Mono", monospace;
+  color: var(--text);
+  background: transparent;
+  outline: none;
+}
+
+.preview {
+  flex: 1;
+  min-height: 0;
+  padding: 24px;
+  overflow-y: auto;
+  font-size: 16px;
+  line-height: 1.7;
+}
+
+.preview h1,
+.preview h2,
+.preview h3,
+.preview h4,
+.preview h5,
+.preview h6 {
+  margin: 1.6em 0 0.55em;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+}
+
+.preview > :first-child {
+  margin-top: 0;
+}
+
+.preview > :last-child {
+  margin-bottom: 0;
+}
+
+.preview h1 {
+  font-size: 28px;
+}
+
+.preview h2 {
+  font-size: 22px;
+}
+
+.preview h3 {
+  font-size: 18px;
+}
+
+.preview h4,
+.preview h5,
+.preview h6 {
+  font-size: 16px;
+}
+
+.preview p {
+  margin: 0 0 1em;
+}
+
+.preview ul,
+.preview ol {
+  margin: 0 0 1em;
+  padding-left: 1.6em;
+}
+
+.preview li + li {
+  margin-top: 0.35em;
+}
+
+.preview li > ul,
+.preview li > ol {
+  margin: 0.35em 0 0;
+}
+
+.preview mark {
+  background: rgba(255, 214, 10, 0.4);
+  color: inherit;
+  padding: 0 0.15em;
+  border-radius: 3px;
+}
+
+.preview ins {
+  text-decoration-color: var(--accent);
+}
+
+.preview abbr[title] {
+  text-decoration: underline dotted;
+  cursor: help;
+}
+
+.preview dl {
+  margin: 0 0 1em;
+}
+
+.preview dt {
+  font-weight: 600;
+}
+
+.preview dd {
+  margin: 0.2em 0 0.6em 1.4em;
+}
+
+.preview sub,
+.preview sup {
+  line-height: 0;
+}
+
+.preview .footnotes {
+  margin-top: 2em;
+  font-size: 0.92em;
+  color: var(--muted);
+}
+
+.preview .footnotes-sep {
+  margin: 2em 0 1em;
+}
+
+.preview .footnote-ref a,
+.preview .footnote-backref {
+  text-decoration: none;
+}
+
+.preview .footnotes :target,
+.preview .footnote-ref :target {
+  background: rgba(58, 134, 255, 0.15);
+  border-radius: 4px;
+}
+
+.preview table.front-matter {
+  font-size: 14px;
+}
+
+.preview table.front-matter td {
+  color: var(--muted);
+}
+
+.preview pre code.hljs {
+  padding: 0;
+  background: transparent;
+}
+
+.preview kbd {
+  display: inline-block;
+  padding: 0.05em 0.45em;
+  font-family: "JetBrains Mono", "Fira Code", "IBM Plex Mono", monospace;
+  font-size: 0.82em;
+  line-height: 1.5;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+.preview details {
+  margin: 0 0 1em;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+
+.preview details > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.preview details[open] > summary {
+  margin-bottom: 0.6em;
+}
+
+/* GitHub-style alerts: > [!NOTE], [!TIP], [!IMPORTANT], [!WARNING], [!CAUTION] */
+.preview .markdown-alert {
+  --alert: var(--accent);
+  --alert-icon: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Cpath d=%27M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z%27/%3E%3C/svg%3E");
+  margin: 0 0 1em;
+  padding: 10px 16px;
+  border-left: 4px solid var(--alert);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--alert) 10%, transparent);
+}
+
+.preview .markdown-alert > :last-child {
+  margin-bottom: 0;
+}
+
+.preview .markdown-alert-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  color: var(--alert);
+  margin-bottom: 0.3em;
+}
+
+/* The icon is a mask in the alert colour rather than the plugin's inline <svg>, which
+   the sanitisers remove from markdown. Shapes: GitHub Octicons (MIT), the same ones
+   markdown-it-github-alerts ships. */
+.preview .markdown-alert-title::before {
+  content: "";
+  flex: none;
+  width: 16px;
+  height: 16px;
+  background-color: currentColor;
+  -webkit-mask: var(--alert-icon) center / contain no-repeat;
+  mask: var(--alert-icon) center / contain no-repeat;
+}
+
+.preview .markdown-alert-tip {
+  --alert: #2da44e;
+  --alert-icon: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Cpath d=%27M8 1.5c-2.363 0-4 1.69-4 3.75 0 .984.424 1.625.984 2.304l.214.253c.223.264.47.556.673.848.284.411.537.896.621 1.49a.75.75 0 0 1-1.484.211c-.04-.282-.163-.547-.37-.847a8.456 8.456 0 0 0-.542-.68c-.084-.1-.173-.205-.268-.32C3.201 7.75 2.5 6.766 2.5 5.25 2.5 2.31 4.863 0 8 0s5.5 2.31 5.5 5.25c0 1.516-.701 2.5-1.328 3.259-.095.115-.184.22-.268.319-.207.245-.383.453-.541.681-.208.3-.33.565-.37.847a.751.751 0 0 1-1.485-.212c.084-.593.337-1.078.621-1.489.203-.292.45-.584.673-.848.075-.088.147-.173.213-.253.561-.679.985-1.32.985-2.304 0-2.06-1.637-3.75-4-3.75ZM5.75 12h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5ZM6 15.25a.75.75 0 0 1 .75-.75h2.5a.75.75 0 0 1 0 1.5h-2.5a.75.75 0 0 1-.75-.75Z%27/%3E%3C/svg%3E");
+}
+
+.preview .markdown-alert-important {
+  --alert: #8250df;
+  --alert-icon: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Cpath d=%27M0 1.75C0 .784.784 0 1.75 0h12.5C15.216 0 16 .784 16 1.75v9.5A1.75 1.75 0 0 1 14.25 13H8.06l-2.573 2.573A1.458 1.458 0 0 1 3 14.543V13H1.75A1.75 1.75 0 0 1 0 11.25Zm1.75-.25a.25.25 0 0 0-.25.25v9.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h6.5a.25.25 0 0 0 .25-.25v-9.5a.25.25 0 0 0-.25-.25Zm7 2.25v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 9a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z%27/%3E%3C/svg%3E");
+}
+
+.preview .markdown-alert-warning {
+  --alert: #bf8700;
+  --alert-icon: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Cpath d=%27M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z%27/%3E%3C/svg%3E");
+}
+
+.preview .markdown-alert-caution {
+  --alert: #cf222e;
+  --alert-icon: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Cpath d=%27M4.47.22A.749.749 0 0 1 5 0h6c.199 0 .389.079.53.22l4.25 4.25c.141.14.22.331.22.53v6a.749.749 0 0 1-.22.53l-4.25 4.25A.749.749 0 0 1 11 16H5a.749.749 0 0 1-.53-.22L.22 11.53A.749.749 0 0 1 0 11V5c0-.199.079-.389.22-.53Zm.84 1.28L1.5 5.31v5.38l3.81 3.81h5.38l3.81-3.81V5.31L10.69 1.5ZM8 4a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0v-3.5A.75.75 0 0 1 8 4Zm0 8a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z%27/%3E%3C/svg%3E");
+}
+
+.preview .math-tex.is-display {
+  margin: 0 0 1.1em;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.preview .math-tex:not(.is-rendered) {
+  font-family: "JetBrains Mono", "Fira Code", "IBM Plex Mono", monospace;
+  font-size: 0.9em;
+  color: var(--muted);
+}
+
+.preview .mermaid-diagram {
+  margin: 0 0 1.25em;
+  overflow-x: auto;
+  text-align: center;
+}
+
+.preview .mermaid-diagram svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.preview .math-tex.is-invalid {
+  text-decoration: underline wavy rgba(214, 69, 69, 0.6);
+}
+
+.preview pre.mermaid-source.is-invalid {
+  outline: 2px solid rgba(214, 69, 69, 0.6);
+}
+
+.preview .task-box {
+  display: inline-block;
+  width: 1.2em;
+  margin-right: 0.3em;
+  color: var(--muted);
+}
+
+.preview .task-box.is-done {
+  color: var(--accent);
+}
+
+.preview li:has(> .task-box),
+.preview li:has(> p:first-child > .task-box) {
+  list-style: none;
+  margin-left: -1.2em;
+}
+
+.preview hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 2em 0;
+}
+
+.preview a {
+  color: var(--accent-2);
+}
+
+.preview code {
+  font-family: "JetBrains Mono", "Fira Code", "IBM Plex Mono", monospace;
+  font-size: 0.86em;
+  background: rgba(58, 134, 255, 0.12);
+  padding: 0.12em 0.35em;
+  border-radius: 5px;
+}
+
+.preview pre {
+  background: #0d1117;
+  color: #e6edf3;
+  padding: 16px;
+  border-radius: 12px;
+  overflow: auto;
+}
+
+html[data-theme="dark"] .preview pre {
+  background: #0c1118;
+}
+
+.preview pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.preview blockquote {
+  margin: 0 0 1em;
+  padding: 12px 18px;
+  border-left: 4px solid var(--accent);
+  background: rgba(58, 134, 255, 0.12);
+  border-radius: 10px;
+}
+
+.preview table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 1.25em;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.preview th,
+.preview td {
+  border: 1px solid var(--border);
+  padding: 9px 12px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.preview th {
+  background: var(--surface-2);
+  font-weight: 600;
+}
+
+.preview th[align="center"],
+.preview td[align="center"] {
+  text-align: center;
+}
+
+.preview th[align="right"],
+.preview td[align="right"] {
+  text-align: right;
+}
+
+.preview img {
+  max-width: 100%;
+  border-radius: 12px;
+}
+
+/* Editor workspace */
+@media (min-width: 981px) {
+  .editor .backdrop {
+    height: 100vh;
+    min-height: 560px;
+  }
+
+  .editor .split {
+    grid-template-rows: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 980px) {
+  .editor .pane {
+    height: min(70vh, 680px);
+    min-height: 320px;
+  }
+}
+
+/* Shared document page */
+.doc,
+.view .topbar {
+  width: 100%;
+  max-width: 980px;
+  margin: 0 auto;
+}
+
+.doc {
+  flex: 1;
+}
+
+.view .brand h1 {
+  font-size: 24px;
+}
+
+.view .controls {
+  gap: 10px;
+}
+
+.doc .preview {
+  padding: 36px 44px 40px;
+  overflow: visible;
+}
+
+.gone {
+  padding: 32px 40px;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.gone h2 {
+  margin: 0;
+  font-size: 22px;
+}
+
+.gone p {
+  margin: 0 0 16px;
+  color: var(--muted);
+}
+
+.gone .btn {
+  text-decoration: none;
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+  transform: none;
+}
+
+.btn--danger {
+  color: #d64545;
+  border-color: rgba(214, 69, 69, 0.45);
+}
+
+/* Share dialog */
+.dialog {
+  width: min(520px, calc(100vw - 32px));
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+
+.dialog::backdrop {
+  background: rgba(9, 18, 33, 0.45);
+  backdrop-filter: blur(3px);
+}
+
+.dialog__body {
+  padding: 24px 26px;
+}
+
+.dialog h2 {
+  margin: 0 0 12px;
+  font-size: 22px;
+  letter-spacing: -0.01em;
+}
+
+.dialog p {
+  margin: 0 0 10px;
+  line-height: 1.55;
+}
+
+.dialog__error {
+  color: #d64545;
+}
+
+.dialog__note {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+/* The link's other forms: one row of pills, each opens in a new tab. */
+.dialog__links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 2px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.2;
+  text-decoration: none;
+  transition: border-color 0.2s ease, color 0.2s ease, transform 0.2s ease;
+}
+
+/* "Opens in a new tab", drawn as an icon: a text ↗ sits on the baseline and varies by font. */
+.chip::after {
+  content: "";
+  flex: none;
+  width: 12px;
+  height: 12px;
+  background: currentColor;
+  opacity: 0.55;
+  -webkit-mask: var(--icon-external) center / contain no-repeat;
+  mask: var(--icon-external) center / contain no-repeat;
+  transition: opacity 0.2s ease;
+  --icon-external: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M15 3h6v6'/%3E%3Cpath d='M10 14 21 3'/%3E%3Cpath d='M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6'/%3E%3C/svg%3E");
+}
+
+.chip:hover,
+.chip:focus-visible {
+  border-color: var(--accent-2);
+  color: var(--accent-2);
+  transform: translateY(-1px);
+}
+
+.chip:hover::after,
+.chip:focus-visible::after,
+.chip--primary::after {
+  opacity: 1;
+}
+
+.chip--primary {
+  color: var(--accent-2);
+  border-color: color-mix(in srgb, var(--accent-2) 45%, var(--border));
+}
+
+/* The link's lifetime: three pills, one chosen. The radios stay in the page (keyboard,
+   screen readers) and the label's span draws the pill. */
+.share-ttl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 14px 0 4px;
+  padding: 0;
+  border: 0;
+}
+
+.share-ttl legend {
+  margin-bottom: 8px;
+  padding: 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.share-ttl label {
+  position: relative;
+  cursor: pointer;
+}
+
+.share-ttl input {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+}
+
+.share-ttl span {
+  display: inline-block;
+  padding: 7px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.2;
+  transition: border-color 0.2s ease, color 0.2s ease, background 0.2s ease;
+}
+
+.share-ttl label:hover span {
+  border-color: var(--accent-2);
+}
+
+.share-ttl input:checked + span {
+  border-color: var(--accent-2);
+  background: color-mix(in srgb, var(--accent-2) 14%, var(--surface-2));
+  color: var(--accent-2);
+}
+
+.share-ttl input:focus-visible + span {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 2px;
+}
+
+.dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.share-link {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.share-link input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: "JetBrains Mono", "Fira Code", "IBM Plex Mono", monospace;
+  font-size: 13px;
+}
+
+.status {
+  position: fixed;
+  right: 28px;
+  bottom: 28px;
+  padding: 10px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: var(--shadow);
+  opacity: 0;
+  transform: translateY(10px);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  pointer-events: none;
+}
+
+.status.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.doc-footer {
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.doc-footer a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.doc-footer a:hover {
+  color: var(--accent-2);
+  text-decoration: underline;
+}
+
+@media (max-width: 980px) {
+  .split {
+    grid-template-columns: 1fr;
+  }
+
+  .doc .preview,
+  .gone {
+    padding: 24px;
+  }
+}
+
+@media (max-width: 640px) {
+  .backdrop {
+    padding: 18px 16px 28px;
+    gap: 18px;
+  }
+
+  /* Four pills don't fit one row on a phone; an even 2×2 reads better than 3+1. */
+  .dialog__links {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .chip {
+    justify-content: center;
+    padding: 9px 12px;
+  }
+
+  .logo {
+    width: 44px;
+    height: 44px;
+    border-radius: 13px;
+    font-size: 17px;
+  }
+
+  .brand {
+    gap: 12px;
+  }
+
+  .brand h1,
+  .view .brand h1 {
+    font-size: 21px;
+  }
+
+  .controls {
+    gap: 8px;
+  }
+
+  .btn {
+    padding: 8px 15px;
+    font-size: 14px;
+  }
+
+  .doc .preview,
+  .gone {
+    padding: 20px 18px;
+  }
+
+  /* A wide table scrolls inside itself rather than crushing its columns. */
+  .preview table {
+    display: block;
+    width: max-content;
+    max-width: 100%;
+    overflow-x: auto;
+    font-size: 14px;
+  }
+
+  .preview th,
+  .preview td {
+    min-width: 7.5em;
+  }
+
+  .divider {
+    display: none;
+  }
+
+  .topbar {
+    align-items: flex-start;
+  }
+}
+
+/* Export menu */
+.menu-wrap {
+  position: relative;
+}
+
+.menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 20;
+  min-width: 190px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  animation: rise 0.18s ease both;
+}
+
+.menu [role="menuitem"] {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 9px 12px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.menu [role="menuitem"] small {
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 13px;
+}
+
+.menu [role="menuitem"]:hover,
+.menu [role="menuitem"]:focus-visible {
+  background: var(--surface-2);
+  outline: none;
+}
+
+.menu a[role="menuitem"] {
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 9px 9px;
+}
+
+/* Export: one light document layout, used by the downloaded HTML file and by print. */
+#exportArea {
+  display: none;
+}
+
+.export-document {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 48px 32px 64px;
+  overflow: visible;
+  background: #ffffff;
+  color: var(--text);
+}
+
+body.export-page {
+  min-height: 0;
+  background: #ffffff;
+}
+
+body.export-page::before {
+  display: none;
+}
+
+@media print {
+  @page {
+    margin: 16mm 14mm;
+  }
+
+  /* The page margins take the canvas colour of the root's colour scheme, which is dark
+     in the dark theme whatever the background says. */
+  html,
+  body {
+    min-height: 0;
+    color-scheme: light !important;
+    background: #ffffff !important;
+  }
+
+  body::before {
+    display: none;
+  }
+
+  body.is-printing > *:not(#exportArea) {
+    display: none !important;
+  }
+
+  body.is-printing #exportArea {
+    display: block;
+    max-width: none;
+    padding: 0;
+  }
+
+  .export-document pre,
+  .export-document table,
+  .export-document blockquote,
+  .export-document .mermaid-diagram,
+  .export-document .katex-display {
+    break-inside: avoid;
+  }
+
+  .export-document h1,
+  .export-document h2,
+  .export-document h3 {
+    break-after: avoid;
+  }
+
+  .export-document pre,
+  .export-document .preview pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

@@ -1,0 +1,461 @@
+// Every control is looked up here, before any markdown is rendered, and the dialog's
+// controls inside the dialog itself: an element in the document that shares an id with
+// one of them must never be the one that gets the handler.
+const textarea = document.getElementById("markdownInput");
+const preview = document.getElementById("preview");
+const resetBtn = document.getElementById("resetBtn");
+const copyBtn = document.getElementById("copyBtn");
+const shareBtn = document.getElementById("shareBtn");
+const syncToggle = document.getElementById("syncScroll");
+const darkToggle = document.getElementById("darkMode");
+const splitPane = document.getElementById("splitPane");
+const dragHandle = document.getElementById("dragHandle");
+const shareDialog = document.getElementById("shareDialog");
+const exportBtn = document.getElementById("exportBtn");
+const exportMenu = document.getElementById("exportMenu");
+const inDialog = (id) => shareDialog.querySelector(`#${id}`);
+const shareConfirm = inDialog("shareConfirm");
+const shareResult = inDialog("shareResult");
+const shareError = inDialog("shareError");
+const shareCreate = inDialog("shareCreate");
+const shareUrl = inDialog("shareUrl");
+const shareCopy = inDialog("shareCopy");
+const shareExpiry = inDialog("shareExpiry");
+const shareOpen = inDialog("shareOpen");
+const shareRaw = inDialog("shareRaw");
+const shareJson = inDialog("shareJson");
+const shareHtml = inDialog("shareHtml");
+const shareDelete = inDialog("shareDelete");
+const shareNew = inDialog("shareNew");
+const shareReused = inDialog("shareReused");
+const shareTokenNote = inDialog("shareTokenNote");
+const shareResultHeading = inDialog("shareResultHeading");
+const shareTtl = inDialog("shareTtl");
+// The lifetime offered when the dialog opens; SHARE_TTLS in src/limits.js holds the rest.
+const DEFAULT_SHARE_TTL = "24h";
+
+// The tour shown on a first visit and by Reset lives in sample.md, where it is plain
+// markdown to edit rather than a string full of escaped backticks.
+let sampleText = null;
+const loadSample = async () => {
+  if (sampleText === null) {
+    const response = await fetch("/sample.md");
+    if (!response.ok) {
+      throw new Error(`sample.md: ${response.status}`);
+    }
+    sampleText = await response.text();
+  }
+  return sampleText;
+};
+
+let storageWarned = false;
+let diagramTimer = null;
+// Counts changes to the text — typing, Reset, a draft from another tab. Anything that
+// loads text asynchronously (the tour, Reset) checks it has not moved before applying.
+let revision = 0;
+
+// Saving is separate from rendering: only a change to the text writes the draft. A
+// re-render (a theme change) must not, because this tab's copy may be older than what
+// another tab saved since; that once overwrote the newer draft with the older one.
+const saveDraft = () => {
+  if (!setStored(STORAGE_KEYS.content, textarea.value) && !storageWarned) {
+    storageWarned = true;
+    showStatus("Browser storage is full or blocked: this draft will not survive a reload", 6000);
+  }
+};
+
+// Rendering the whole document takes ~0.5 ms per KB. While it fits in a frame it runs on
+// every change, as before; past that, changes are coalesced so typing stays responsive.
+// It always reads the textarea, so a deferred render never shows stale text.
+const FRAME_MS = 16;
+let lastRenderMs = 0;
+let renderTimer = null;
+
+const renderNow = () => {
+  clearTimeout(renderTimer);
+  renderTimer = null;
+  const started = performance.now();
+  preview.innerHTML = renderMarkdown(textarea.value);
+  lastRenderMs = performance.now() - started;
+  renderMath(preview);
+  // Diagrams are drawn once typing pauses: mid-edit, a diagram rarely parses.
+  clearTimeout(diagramTimer);
+  diagramTimer = setTimeout(() => renderDiagrams(preview), 300);
+  if (syncToggle.checked) {
+    syncScroll(textarea, preview);
+  }
+};
+
+const updatePreview = () => {
+  if (lastRenderMs <= FRAME_MS) {
+    renderNow();
+    return;
+  }
+  clearTimeout(renderTimer);
+  renderTimer = setTimeout(renderNow, Math.min(400, lastRenderMs * 2));
+};
+
+let isSyncing = false;
+const syncScroll = (source, target) => {
+  if (isSyncing) {
+    return;
+  }
+  isSyncing = true;
+  const sourceMax = source.scrollHeight - source.clientHeight;
+  const targetMax = target.scrollHeight - target.clientHeight;
+  const ratio = sourceMax > 0 ? source.scrollTop / sourceMax : 0;
+  target.scrollTop = ratio * targetMax;
+  requestAnimationFrame(() => {
+    isSyncing = false;
+  });
+};
+
+// Text set by the page itself (the tour, Reset): saved, and rendered straight away.
+const setContent = (value) => {
+  textarea.value = value;
+  revision++;
+  saveDraft();
+  renderNow();
+};
+
+// null means nothing was ever saved; an empty string is a draft the user emptied.
+const storedContent = getStored(STORAGE_KEYS.content, null);
+const storedSplit = getStored(STORAGE_KEYS.split, "");
+const storedSync = getStored(STORAGE_KEYS.sync, "true");
+
+initTheme(darkToggle);
+// Diagrams are drawn in the theme's colours, so a theme change redraws them.
+new MutationObserver(() => renderNow()).observe(document.documentElement, {
+  attributes: true,
+  attributeFilter: ["data-theme"],
+});
+syncToggle.checked = storedSync !== "false";
+
+if (storedContent === null) {
+  // The tour arrives over the network, and the editor is usable before it does: it goes
+  // in only if nobody has typed in the meantime, or it would replace what they wrote.
+  const starter = (text) => {
+    if (revision === 0) setContent(text);
+  };
+  loadSample()
+    .then(starter)
+    .catch(() => starter("# Markdown Live Preview\n\nWrite on the left, see it on the right."));
+} else {
+  setContent(storedContent);
+}
+
+textarea.addEventListener("input", () => {
+  revision++;
+  saveDraft();
+  updatePreview();
+});
+
+// Another tab saved the draft: this one follows, so the two never hold different texts
+// and neither can save its stale copy over the other's. (The event fires only in the
+// tabs that did not write.) It follows what storage holds now, not the event's newValue:
+// events arrive late, and when two tabs type at once, each gets the other's write after
+// making its own. Applying newValue there left each tab showing the other's older text,
+// and the next keystroke saved it over the newer one.
+window.addEventListener("storage", (event) => {
+  if (event.key !== STORAGE_KEYS.content) {
+    return;
+  }
+  const current = getStored(STORAGE_KEYS.content, null);
+  if (current === null || current === textarea.value) {
+    return;
+  }
+  const { selectionStart, selectionEnd } = textarea;
+  textarea.value = current;
+  textarea.setSelectionRange(selectionStart, selectionEnd);
+  revision++;
+  renderNow();
+  showStatus("Updated with the draft from another tab");
+});
+
+textarea.addEventListener("scroll", () => {
+  if (syncToggle.checked) {
+    syncScroll(textarea, preview);
+  }
+});
+
+preview.addEventListener("scroll", () => {
+  if (syncToggle.checked) {
+    syncScroll(preview, textarea);
+  }
+});
+
+resetBtn.addEventListener("click", async () => {
+  const draft = textarea.value;
+  if (draft.trim() && draft !== sampleText && !confirm("Replace your text with the sample? Your current text will be lost.")) {
+    return;
+  }
+  // The editor stays usable while the sample loads; text typed meanwhile wins.
+  const before = revision;
+  let sample;
+  try {
+    sample = await loadSample();
+  } catch (error) {
+    showStatus("Could not load the sample. Check your connection.");
+    return;
+  }
+  if (revision !== before) {
+    showStatus("Reset cancelled: you kept typing");
+    return;
+  }
+  setContent(sample);
+  showStatus("Reset to sample markdown");
+});
+
+copyBtn.addEventListener("click", async () => {
+  if (await copyText(textarea.value)) {
+    showStatus("Markdown copied to clipboard");
+  } else {
+    textarea.select();
+    document.execCommand("copy");
+    showStatus("Markdown copied");
+  }
+});
+
+syncToggle.addEventListener("change", () => {
+  setStored(STORAGE_KEYS.sync, syncToggle.checked ? "true" : "false");
+  if (syncToggle.checked) {
+    syncScroll(textarea, preview);
+  }
+});
+
+// The divider between the panes: dragged with a pointer, or focused and moved with the
+// arrow keys (Shift for bigger steps), Home and End. aria-valuenow is the editor's share
+// of the width, in percent.
+let isDragging = false;
+const MIN_PANE_WIDTH = 240;
+const KEY_STEP_PERCENT = 2;
+
+const setSplit = (percent, { store = true } = {}) => {
+  const width = splitPane.getBoundingClientRect().width;
+  const min = width > 2 * MIN_PANE_WIDTH ? (MIN_PANE_WIDTH / width) * 100 : 50;
+  const clamped = Math.max(min, Math.min(percent, 100 - min));
+  const value = `${clamped}%`;
+  splitPane.style.setProperty("--split-left", value);
+  dragHandle.setAttribute("aria-valuenow", String(Math.round(clamped)));
+  if (store) setStored(STORAGE_KEYS.split, value);
+};
+
+const currentSplit = () => parseFloat(splitPane.style.getPropertyValue("--split-left")) || 50;
+
+const updateSplit = (clientX) => {
+  const rect = splitPane.getBoundingClientRect();
+  setSplit(((clientX - rect.left) / rect.width) * 100);
+};
+
+setSplit(parseFloat(storedSplit) || 50, { store: false });
+
+dragHandle.addEventListener("keydown", (event) => {
+  const step = event.shiftKey ? KEY_STEP_PERCENT * 5 : KEY_STEP_PERCENT;
+  const target = {
+    ArrowLeft: currentSplit() - step,
+    ArrowRight: currentSplit() + step,
+    Home: 0,
+    End: 100,
+  }[event.key];
+  if (target === undefined) {
+    return;
+  }
+  event.preventDefault();
+  setSplit(target);
+});
+
+const stopDrag = (event) => {
+  if (!isDragging) {
+    return;
+  }
+  isDragging = false;
+  dragHandle.classList.remove("is-active");
+  dragHandle.releasePointerCapture(event.pointerId);
+};
+
+dragHandle.addEventListener("pointerdown", (event) => {
+  if (event.button !== 0) {
+    return;
+  }
+  isDragging = true;
+  dragHandle.classList.add("is-active");
+  dragHandle.setPointerCapture(event.pointerId);
+  updateSplit(event.clientX);
+});
+
+dragHandle.addEventListener("pointermove", (event) => {
+  if (!isDragging) {
+    return;
+  }
+  updateSplit(event.clientX);
+});
+
+dragHandle.addEventListener("pointerup", stopDrag);
+dragHandle.addEventListener("pointercancel", stopDrag);
+
+// Sharing. The editor never uploads anything on its own; this is the one path that
+// does, and only after the author confirms in the dialog what a share link means.
+const MAX_SHARE_BYTES = 256 * 1024; // MAX_CONTENT_BYTES in src/limits.js
+let currentShare = null;
+
+const showShareError = (message) => {
+  shareError.textContent = message;
+  shareError.hidden = !message;
+};
+
+// The status toast sits under the modal's backdrop, so feedback inside the dialog goes
+// on the button that was pressed.
+const flashLabel = (button, label) => {
+  const original = button.dataset.label || button.textContent;
+  button.dataset.label = original;
+  button.textContent = label;
+  clearTimeout(button.flashTimer);
+  button.flashTimer = setTimeout(() => {
+    button.textContent = original;
+  }, 1600);
+};
+
+const showConfirm = () => {
+  showShareError("");
+  // Every new link starts from the default: a short lifetime picked once should not
+  // quietly become the norm for the next document.
+  shareTtl.querySelector(`input[value="${DEFAULT_SHARE_TTL}"]`).checked = true;
+  shareConfirm.hidden = false;
+  shareResult.hidden = true;
+  shareCreate.focus();
+};
+
+const showResult = (share, { reused = false, tokenStored = true } = {}) => {
+  currentShare = share;
+  shareUrl.value = share.url;
+  shareOpen.href = share.url;
+  shareRaw.href = share.markdownUrl;
+  shareJson.href = share.jsonUrl;
+  // Links remembered before .html existed have no htmlUrl; it follows from the page's.
+  shareHtml.href = share.htmlUrl ?? `${share.url}.html`;
+  shareExpiry.textContent = `${formatDateTime(share.expiresAt)} (${formatRemaining(share.expiresAt)})`;
+  shareResultHeading.textContent = reused ? "Already shared" : "Link created";
+  shareReused.hidden = !reused;
+  shareNew.hidden = !reused;
+  shareTokenNote.hidden = tokenStored;
+  shareDelete.disabled = false;
+  shareConfirm.hidden = true;
+  shareResult.hidden = false;
+  shareUrl.focus();
+  shareUrl.select();
+};
+
+// A live link this browser already made for exactly this text. Checked against the
+// server as well, because it may have been deleted from another tab.
+const findExistingShare = async (content) => {
+  const existing = findShareByHash(await hashText(content));
+  if (!existing) {
+    return null;
+  }
+  try {
+    const response = await fetch(`/${existing.id}.md`, { method: "HEAD" });
+    if (response.ok) {
+      return existing;
+    }
+    if (response.status === 404) {
+      forgetShareToken(existing.id);
+    }
+  } catch (error) {
+    // Offline: fall through to a fresh share, which will report the network error.
+  }
+  return null;
+};
+
+shareBtn.addEventListener("click", async () => {
+  const content = textarea.value;
+  if (!content.trim()) {
+    showStatus("Nothing to share yet");
+    return;
+  }
+  const existing = await findExistingShare(content).catch(() => null);
+  shareDialog.showModal();
+  if (existing) {
+    showResult(existing, { reused: true });
+  } else {
+    showConfirm();
+  }
+});
+
+shareNew.addEventListener("click", showConfirm);
+
+shareCreate.addEventListener("click", async () => {
+  // Only ever from the confirm step of an open dialog.
+  if (!shareDialog.open || shareConfirm.hidden) {
+    return;
+  }
+  const content = textarea.value;
+  if (new TextEncoder().encode(content).length > MAX_SHARE_BYTES) {
+    showShareError(`This text is too long to share: the limit is ${MAX_SHARE_BYTES / 1024} KB.`);
+    return;
+  }
+
+  const ttl = shareTtl.querySelector("input:checked")?.value ?? DEFAULT_SHARE_TTL;
+  showShareError("");
+  shareCreate.disabled = true;
+  shareCreate.textContent = "Creating…";
+  try {
+    const response = await fetch("/api/shares", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content, ttl }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      showShareError(data.error || "Could not create the link. Try again.");
+      return;
+    }
+    const tokenStored = saveShareToken(data, await hashText(content));
+    showResult(data, { tokenStored });
+  } catch (error) {
+    showShareError("Network error. Check your connection and try again.");
+  } finally {
+    shareCreate.disabled = false;
+    shareCreate.textContent = "Create link";
+  }
+});
+
+shareCopy.addEventListener("click", async () => {
+  if (!(await copyText(shareUrl.value))) {
+    shareUrl.select();
+    document.execCommand("copy");
+  }
+  flashLabel(shareCopy, "Copied");
+});
+
+shareDelete.addEventListener("click", async () => {
+  if (!currentShare || !confirm("Delete this link now? It will stop working for everyone.")) {
+    return;
+  }
+  shareDelete.disabled = true;
+  try {
+    // The token from memory: it is there even when storage refused to keep it.
+    if (await deleteShare(currentShare.id, currentShare.deleteToken)) {
+      forgetShareToken(currentShare.id);
+      currentShare = null;
+      shareDialog.close();
+      showStatus("Link deleted");
+      return;
+    }
+  } catch (error) {
+    // Reported below.
+  }
+  shareDelete.disabled = false;
+  flashLabel(shareDelete, "Could not delete");
+});
+
+shareDialog.querySelectorAll("[data-close]").forEach((button) => {
+  button.addEventListener("click", () => shareDialog.close());
+});
+
+shareDialog.addEventListener("click", (event) => {
+  if (event.target === shareDialog) {
+    shareDialog.close();
+  }
+});
+
+setupExport({ button: exportBtn, menu: exportMenu, getMarkdown: () => textarea.value });

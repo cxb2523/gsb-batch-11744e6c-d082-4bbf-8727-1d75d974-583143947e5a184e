@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- SEO Meta Tags -->
+    <title>md.airat.top — Markdown Live Preview</title>
+    <meta
+      name="description"
+      content="Markdown live preview in your browser with code highlighting, math, Mermaid diagrams and export to HTML or PDF. Private and local, plus share links that delete themselves after 1 hour, 24 hours or 3 days."
+    />
+    <meta
+      name="keywords"
+      content="markdown, markdown preview, markdown editor, live preview, gfm, mermaid, katex, math, syntax highlighting, export pdf, markdown to html, share markdown, temporary link, dark mode, airattop"
+    />
+    <meta name="author" content="AiratTop" />
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://md.airat.top/" />
+    <meta property="og:title" content="Markdown Live Preview" />
+    <meta
+      property="og:description"
+      content="Markdown live preview in your browser with code highlighting, math, Mermaid diagrams and export to HTML or PDF. Private and local, plus share links that delete themselves after 1 hour, 24 hours or 3 days."
+    />
+    <meta property="og:image" content="https://md.airat.top/canvas.png" />
+
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Markdown Live Preview" />
+    <meta
+      name="twitter:description"
+      content="Markdown live preview with highlighting, math and diagrams, export to HTML or PDF, and share links for up to 3 days."
+    />
+    <link rel="stylesheet" href="/vendor/highlight.css" />
+    <link rel="stylesheet" href="/styles.css" />
+
+    <meta name="msvalidate.01" content="A4ADBC8E0D3C862E117640B06AC788E3" />
+    <meta name="google-site-verification" content="zuHpP1sB8u4uv7gVtMj2RNaGCoxq2lGMYENOCMovy1Y" />
+    <meta name="p:domain_verify" content="ebe9e31b6c3867c499c054b525b7a05e"/>
+    <meta name="facebook-domain-verification" content="bofgez55w88aet0czx4sls6jhw5o1w" />
+    <link rel="canonical" href="https://md.airat.top/" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+    <link rel="icon" href="/favicon.ico">
+    <link rel="manifest" href="/site.webmanifest">
+  </head>
+  <body class="editor">
+    <div class="backdrop">
+      <header class="topbar">
+        <div class="brand">
+          <div class="logo" aria-hidden="true">md</div>
+          <div>
+            <h1>Markdown Live Preview</h1>
+            <p title="Your text stays in this browser unless you share it. Images from other sites load from those sites.">Private and local. Share a link for up to 3 days.</p>
+          </div>
+        </div>
+        <div class="controls" role="group" aria-label="Preview controls">
+          <button class="btn btn--ghost" id="resetBtn" type="button">Reset</button>
+          <button class="btn btn--ghost" id="copyBtn" type="button">Copy</button>
+          <div class="menu-wrap">
+            <button class="btn btn--ghost" id="exportBtn" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="exportMenu">Export</button>
+            <div class="menu" id="exportMenu" role="menu" aria-label="Export" hidden>
+            <button type="button" role="menuitem" data-export="md">Markdown <small>.md</small></button>
+            <button type="button" role="menuitem" data-export="html">HTML <small>.html</small></button>
+            <button type="button" role="menuitem" data-export="pdf">PDF <small>print</small></button>
+            </div>
+          </div>
+          <button class="btn" id="shareBtn" type="button">Share</button>
+          <label class="toggle">
+            <input id="syncScroll" type="checkbox" checked />
+            <span>Sync Scroll</span>
+          </label>
+          <label class="toggle">
+            <input id="darkMode" type="checkbox" />
+            <span>Dark Mode</span>
+          </label>
+          <a
+            class="repo"
+            href="https://github.com/AiratTop/md.airat.top"
+            target="_blank"
+            rel="noreferrer noopener"
+          >
+            GitHub
+          </a>
+        </div>
+      </header>
+
+      <main class="split" id="splitPane">
+        <section class="pane">
+          <div class="pane__header">Markdown</div>
+          <textarea
+            id="markdownInput"
+            spellcheck="false"
+            aria-label="Markdown input"
+          ></textarea>
+        </section>
+        <div
+          class="divider"
+          id="dragHandle"
+          role="separator"
+          tabindex="0"
+          aria-orientation="vertical"
+          aria-label="Resize panels"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow="50"
+        ></div>
+        <section class="pane">
+          <div class="pane__header">Preview</div>
+          <div id="preview" class="preview" aria-live="polite"></div>
+        </section>
+      </main>
+
+      <div class="status" id="status" aria-live="polite"></div>
+
+      <dialog class="dialog" id="shareDialog" aria-labelledby="shareHeading">
+        <div class="dialog__body" id="shareConfirm">
+          <h2 id="shareHeading">Share as a temporary link</h2>
+          <p>
+            The text is uploaded to md.airat.top, and
+            <strong>anyone with the link can read it</strong>.
+          </p>
+          <fieldset class="share-ttl" id="shareTtl">
+            <legend>Delete the link automatically after</legend>
+            <label><input type="radio" name="shareTtl" value="1h" /><span>1 hour</span></label>
+            <label><input type="radio" name="shareTtl" value="24h" checked /><span>24 hours</span></label>
+            <label><input type="radio" name="shareTtl" value="3d" /><span>3 days</span></label>
+          </fieldset>
+          <p class="dialog__error" id="shareError" role="alert" hidden></p>
+          <div class="dialog__actions">
+            <button class="btn btn--ghost" type="button" data-close>Cancel</button>
+            <button class="btn" type="button" id="shareCreate">Create link</button>
+          </div>
+        </div>
+        <div class="dialog__body" id="shareResult" hidden>
+          <h2 id="shareResultHeading">Link created</h2>
+          <p class="dialog__note" id="shareReused" hidden>
+            You already shared this exact text, so here is the same link. It keeps its
+            original expiry.
+          </p>
+          <div class="share-link">
+            <input id="shareUrl" type="text" readonly aria-label="Share link" />
+            <button class="btn" type="button" id="shareCopy">Copy</button>
+          </div>
+          <p class="dialog__note">Deleted automatically on <strong id="shareExpiry"></strong>.</p>
+          <p class="dialog__note" id="shareTokenNote" hidden>
+            This browser's storage is blocked, so <strong>Delete now</strong> works only
+            until you close this page.
+          </p>
+          <nav class="dialog__links" aria-label="Open the shared link">
+            <a class="chip chip--primary" id="shareOpen" target="_blank" rel="noopener">Open</a>
+            <a class="chip" id="shareRaw" target="_blank" rel="noopener" title="Plain markdown, for curl and models">Raw .md</a>
+            <a class="chip" id="shareJson" target="_blank" rel="noopener" title="Markdown plus metadata">JSON</a>
+            <a class="chip" id="shareHtml" target="_blank" rel="noopener" title="Rendered on the server, no script">HTML</a>
+          </nav>
+          <div class="dialog__actions">
+            <button class="btn btn--ghost btn--danger" type="button" id="shareDelete">Delete now</button>
+            <button class="btn btn--ghost" type="button" id="shareNew" hidden>New link</button>
+            <button class="btn" type="button" data-close>Done</button>
+          </div>
+        </div>
+      </dialog>
+
+      <footer class="doc-footer">
+        <p>
+          © 2026
+          <a href="https://airat.top" target="_blank" rel="author">Airat.Top</a>
+          ·
+          <a href="https://github.com/AiratTop/md.airat.top" target="_blank" rel="noreferrer">GitHub</a>
+          ·
+          <a href="https://status.airat.top" target="_blank" rel="noreferrer">Status</a>
+          ·
+          <a href="https://privacy.airat.top" target="_blank" rel="noreferrer privacy-policy">Privacy</a>
+          ·
+          <a href="https://terms.airat.top" target="_blank" rel="noreferrer terms-of-service">Terms</a>
+        </p>
+      </footer>
+    </div>
+
+    <div class="preview export-document" id="exportArea" aria-hidden="true"></div>
+
+    <script src="/vendor/markdown-kit.js"></script>
+    <script src="/vendor/purify.min.js"></script>
+    <script src="/render.js"></script>
+    <script src="/common.js"></script>
+    <script src="/export.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
