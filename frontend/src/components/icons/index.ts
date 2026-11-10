@@ -1,0 +1,9 @@
+export { BoardIcon } from './BoardIcon';
+export { BacklogIcon } from './BacklogIcon';
+export { DashboardIcon } from './DashboardIcon';
+export { ProjectsIcon } from './ProjectsIcon';
+export { MembersIcon } from './MembersIcon';
+export { SettingsIcon } from './SettingsIcon';
+export { TeamManagementIcon } from './TeamManagementIcon';
+export { StatusIcon } from './StatusIcon';
+export { ReleaseIcon } from './ReleaseIcon';

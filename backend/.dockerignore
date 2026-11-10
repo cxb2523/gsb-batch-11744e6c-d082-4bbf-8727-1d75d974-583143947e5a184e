@@ -1,0 +1,36 @@
+.venv/
+venv/
+env/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+tests/
+uploads/
+.env
+.env.*
+!.env.example
+*.log
+*.db
+*.sqlite*
+Dockerfile
+.dockerignore
+# One-off maintenance scripts: not part of the served app. The patterns below
+# are root-level only; scripts/ has its own dev-only files, excluded further
+# down. scripts/init_db.py is NOT excluded - a deployed stack runs it to
+# prepare a fresh database.
+migrate_*.py
+check_*.py
+test_*.py
+seed_*.py
+fix_*.py
+create_test_*.py
+*.sh
+
+# Dev-only helpers under scripts/. init_db.py deliberately ships.
+scripts/migrate_*.py
+scripts/seed_*.py
+scripts/test_*.py

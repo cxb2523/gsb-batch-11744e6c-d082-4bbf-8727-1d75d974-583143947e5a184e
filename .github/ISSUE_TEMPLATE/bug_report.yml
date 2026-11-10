@@ -1,0 +1,62 @@
+name: Bug report
+description: Something is broken or behaves differently from what you expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. If you are not sure whether this is a bug or a misconfiguration, file it anyway. If the guide let you misconfigure it that easily, that is worth knowing.
+
+        **Do not paste secrets.** Redact your secret key, tokens and real email addresses from logs and config. For a security problem, do not use this form; see [SECURITY.md](https://github.com/Stratzi-Tech/grid/blob/develop/SECURITY.md).
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Go to ...
+        2. Click ...
+        3. See ...
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How are you running it?
+      options:
+        - Docker Compose
+        - Manual install (setup.sh / setup.ps1)
+        - Kubernetes or other container platform
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: A release tag or the output of `git rev-parse --short HEAD`.
+      placeholder: v1.0.0
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Browser and OS
+      placeholder: Chrome 130 on macOS 15
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant backend output or browser console errors, with secrets and real emails removed.
+      render: shell

@@ -1,0 +1,100 @@
+# Local run of the two production images. Not the dev loop (no hot reload);
+# see CONTRIBUTING.md for that.
+#
+# Setup is one command on a fresh clone; it brings MongoDB up itself and is
+# idempotent, so it is safe to re-run:
+#
+#   docker compose run --rm init --email you@example.com --password '...'
+#   docker compose up --build
+#
+# Outside Docker, ./scripts/setup.sh (or scripts\setup.ps1) does the same
+# against a MongoDB you are running yourself.
+#
+# Backend config comes from backend/.env (the same file the non-Docker setup uses); inside the
+# network MongoDB is reachable at mongo:27017, so APP_MONGODB_URI must say
+# mongodb://mongo:27017 rather than localhost.
+
+# Shared by the backend and the one-shot init service, so the image is built
+# once and the second build is a cache hit.
+x-backend-build: &backend-build
+  context: ./backend
+  dockerfile: Dockerfile
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    # --quiet drops the per-connection NETWORK/ACCESS chatter (every ping from
+    # the healthcheck and init logs several lines). That noise can bury the one
+    # short line that actually matters when setup fails; warnings and errors are
+    # still printed.
+    command: ["--quiet"]
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # One-shot setup: indexes, master data and the first global admin. Never
+  # started by `docker compose up` (it sits behind a profile); `compose run`
+  # enables the profile itself and starts mongo first via depends_on, so
+  #
+  #   docker compose run --rm init --email you@example.com --password '...'
+  #
+  # is the whole of setup on an empty database. --skip-admin, --reset-password,
+  # --name, --uri and --db all work here too; with no arguments at all it
+  # prompts, since `compose run` allocates a TTY.
+  init:
+    profiles: ["setup"]
+    build: *backend-build
+    image: grid-backend:local
+    # Optional on purpose: init_db needs only the URI set below, so this runs on
+    # a fresh clone before backend/.env exists. When the file is there, its
+    # APP_MONGODB_DB_NAME (and anything else) is picked up. Needs Compose
+    # v2.24 or newer, which is where `required:` arrived.
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      APP_MONGODB_URI: mongodb://mongo:27017
+    entrypoint: ["python", "-m", "scripts.init_db"]
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  backend:
+    build: *backend-build
+    image: grid-backend:local
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment:
+      APP_MONGODB_URI: mongodb://mongo:27017
+      APP_BACKEND_BASE_URL: http://localhost:8000
+      APP_FRONTEND_BASE_URL: http://localhost:3000
+    ports:
+      - "8000:8000"
+    volumes:
+      - uploads:/app/uploads
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Browser-visible URLs: baked into the bundle at build time.
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_FRONTEND_URL: http://localhost:3000
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  mongo_data:
+  uploads:

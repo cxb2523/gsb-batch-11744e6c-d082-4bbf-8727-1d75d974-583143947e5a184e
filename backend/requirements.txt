@@ -1,0 +1,53 @@
+# Runtime dependencies for the GRID backend (FastAPI).
+#
+# SOURCE OF TRUTH: pyproject.toml ([project].dependencies). This file mirrors it
+# for tooling that expects a requirements file (older CI images, scanners, some
+# PaaS buildpacks). If you change one, change the other.
+#
+#   pip install -r requirements.txt
+#
+# Dev tools (pytest, ruff, mypy) are NOT here; they live in pyproject's
+# [project.optional-dependencies].dev:  pip install -e ".[dev]"
+#
+# Note: these are lower bounds, not pins, so this is not a lockfile. For a
+# reproducible build, resolve once and commit the output:
+#   pip-compile requirements.txt -o requirements.lock.txt   (or: uv pip compile)
+
+# Requires Python >=3.11
+
+# --- web framework ---
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+itsdangerous>=2.2.0
+
+# --- config & validation ---
+pydantic>=2.7.0
+pydantic-settings>=2.2.1
+python-dotenv>=1.0.0
+
+# --- auth ---
+authlib>=1.3.0
+python-jose[cryptography]>=3.3.0
+bcrypt>=4.0.0
+# Fernet symmetric encryption for OAuth/Slack tokens at rest (app/core/crypto.py).
+cryptography>=42.0.0
+
+# --- datastores ---
+motor>=3.3.0
+
+# --- integrations ---
+httpx>=0.27.0
+slack_sdk>=3.23.0
+google-api-python-client>=2.100.0
+google-auth>=2.30.0
+google-auth-oauthlib>=1.2.0
+
+# --- document parsing / uploads ---
+PyPDF2>=3.0.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
+filetype>=1.2.0
+
+# --- misc ---
+tzdata>=2024.1

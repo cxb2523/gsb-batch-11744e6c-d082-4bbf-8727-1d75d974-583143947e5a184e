@@ -1,0 +1,7 @@
+# Shell scripts must keep LF endings whatever the checkout platform.
+#
+# core.autocrlf=true on a Windows clone would otherwise hand them CRLF, and a
+# bash script with CRLF fails at the shebang — `bad interpreter: /usr/bin/env
+# bash^M` — which is a confusing first thing for a self-hoster to hit when
+# running scripts/setup.sh under WSL or Git Bash.
+*.sh text eol=lf

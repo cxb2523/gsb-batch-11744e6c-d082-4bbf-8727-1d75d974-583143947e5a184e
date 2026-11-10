@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Stratzi-Tech/grid/security/advisories/new
+    about: Please do not open a public issue for a vulnerability. Report it privately here.
+  - name: Self-hosting guide
+    url: https://github.com/Stratzi-Tech/grid/blob/develop/docs/self-hosting.md
+    about: Setup, configuration and troubleshooting. Check the Troubleshooting section before filing a setup problem.

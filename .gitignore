@@ -1,0 +1,216 @@
+# ========== General ==========
+.DS_Store
+*.log
+*.swp
+*.swo
+*~
+.env
+.env.*
+.env.local
+.env.*.local
+# ...but keep the committed example templates.
+!.env.example
+
+# ========== Frontend (Next.js) ==========
+
+# Dependencies
+frontend/node_modules/
+frontend/.pnp
+frontend/.pnp.js
+
+# Testing
+frontend/coverage/
+frontend/.nyc_output
+
+# Next.js
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/dist/
+
+# Production
+frontend/build
+
+# Misc
+frontend/.DS_Store
+frontend/*.pem
+
+# Debug
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+
+# Local env files
+frontend/.env
+frontend/.env*.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+
+# Vercel
+frontend/.vercel
+
+# TypeScript
+frontend/*.tsbuildinfo
+frontend/next-env.d.ts
+
+# ========== Backend (Python/FastAPI) ==========
+
+# Byte-compiled / optimized / DLL files
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.py[cod]
+backend/*$py.class
+backend/**/*.py[cod]
+backend/**/*$py.class
+backend/uploads
+# Default local file-storage root (APP_DATA_DIR) for non-Docker runs.
+data/
+# C extensions
+backend/*.so
+
+# Distribution / packaging
+backend/.Python
+backend/build/
+backend/develop-eggs/
+backend/dist/
+backend/downloads/
+backend/eggs/
+backend/.eggs/
+backend/lib/
+backend/lib64/
+backend/parts/
+backend/sdist/
+backend/var/
+backend/wheels/
+backend/share/python-wheels/
+backend/*.egg-info/
+backend/.installed.cfg
+backend/*.egg
+backend/MANIFEST
+
+# PyInstaller
+backend/*.manifest
+backend/*.spec
+
+# Unit test / coverage reports
+backend/htmlcov/
+backend/.tox/
+backend/.nox/
+backend/.coverage
+backend/.coverage.*
+backend/.cache
+backend/nosetests.xml
+backend/coverage.xml
+backend/*.cover
+backend/*.py,cover
+backend/.hypothesis/
+backend/.pytest_cache/
+backend/cover/
+
+# Flask/FastAPI stuff
+backend/instance/
+backend/.webassets-cache
+
+# Environments
+backend/.env
+backend/.env.*
+# ...but keep the committed example template.
+!backend/.env.example
+backend/.venv
+backend/env/
+backend/venv/
+backend/ENV/
+backend/env.bak/
+backend/venv.bak/
+
+# mypy
+backend/.mypy_cache/
+backend/.dmypy.json
+backend/dmypy.json
+
+# Pyre type checker
+backend/.pyre/
+
+# pytype static type analyzer
+backend/.pytype/
+
+# Cython debug symbols
+backend/cython_debug/
+
+# IDEs
+backend/.idea/
+backend/.vscode/
+backend/*.swp
+backend/*.swo
+backend/*~
+
+# Database
+backend/*.db
+backend/*.sqlite
+backend/*.sqlite3
+
+# ========== Documentation Files (root level only) ==========
+# Deny-by-default: internal planning docs, audits and scratch notes at the repo
+# root stay out of git, so they cannot leak into the public repository. The
+# files meant for the outside world are allowed back in one by one below — add
+# to that list rather than relaxing the rule, and check `git check-ignore -v`
+# on any new root-level doc before assuming it was committed.
+/*.md
+!README.md
+!API.md
+!SECURITY.md
+!CONTRIBUTING.md
+!CODE_OF_CONDUCT.md
+!CHANGELOG.md
+
+# Internal planning spreadsheets (the launch tracker and anything like it).
+# Same deny-by-default reasoning as the markdown rule above: these carry
+# internal status, owners and known-weakness notes and must never ship.
+/*.xlsx
+/*.xlsm
+
+# Specifically ignore these documentation files
+/ALL_PROJECTS_IMPLEMENTATION.md
+/BACKEND_ANALYSIS_SUMMARY.md
+/BACKEND_API_ENDPOINTS_SUMMARY.md
+/BACKEND_API_GAPS.md
+/BACKEND_ARCHITECTURE_ANALYSIS.md
+/DASHBOARD_IMPLEMENTATION.md
+/DESIGN_SYSTEM.json
+/INTEGRATION_PLAN.md
+/LOGIN_PAGE_IMPLEMENTATION.md
+/PAGES_INVENTORY.md
+/PAGES_LIST.md
+/PHASE_1_COMPLETE.md
+/PROJECT_ANALYSIS_SUMMARY.md
+/QUICK_START_GUIDE.md
+/README_BACKEND_ANALYSIS.md
+/UI_REPLACEMENT_SUMMARY.md
+
+# ========== Screenshots ==========
+screen-shots/
+
+# ========== IDE / Editor ==========
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# ========== OS ==========
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+.claude/
+
+.agents/
+skills-lock.json
+# ========== Playwright ==========
+# Saved session cookies from tests/auth.setup.ts — never commit these.
+frontend/tests/.auth/
+frontend/test-results/
+frontend/playwright-report/
+frontend/blob-report/
+# Note: frontend/tests/*-snapshots/ IS committed — those are the baselines.
