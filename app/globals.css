@@ -1,0 +1,496 @@
+/* Explicit cascade-layer order - must precede every @import (later layers win).
+   reset < utilities un-breaks non-migrated prose; astryx-base > base keeps
+   Astryx component styling through Tailwind preflight; utilities > astryx-base
+   restores py-6 and className overrides; astryx-theme (scoped tokens) stays last. */
+@layer properties, theme, base, components, reset, astryx-base, utilities, astryx-theme;
+
+@import 'tailwindcss';
+@import '@astryxdesign/core/astryx.css';
+@import '@astryxdesign/theme-neutral/theme.css';
+/* Pre-built speedtest theme (astryx theme build lib/astryx-theme.ts). Ships the
+   scoped tokens/component CSS statically so nothing is injected at runtime; the
+   file declares its own @layer reset / @layer astryx-theme, slotting into the
+   explicit order above. Pair with the __built theme in components/astryx-providers.tsx. */
+@import '../lib/speedtest.css';
+
+@custom-variant dark (&:is(.dark *));
+/* Touch devices fire :hover on tap and keep it stuck until the next tap, so
+   every hover-driven transform/shadow is gated behind a fine pointer. */
+@custom-variant hover-fine (@media (hover: hover) and (pointer: fine));
+
+@theme inline {
+  --font-sans:
+    var(--font-sans), ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    sans-serif;
+  --font-mono:
+    var(--font-mono), ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-brand: var(--brand);
+  --color-brand-hover: var(--brand-hover);
+  --color-brand-foreground: var(--brand-foreground);
+  --color-brand-accent: var(--brand-accent);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-speed-down: var(--speed-down);
+  --color-speed-up: var(--speed-up);
+  --color-latency-ok: var(--latency-ok);
+  --color-latency-warn: var(--latency-warn);
+  --color-latency-bad: var(--latency-bad);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  /* Typography tokens */
+  --tracking-eyebrow: 0.14em;
+  /* Spacing scale (semantic) */
+  --space-stack-xs: 0.25rem;
+  --space-stack-sm: 0.5rem;
+  --space-stack-md: 1rem;
+  --space-stack-lg: 1.5rem;
+  --space-stack-xl: 2rem;
+}
+
+/* Motion tokens. Curves are the strong variants of the built-in easings (the
+   CSS defaults are too weak to read as deliberate); durations mirror the
+   Astryx theme's --duration-* scale, redeclared here because the theme's live
+   inside an @scope and this file's rules also style nodes outside it. */
+:root {
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+  --motion-fast: 125ms;
+  --motion-medium: 300ms;
+  --motion-slow: 700ms;
+}
+
+:root {
+  --radius: 0.625rem;
+  --background: oklch(0.99 0.002 250);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.45 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  /* Brand identity (logo gradient #2563EB -> #06B6D4) */
+  --brand: oklch(0.56 0.19 250);
+  /* Pure white: 0.985 grey computed 4.38:1 on the darkened brand, under AA */
+  --brand-foreground: oklch(1 0 0);
+  /* Hover surface, darker than --brand for a perceptible state change.
+     White foreground on this token computes to 5.85:1 (>= 4.5:1 AA) - see
+     .superpowers/sdd/p4-task-1-report.md for the WCAG math. */
+  --brand-hover: oklch(0.5 0.19 250);
+  --brand-accent: oklch(0.72 0.15 210);
+  --ring: oklch(0.58 0.19 250);
+  /* Chart palette: brand-first, stable light/dark */
+  --chart-1: oklch(0.58 0.19 250);
+  --chart-2: oklch(0.72 0.15 210);
+  --chart-3: oklch(0.63 0.19 145);
+  --chart-4: oklch(0.75 0.16 80);
+  --chart-5: oklch(0.6 0.23 300);
+  --speed-down: oklch(0.58 0.19 250);
+  --speed-up: oklch(0.6 0.23 300);
+  --latency-ok: oklch(0.63 0.19 145);
+  --latency-warn: oklch(0.75 0.16 80);
+  --latency-bad: oklch(0.63 0.24 25);
+  /* Atmosphere */
+  --grid-color: oklch(0.145 0 0 / 4%);
+  --glow-color: oklch(0.58 0.19 250 / 8%);
+}
+
+.dark {
+  --background: oklch(0.135 0.01 260);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.19 0.008 260);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.74 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  /* Same brand hue, lighter luminance for dark surfaces */
+  --brand: oklch(0.7 0.17 240);
+  --brand-foreground: oklch(0.145 0 0);
+  /* Hover surface, lighter than --brand so hover stays perceptible against the
+     dark surface. Dark foreground on this token computes to 8.61:1 - see
+     .superpowers/sdd/p4-task-1-report.md for the WCAG math. */
+  --brand-hover: oklch(0.74 0.17 240);
+  --brand-accent: oklch(0.82 0.15 200);
+  --ring: oklch(0.7 0.17 240);
+  --chart-1: oklch(0.7 0.17 240);
+  --chart-2: oklch(0.82 0.15 200);
+  --chart-3: oklch(0.74 0.18 145);
+  --chart-4: oklch(0.82 0.16 80);
+  --chart-5: oklch(0.76 0.17 300);
+  --speed-down: oklch(0.7 0.17 240);
+  --speed-up: oklch(0.76 0.17 300);
+  --latency-ok: oklch(0.74 0.18 145);
+  --latency-warn: oklch(0.82 0.16 80);
+  --latency-bad: oklch(0.7 0.23 25);
+  /* Atmosphere */
+  --grid-color: oklch(1 0 0 / 5%);
+  --glow-color: oklch(0.7 0.17 240 / 12%);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    font-feature-settings: 'cv11', 'ss01', 'ss03';
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: 'rlig' 1, 'calt' 1;
+  }
+
+  /* Tabular figures for numeric-heavy UI */
+  table,
+  th,
+  td {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Skip-link: hidden until focused */
+  .skip-link {
+    position: absolute;
+    top: 0.5rem;
+    left: 0.5rem;
+    z-index: 100;
+    /* No transition: focusing this is a keyboard action, and for a keyboard-only
+       user it is the first Tab of every page load. Animation there only delays
+       the confirmation that focus landed. */
+    transform: translateY(-200%);
+    padding: 0.5rem 0.75rem;
+    border-radius: var(--radius-md);
+    background: var(--brand);
+    color: var(--brand-foreground);
+    font-size: 0.875rem;
+    font-weight: 500;
+    box-shadow: 0 4px 12px -2px rgb(0 0 0 / 0.2);
+  }
+  .skip-link:focus-visible {
+    transform: translateY(0);
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+}
+
+/* Eyebrow / section labels - uniform style across cards, fieldsets, headers.
+   Unlayered on purpose: it must beat Astryx Heading's own scale (astryx-base
+   layer) on migrated cards, and unlayered rules outrank every cascade layer. */
+.label-eyebrow {
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-eyebrow);
+  color: var(--muted-foreground);
+}
+
+/* Mono variant: same tracking token, used inside Tokens/badges that bring their
+   own color - so this one deliberately does not set `color`. */
+.label-eyebrow-mono {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-eyebrow);
+}
+
+/* ---- Press feedback (Apple: respond on pointer-down, not on release) -------
+   Astryx controls already ship `:active { transform: scale(.98) }`; this covers
+   the hand-rolled buttons/links, which otherwise have hover-only feedback and
+   therefore none at all on touch. */
+/* Longhand, and transform listed alongside the color properties: this rule is
+   unlayered, so a `transition` shorthand here would silently drop the
+   `transition-colors` these call sites already carry. */
+.press {
+  transition-property: transform, color, background-color, border-color;
+  transition-duration: var(--motion-fast);
+  transition-timing-function: var(--ease-out);
+}
+.press:active {
+  transform: scale(0.97);
+  transition-duration: 100ms;
+}
+
+/* ---- Atmosphere: soft grid + brand glow ---------------------------------- */
+.app-backdrop {
+  background-image:
+    radial-gradient(
+      ellipse 80% 50% at 50% -10%,
+      var(--glow-color) 0%,
+      transparent 60%
+    ),
+    linear-gradient(to right, var(--grid-color) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid-color) 1px, transparent 1px);
+  background-size: auto, 56px 56px, 56px 56px;
+  background-position: center top, center, center;
+  mask-image: radial-gradient(ellipse 80% 60% at 50% 30%, black 50%, transparent 95%);
+  -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 30%, black 50%, transparent 95%);
+}
+
+/* ---- KPI hero number gradient ------------------------------------------- */
+.kpi-value-gradient {
+  background-image: linear-gradient(
+    180deg,
+    var(--foreground) 0%,
+    color-mix(in oklab, var(--foreground) 75%, transparent) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* ---- Brand glow pill (Run now) ------------------------------------------ */
+.brand-glow {
+  box-shadow:
+    0 0 0 1px color-mix(in oklab, var(--brand) 60%, transparent),
+    0 6px 24px -6px color-mix(in oklab, var(--brand) 65%, transparent),
+    0 2px 6px -2px color-mix(in oklab, var(--brand) 45%, transparent);
+}
+
+/* ---- Pulsing ring for live status --------------------------------------- */
+@keyframes pulse-ring {
+  0% { transform: scale(0.85); opacity: 0.7; }
+  80%, 100% { transform: scale(2); opacity: 0; }
+}
+.pulse-ring::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  background: currentColor;
+  animation: pulse-ring 1.4s var(--ease-out) infinite;
+}
+
+/* ---- KPI "new measurement landed" highlight ----------------------------
+   A transition, not a @keyframes: measurements can land back-to-back (an
+   automatic run followed by a manual one), and a keyframe restarts from zero,
+   which is why this previously needed a forced-reflow hack to re-trigger. The
+   overlay snaps to full opacity (0ms) and decays over --motion-slow, so a
+   second measurement mid-decay retargets smoothly from wherever it is.
+   Opacity on a pseudo-element also keeps it composited - the old version
+   animated background-color, which repaints. */
+.kpi-flash {
+  position: relative;
+}
+.kpi-flash::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-color: color-mix(in oklab, var(--brand) 14%, transparent);
+  opacity: 0;
+  transition: opacity var(--motion-slow) var(--ease-out);
+}
+.kpi-flash[data-flash='true']::after {
+  opacity: 1;
+  transition-duration: 0ms;
+}
+
+/* ---- Drawer section stagger entry --------------------------------------- */
+@keyframes drawer-section-in {
+  0% {
+    opacity: 0;
+    transform: translateX(8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+.drawer-section {
+  animation: drawer-section-in 280ms var(--ease-drawer) both;
+}
+
+/* The drawer leaves the way it arrived, back toward the Menu button that opened
+   it (Apple: symmetric paths, anchored origins). The staggered sections are
+   suppressed on the way out so the panel reads as one object. */
+@keyframes drawer-out {
+  to {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+}
+.drawer-out {
+  transform-origin: top right;
+  animation: drawer-out 180ms var(--ease-drawer) both;
+}
+.drawer-out .drawer-section {
+  animation: none;
+}
+
+/* ---- Scroll edge effect (no divider until content is actually under it) ---
+   Scroll-driven, zero JS. Browsers without scroll timelines keep the static
+   border, which is the previous behaviour. */
+@supports (animation-timeline: scroll()) {
+  @keyframes scroll-edge-in {
+    to {
+      border-bottom-color: color-mix(in oklab, var(--border) 60%, transparent);
+    }
+  }
+  .scroll-edge {
+    border-bottom-color: transparent;
+    animation: scroll-edge-in linear both;
+    animation-timeline: scroll();
+    animation-range: 0 56px;
+  }
+}
+
+/* ---- React <ViewTransition> ----------------------------------------------
+   Page swaps and range-data swaps crossfade. Opacity only, so they stay under
+   reduced motion (same stance as below); the global `*` rule does not reach
+   ::view-transition-* pseudos anyway. The overlay must not eat clicks. */
+::view-transition {
+  pointer-events: none;
+}
+::view-transition-group(*) {
+  animation-duration: var(--motion-medium);
+  animation-timing-function: var(--ease-out);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Reduced motion means a gentler equivalent, not no feedback. All three are
+     color/opacity changes rather than movement, and each carries meaning: the
+     flash says a new measurement landed, the edge says content is under the
+     chrome, the theme fade softens a full-viewport brightness jump. */
+  .kpi-flash::after {
+    transition-duration: var(--motion-slow) !important;
+  }
+  .scroll-edge {
+    animation-duration: auto !important;
+  }
+  .theme-ready body,
+  .theme-ready .app-backdrop {
+    transition-duration: var(--motion-fast) !important;
+  }
+}
+
+/* ---- Reduced transparency: frost the translucent chrome solid ------------- */
+@media (prefers-reduced-transparency: reduce) {
+  .material-chrome {
+    background: var(--background) !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+  .app-backdrop {
+    display: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --muted-foreground: oklch(0.35 0 0);
+    --border: oklch(0.75 0 0);
+  }
+  .dark {
+    --muted-foreground: oklch(0.85 0 0);
+    --border: oklch(1 0 0 / 30%);
+  }
+  :focus-visible {
+    outline: 3px solid var(--ring) !important;
+    outline-offset: 2px !important;
+  }
+}
+
+@media (forced-colors: active) {
+  *:focus-visible {
+    outline: 2px solid CanvasText !important;
+    outline-offset: 2px !important;
+  }
+  .skip-link {
+    background: Canvas;
+    color: CanvasText;
+    border: 1px solid CanvasText;
+  }
+  [aria-pressed='true'],
+  [aria-checked='true'] {
+    forced-color-adjust: none;
+    background: Highlight;
+    color: HighlightText;
+  }
+  .app-backdrop {
+    display: none;
+  }
+}
+
+/* ---- Theme switch: soften the full-viewport brightness flip --------------
+   Scoped to `body` and the backdrop rather than `*` on purpose: those two
+   surfaces are the flip, and a universal color transition would both cost a
+   paint on every node and clobber the transition shorthand of every component
+   that sets its own. `.theme-ready` is added after hydration (see
+   components/astryx-providers.tsx) so this never plays on first paint. */
+.theme-ready body,
+.theme-ready .app-backdrop {
+  transition: background-color var(--motion-fast) ease, color var(--motion-fast) ease;
+}
+
+/* ---- Panel entrance -----------------------------------------------------
+   For conditionally-rendered panels that would otherwise teleport in.
+   Enter only: @starting-style has no exit counterpart, and the collapse is
+   driven by an unmount we do not hold open. Degrades to the previous instant
+   appearance where @starting-style is unsupported. */
+.panel-enter {
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity var(--motion-medium) var(--ease-out), transform var(--motion-medium) var(--ease-out);
+}
+@starting-style {
+  .panel-enter {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}

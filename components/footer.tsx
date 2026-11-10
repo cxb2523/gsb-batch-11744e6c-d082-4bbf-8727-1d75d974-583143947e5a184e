@@ -1,0 +1,70 @@
+import { cacheLife } from 'next/cache';
+import Link from 'next/link';
+
+import { LogoMark } from '@/components/logo-mark';
+import { APP_VERSION, GITHUB_REPO_URL } from '@/lib/version';
+
+function GithubMark({ className }: { className?: string }) {
+  return (
+    <svg role="img" aria-label="GitHub" viewBox="0 0 16 16" fill="currentColor" className={className}>
+      <title>GitHub</title>
+      <path
+        fillRule="evenodd"
+        d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"
+        clipRule="evenodd"
+      />
+    </svg>
+  );
+}
+
+// Cache Components refuses an uncached `new Date()` in a prerender; a daily
+// cache keeps the shell static and still flips the year without a rebuild.
+async function currentYear() {
+  'use cache';
+  cacheLife('days');
+  return new Date().getFullYear();
+}
+
+export async function Footer() {
+  const year = await currentYear();
+  const isTagged = APP_VERSION !== 'dev';
+  return (
+    <footer
+      role="contentinfo"
+      className="material-chrome mt-auto border-t border-border/60 bg-background/40 backdrop-blur-sm"
+    >
+      <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-3 px-4 py-5 text-sm text-muted-foreground md:flex-row md:px-6">
+        <div className="flex items-center gap-2.5">
+          <LogoMark size={20} />
+          <p className="font-mono text-xs leading-none tracking-wide">
+            <span className="text-foreground">Speedtest·Monitor</span>
+            <span className="mx-1.5 text-border">/</span>
+            <span>&copy; {year}</span>
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Link
+            href="/changelog"
+            className="press inline-flex items-center gap-1.5 rounded-full border border-border/70 bg-card/40 px-2.5 py-0.5 font-mono text-[11px] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            aria-label={isTagged ? `Version ${APP_VERSION}, view changelog` : 'Development build, view changelog'}
+          >
+            <span
+              aria-hidden
+              className={isTagged ? 'size-1.5 rounded-full bg-latency-ok' : 'size-1.5 rounded-full bg-muted-foreground'}
+            />
+            <span className="tabular-nums">{APP_VERSION}</span>
+          </Link>
+          <a
+            href={GITHUB_REPO_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="press inline-flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            aria-label="Source code on GitHub (opens in a new tab)"
+          >
+            <GithubMark className="size-4" />
+          </a>
+        </div>
+      </div>
+    </footer>
+  );
+}

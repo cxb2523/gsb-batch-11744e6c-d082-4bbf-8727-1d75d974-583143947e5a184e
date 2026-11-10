@@ -1,0 +1,159 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.6.6/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignoreUnknown": false,
+    "includes": [
+      "**",
+      "!**/node_modules",
+      "!**/.next",
+      "!**/dist",
+      "!**/drizzle",
+      "!**/coverage",
+      "!**/public",
+      "!**/.claude",
+      "!**/.vscode",
+      "!**/.worktrees",
+      "!**/*.tsbuildinfo",
+      "!**/*.css",
+      "!next-env.d.ts",
+      "!bun-env.d.ts",
+      "!bun.lock",
+      "!speedtest.db",
+      "!speedtest.db-shm",
+      "!speedtest.db-wal",
+      "!lib/generated",
+      "!lib/speedtest.js",
+      "!lib/speedtest.d.ts",
+      "!lib/speedtest.variants.d.ts",
+      "!CLAUDE.md"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 120,
+    "lineEnding": "lf"
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "jsxQuoteStyle": "double",
+      "semicolons": "always",
+      "trailingCommas": "all",
+      "bracketSpacing": true,
+      "arrowParentheses": "always"
+    }
+  },
+  "json": {
+    "formatter": {
+      "enabled": true,
+      "trailingCommas": "none"
+    }
+  },
+  "css": {
+    "parser": { "cssModules": false },
+    "formatter": { "enabled": false },
+    "linter": { "enabled": false }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "style": {
+        "useImportType": "error",
+        "noNonNullAssertion": "off",
+        "noParameterAssign": "error",
+        "noNestedTernary": "warn",
+        "useTemplate": "error",
+        "useDefaultParameterLast": "error",
+        "noUselessElse": "warn",
+        "useShorthandAssign": "error",
+        "useBlockStatements": "error"
+      },
+      "suspicious": {
+        "noExplicitAny": "error",
+        "noArrayIndexKey": "off",
+        "noImplicitAnyLet": "error",
+        "noShadowRestrictedNames": "error",
+        "useIterableCallbackReturn": "error",
+        "noConsole": "warn",
+        "noDuplicateElseIf": "error"
+      },
+      "correctness": {
+        "noUnusedVariables": "warn",
+        "useExhaustiveDependencies": "off",
+        "useHookAtTopLevel": "error",
+        "useJsxKeyInIterable": "error",
+        "noUndeclaredDependencies": "error"
+      },
+      "a11y": {
+        "preset": "recommended",
+        "noSvgWithoutTitle": "warn",
+        "noStaticElementInteractions": "off"
+      },
+      "security": {
+        "noDangerouslySetInnerHtml": "warn"
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["app/**/route.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noConsole": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["scripts/**/*.ts", "server.ts", "proxy.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noConsole": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["**/*.test.ts", "**/*.test.tsx"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noExplicitAny": "off",
+            "noConsole": "off"
+          }
+        }
+      }
+    }
+  ],
+  "assist": {
+    "enabled": true,
+    "actions": {
+      "source": {
+        "organizeImports": {
+          "level": "on",
+          "options": {
+            "groups": [
+              [":BUN:", ":NODE:"],
+              ":BLANK_LINE:",
+              ":PACKAGE:",
+              ":BLANK_LINE:",
+              ":PATH:",
+              ":BLANK_LINE:",
+              ["@/components/**", "@/lib/**", "@/**"]
+            ]
+          }
+        }
+      }
+    }
+  }
+}

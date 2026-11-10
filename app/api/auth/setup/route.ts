@@ -1,0 +1,39 @@
+import { NextResponse } from 'next/server';
+import { z } from 'zod';
+
+import { apiError, apiValidationError } from '@/lib/api-errors';
+import { loadAuthConfig } from '@/lib/auth/config';
+import { hashPassword } from '@/lib/auth/hash';
+import { emailSchema } from '@/lib/auth/schema';
+import { countUsers, createUser, setCredentialPassword } from '@/lib/auth/users';
+
+const schema = z.object({
+  email: emailSchema,
+  password: z.string().min(10).max(1024),
+});
+
+export async function POST(req: Request) {
+  if (countUsers() !== 0 || loadAuthConfig().passwordLoginDisabled) {
+    return apiError('not_found', 'Setup is no longer available.', 404);
+  }
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return apiError('invalid_json', 'Request body is not valid JSON.', 400);
+  }
+  const parsed = schema.safeParse(body);
+  if (!parsed.success) {
+    return apiValidationError(parsed.error);
+  }
+  const email = parsed.data.email.toLowerCase().trim();
+  const created = createUser({
+    email,
+    name: '',
+    emailVerified: true,
+    role: 'admin',
+    provider: 'local',
+  });
+  setCredentialPassword(created.id, await hashPassword(parsed.data.password));
+  return new NextResponse(null, { status: 204 });
+}

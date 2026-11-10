@@ -1,0 +1,90 @@
+import { describe, expect, it } from 'bun:test';
+
+import { renderToStaticMarkup } from 'react-dom/server';
+
+import { Markdown, safeHref } from './markdown';
+
+describe('safeHref', () => {
+  it('allows http/https/mailto', () => {
+    expect(safeHref('https://github.com/x')).toBe('https://github.com/x');
+    expect(safeHref('http://example.com/a')).toBe('http://example.com/a');
+    expect(safeHref('mailto:a@b.c')).toBe('mailto:a@b.c');
+  });
+
+  it('allows relative and anchor links (resolved against an https base)', () => {
+    expect(safeHref('/changelog')).toBe('/changelog');
+    expect(safeHref('#notes')).toBe('#notes');
+  });
+
+  it('rejects script-capable schemes', () => {
+    expect(safeHref('javascript:alert(1)')).toBeNull();
+    expect(safeHref('data:text/html,x')).toBeNull();
+    expect(safeHref('vbscript:msgbox')).toBeNull();
+  });
+
+  it('rejects unparseable input', () => {
+    expect(safeHref('http://')).toBeNull();
+  });
+});
+
+// Render smoke test: pins that the Astryx Markdown component (not the old
+// hand-rolled parser) is what's rendering, and that safeHref is actually
+// wired in as the link component's guard.
+describe('Markdown (rendered via Astryx)', () => {
+  const sample = ['## Highlights', '', '- Faster **exports**', '- Fixed `flaky` retries', '', '[docs](https://x)'].join(
+    '\n',
+  );
+
+  it('renders headings, list items, bold, inline code and a safe link', () => {
+    const html = renderToStaticMarkup(<Markdown source={sample} />);
+    expect(html).toContain('<h3');
+    expect(html).toContain('Highlights');
+    expect(html).toContain('<li');
+    expect(html).toContain('<strong');
+    expect(html).toContain('exports');
+    expect(html).toContain('<code');
+    expect(html).toContain('flaky');
+    expect(html).toContain('<a');
+    expect(html).toContain('href="https://x"');
+    expect(html).toContain('target="_blank"');
+    expect(html).toContain('rel="noopener noreferrer"');
+  });
+
+  // Two independent layers reject a script-capable scheme, and they degrade
+  // differently. Astryx (since 0.5.x) refuses to parse `javascript:`/`data:`
+  // into a link node at all and emits the raw source as escaped text, so
+  // ReleaseLink never runs and the literal string "javascript:" survives as
+  // inert text content. Assert the invariant that actually matters - nothing
+  // renders an anchor or an href - rather than the absence of that substring.
+  // safeHref's own rejection is covered directly by the unit tests above, and
+  // is still reached for schemes Astryx does parse (see the tel: case below).
+  it('renders an unsafe link without an anchor or href', () => {
+    const html = renderToStaticMarkup(<Markdown source="[x](javascript:alert(1))" />);
+    expect(html).not.toContain('<a');
+    expect(html).not.toContain('href=');
+    expect(html).toContain('x');
+  });
+
+  it('rejects tel: scheme via safeHref allowlist even though Astryx blocklist allows it', () => {
+    const html = renderToStaticMarkup(<Markdown source="[call us](tel:123456)" />);
+    expect(html).not.toContain('<a');
+    expect(html).not.toContain('tel:');
+    expect(html).toContain('call us');
+  });
+
+  it('renders images as a link, never an <img>, and drops unsafe image src entirely', () => {
+    const safe = renderToStaticMarkup(<Markdown source="![logo](https://example.com/x.png)" />);
+    expect(safe).not.toContain('<img');
+    expect(safe).toContain('<a');
+    expect(safe).toContain('href="https://example.com/x.png"');
+
+    const unsafe = renderToStaticMarkup(<Markdown source="![x](javascript:alert(1))" />);
+    expect(unsafe).not.toContain('<img');
+    expect(unsafe).not.toContain('<a');
+  });
+
+  it('degrades empty-alt images to empty links (no <img tag)', () => {
+    const html = renderToStaticMarkup(<Markdown source="![](https://example.com/x.png)" />);
+    expect(html).not.toContain('<img');
+  });
+});

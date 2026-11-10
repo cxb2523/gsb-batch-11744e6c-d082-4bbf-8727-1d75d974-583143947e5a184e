@@ -1,0 +1,21 @@
+services:
+  speedtest:
+    build: .
+    container_name: speedtest-monitor
+    ports:
+      - "3000:3000"
+    environment:
+      SPEEDTEST_INTERVAL_MINUTES: "15"
+      # SPEEDTEST_LOCALE: "en-US"
+      # SPEEDTEST_TIMEZONE: "Europe/Paris"
+      TZ: "Europe/Paris"
+      # Owner of /data and uid/gid the server runs as (Unraid: 99 / 100)
+      # PUID: "1001"
+      # PGID: "1001"
+      AUTH_SECRET: ${AUTH_SECRET:-}
+    volumes:
+      - speedtest-data:/data
+    restart: unless-stopped
+
+volumes:
+  speedtest-data:
