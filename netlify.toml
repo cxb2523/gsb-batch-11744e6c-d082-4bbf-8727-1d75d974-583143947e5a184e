@@ -1,0 +1,125 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+[build.environment]
+  NODE_VERSION = "24"
+
+[functions]
+  node_bundler = "esbuild"
+
+[dev]
+  command = "npm run dev:vite"
+  targetPort = 5173
+  port = 8888
+  framework = "#custom"
+  autoLaunch = false
+
+# The legacy (2023) app registered a Workbox service worker at this path that
+# precached the old index.html. Our replacement unregisters itself; never cache it.
+[[headers]]
+  for = "/service-worker.js"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
+[[headers]]
+  for = "/fonts/*"
+  [headers.values]
+    Cache-Control = "public, max-age=604800"
+
+[[headers]]
+  for = "/pages.css"
+  [headers.values]
+    Cache-Control = "public, max-age=3600"
+
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    X-Frame-Options = "DENY"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+
+# Agent discovery: advertise the plain-text guide and sitemap on the homepage.
+[[headers]]
+  for = "/"
+  [headers.values]
+    Link = '</llms.txt>; rel="llms-txt", </sitemap.xml>; rel="sitemap"'
+
+[[headers]]
+  for = "/llms.txt"
+  [headers.values]
+    Content-Type = "text/plain; charset=utf-8"
+    Access-Control-Allow-Origin = "*"
+
+[[headers]]
+  for = "/.well-known/*"
+  [headers.values]
+    Access-Control-Allow-Origin = "*"
+
+[[headers]]
+  for = "/manifest.webmanifest"
+  [headers.values]
+    Content-Type = "application/manifest+json"
+
+# Icons and manifest of the 2023 app, still referenced by old installs and caches.
+[[redirects]]
+  from = "/manifest.json"
+  to = "/manifest.webmanifest"
+  status = 301
+
+[[redirects]]
+  from = "/logo192.png"
+  to = "/icon-192.png"
+  status = 301
+
+[[redirects]]
+  from = "/logo512.png"
+  to = "/icon-512.png"
+  status = 301
+
+[[redirects]]
+  from = "/logo192_mask.png"
+  to = "/maskable-512.png"
+  status = 301
+
+[[redirects]]
+  from = "/logo512_mask.png"
+  to = "/maskable-512.png"
+  status = 301
+
+# One canonical host: the default Netlify hostname redirects (single hop, path and query kept).
+# Deploy previews use other hostnames and are unaffected.
+[[redirects]]
+  from = "https://llm-alchemy.netlify.app/*"
+  to = "https://alchemy.sshh.io/:splat"
+  status = 301
+  force = true
+
+# Content pages have one clean URL each.
+[[redirects]]
+  from = "/how-to-play.html"
+  to = "/how-to-play"
+  status = 301
+  force = true
+
+[[redirects]]
+  from = "/about.html"
+  to = "/about"
+  status = 301
+  force = true
+
+[[redirects]]
+  from = "/recipes.html"
+  to = "/recipes"
+  status = 301
+  force = true
+
+# No catch-all: the game lives at "/", content pages are static files (/how-to-play, /about,
+# /recipes) or functions (/daily), and anything else gets public/404.html with a real 404.

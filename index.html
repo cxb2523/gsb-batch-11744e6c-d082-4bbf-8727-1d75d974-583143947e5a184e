@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+    <title>Infinite Alchemy: the original AI element-combining game</title>
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#EFE7D9" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#2A231C" media="(prefers-color-scheme: dark)" />
+    <link rel="preload" href="/node_modules/@fontsource-variable/instrument-sans/files/instrument-sans-latin-wdth-normal.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/node_modules/@fontsource-variable/fraunces/files/fraunces-latin-soft-normal.woff2" as="font" type="font/woff2" crossorigin />
+    <script>
+      // Apply a saved theme / motion override before first paint (no flash). Mirrors src/app/state/settings.ts.
+      try {
+        var s = JSON.parse(localStorage.getItem("ia:settings") || "{}");
+        if (s.theme === "light" || s.theme === "dark") {
+          document.documentElement.dataset.theme = s.theme;
+          var c = s.theme === "dark" ? "#2A231C" : "#EFE7D9";
+          document.querySelectorAll('meta[name="theme-color"]').forEach(function (m) { m.content = c; });
+        }
+        if (s.motion === "reduce") document.documentElement.dataset.motion = "reduce";
+      } catch (e) {}
+    </script>
+    <!-- meta: SEO, Open Graph/Twitter, icons, manifest, JSON-LD and analytics (owned by web-meta) -->
+    <meta name="description" content="The original AI alchemy game. Combine elements into anything: AI invents and paints every result. Free online, no account. Inspired by Little Alchemy." />
+    <meta name="keywords" content="AI alchemy game, element combining game, crafting game, infinite craft, Little Alchemy, LLM game, browser game" />
+    <meta name="author" content="Shrivu Shankar" />
+    <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1" />
+    <meta name="is-agentic-site-type" content="app" />
+    <link rel="canonical" href="https://alchemy.sshh.io/" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Infinite Alchemy" />
+    <meta property="og:url" content="https://alchemy.sshh.io/" />
+    <meta property="og:title" content="Infinite Alchemy: the original AI element-combining game" />
+    <meta property="og:description" content="The original infinite AI alchemy game. Start with five elements and combine them into anything: an AI invents and paints every new result." />
+    <meta property="og:image" content="https://alchemy.sshh.io/og-image.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Infinite Alchemy: clay-style tiles showing Water plus Fire equals Steam." />
+    <meta property="og:locale" content="en_US" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:site" content="@ShrivuShankar" />
+    <meta name="twitter:creator" content="@ShrivuShankar" />
+    <meta name="twitter:title" content="Infinite Alchemy: the original AI element-combining game" />
+    <meta name="twitter:description" content="The original infinite AI alchemy game. Start with five elements and combine them into anything: an AI invents and paints every new result." />
+    <meta name="twitter:image" content="https://alchemy.sshh.io/og-image.png" />
+    <meta name="twitter:image:alt" content="Infinite Alchemy: clay-style tiles showing Water plus Fire equals Steam." />
+
+    <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+    <link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="application-name" content="Infinite Alchemy" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Alchemy" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="format-detection" content="telephone=no" />
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "WebSite",
+            "@id": "https://alchemy.sshh.io/#website",
+            "url": "https://alchemy.sshh.io/",
+            "name": "Infinite Alchemy",
+            "inLanguage": "en",
+            "publisher": { "@id": "https://sshh.io/#person" }
+          },
+          {
+            "@type": ["VideoGame", "WebApplication"],
+            "@id": "https://alchemy.sshh.io/#game",
+            "name": "Infinite Alchemy",
+            "url": "https://alchemy.sshh.io/",
+            "description": "A free, AI-powered element-combining game. Start with Earth, Water, Air, Fire and Time and combine them into anything: an AI names every new element and paints it in a handmade clay style.",
+            "image": "https://alchemy.sshh.io/og-image.png",
+            "genre": ["Puzzle", "Crafting", "Sandbox"],
+            "keywords": "AI alchemy game, element combining game, crafting game, infinite craft, LLM game",
+            "gamePlatform": "Web browser",
+            "playMode": "SinglePlayer",
+            "applicationCategory": "GameApplication",
+            "operatingSystem": "Any",
+            "browserRequirements": "Requires JavaScript and a modern browser.",
+            "inLanguage": "en",
+            "isAccessibleForFree": true,
+            "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD", "availability": "https://schema.org/InStock" },
+            "datePublished": "2023-05-20",
+            "dateModified": "2026-11-06",
+            "softwareVersion": "2",
+            "author": { "@id": "https://sshh.io/#person" },
+            "isBasedOn": {
+              "@type": "VideoGame",
+              "name": "Little Alchemy",
+              "url": "https://littlealchemy.com/",
+              "author": { "@type": "Person", "name": "Jakub Koziol" }
+            },
+            "subjectOf": {
+              "@type": "BlogPosting",
+              "headline": "Infinite Alchemy",
+              "description": "Building an infinite crafting game using LLMs and DALLE.",
+              "datePublished": "2024-03-03",
+              "url": "https://blog.sshh.io/p/infinite-alchemy",
+              "author": { "@id": "https://sshh.io/#person" }
+            }
+          },
+          {
+            "@type": "SoftwareSourceCode",
+            "@id": "https://alchemy.sshh.io/#source",
+            "name": "llm_alchemy",
+            "codeRepository": "https://github.com/sshh12/llm_alchemy",
+            "license": "https://opensource.org/license/mit",
+            "programmingLanguage": "TypeScript",
+            "author": { "@id": "https://sshh.io/#person" },
+            "targetProduct": { "@id": "https://alchemy.sshh.io/#game" }
+          },
+          {
+            "@type": "Person",
+            "@id": "https://sshh.io/#person",
+            "name": "Shrivu Shankar",
+            "url": "https://sshh.io/",
+            "sameAs": ["https://github.com/sshh12", "https://x.com/ShrivuShankar", "https://www.linkedin.com/in/shrivushankar/", "https://blog.sshh.io/"]
+          }
+        ]
+      }
+    </script>
+
+    <script>
+      // First-touch acquisition, stored once per browser for players.acq_* (sent when the player
+      // is created): external referrer host, landing path and UTM tags of the visit's first page.
+      (function () {
+        try {
+          if (localStorage.getItem("ia:acq")) return;
+          var ref = document.referrer ? new URL(document.referrer).hostname : "";
+          if (ref === location.hostname) return;
+          var utm = new URLSearchParams(location.search);
+          localStorage.setItem("ia:acq", JSON.stringify({ ref: ref, path: location.pathname, src: utm.get("utm_source"), med: utm.get("utm_medium"), cmp: utm.get("utm_campaign") }));
+        } catch (e) {}
+      })();
+      // Google Analytics 4, production host only. gtag() queues into dataLayer right away; the
+      // library itself loads after the window load event so it never competes with first paint.
+      if (location.hostname === "alchemy.sshh.io") {
+        window.dataLayer = window.dataLayer || [];
+        window.gtag = function () { dataLayer.push(arguments); };
+        gtag("js", new Date());
+        gtag("config", "G-PYCZGBX322");
+        addEventListener("load", function () {
+          var ga = document.createElement("script");
+          ga.async = true;
+          ga.src = "https://www.googletagmanager.com/gtag/js?id=G-PYCZGBX322";
+          document.head.appendChild(ga);
+        });
+      }
+    </script>
+
+    <style>
+      /* Session-independent intro: the first paint and the no-JS page. React replaces #root on mount. */
+      .intro { min-height: 100dvh; display: grid; place-content: center; gap: 14px; padding: 32px 20px; text-align: center; background: #f6f1e7; color: #2a2118; font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+      .intro-eyebrow { display: block; font-size: 11px; font-weight: 600; letter-spacing: 0.16em; text-transform: uppercase; color: #a9471f; }
+      .intro h1 { margin: 2px 0 0; font: 600 2.4rem/1.05 Georgia, ui-serif, serif; letter-spacing: -0.01em; }
+      .intro p { margin: 0 auto; max-width: 34rem; }
+      .intro .intro-eg { color: #6b5d4e; font-size: 15px; }
+      .intro nav { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 16px; font-size: 15px; }
+      .intro a { color: #a9471f; text-underline-offset: 3px; }
+      @media (prefers-color-scheme: dark) {
+        .intro { background: #16120e; color: #f3eadb; }
+        .intro .intro-eg { color: #b4a693; }
+        .intro-eyebrow, .intro a { color: #e5835a; }
+      }
+    </style>
+    <!-- /meta -->
+  </head>
+  <body>
+    <div id="root">
+      <main class="intro">
+        <header>
+          <span class="intro-eyebrow">The original</span>
+          <h1>Infinite Alchemy</h1>
+        </header>
+        <p>Start with Earth, Water, Air, Fire and Time. Combine elements to discover new things, illustrated by AI.</p>
+        <p class="intro-eg">Water + Fire = Steam · Earth + Water = Mud · Air + Air = Wind</p>
+        <p>Play free in your browser, no account needed. Find a first discovery, or try today's three challenges.</p>
+        <nav aria-label="Learn more">
+          <a href="/how-to-play">How to play</a>
+          <a href="/daily">Today's challenge</a>
+          <a href="/recipes">Recipes</a>
+          <a href="/about">About</a>
+        </nav>
+        <noscript><p>Infinite Alchemy needs JavaScript to play.</p></noscript>
+      </main>
+    </div>
+    <script type="module" src="/src/app/main.tsx"></script>
+  </body>
+</html>
