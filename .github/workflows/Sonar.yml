@@ -1,0 +1,93 @@
+name: Sonar
+on: push
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  Code-Quality:
+    runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: microsoft
+          java-version: 21
+
+      - name: Install Sonar Scanner
+        run: dotnet tool install --global dotnet-sonarscanner
+
+      - name: Install dependencies
+        run: dotnet restore
+
+      - name: Start Sonar Analysis
+        run: dotnet-sonarscanner begin -d:sonar.host.url="https://sonarcloud.io" -d:sonar.token="$SONAR_TOKEN" -o:"ecoapm" -k:"ecoAPM_WiFiSurveyor-Server" -d:sonar.cs.vstest.reportsPaths="*.Tests/**/results.trx" -d:sonar.cs.opencover.reportsPaths="*.Tests/**/coverage.opencover.xml" -d:sonar.exclusions="App*/**"
+        env:
+          SONAR_TOKEN: ${{secrets.SONAR_TOKEN}}
+
+      - name: Build
+        run: dotnet build --no-restore
+        env:
+          SONAR_DOTNET_ENABLE_CONCURRENT_EXECUTION: true
+
+      - name: Test
+        run: dotnet test --no-build --logger "trx;LogFileName=results.trx" --collect:"XPlat Code Coverage" -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=opencover
+
+      - name: Remove client-side Sonar properties
+        run: rm sonar-project.properties
+
+      - name: Finish Sonar Analysis
+        run: dotnet-sonarscanner end -d:sonar.token="$SONAR_TOKEN"
+        env:
+          SONAR_TOKEN: ${{secrets.SONAR_TOKEN}}
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+
+  App-Code-Quality:
+    runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 26
+
+      - name: Install c8
+        run: yarn global add c8
+
+      - name: Install dependencies
+        run: yarn install
+        env:
+          YARN_ENABLE_SCRIPTS: false
+
+      - name: Build
+        run: yarn build
+
+      - name: Get code coverage
+        run: c8 -r lcov yarn test -s
+
+      - name: SonarCloud Analysis
+        uses: SonarSource/sonarqube-scan-action@v7.0.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

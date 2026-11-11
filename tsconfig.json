@@ -1,0 +1,15 @@
+{
+	"compilerOptions": {
+		"esModuleInterop": true,
+		"experimentalDecorators": true,
+		"lib": [
+			"DOM",
+			"ES2019"
+		],
+		"module": "CommonJS",
+		"outDir": "Server/wwwroot",
+		"sourceMap": true,
+		"strict": true,
+		"target": "ES2015"
+	}
+}

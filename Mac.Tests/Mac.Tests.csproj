@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<AssemblyName>WiFiSurveyor.Mac.Tests</AssemblyName>
+		<RootNamespace>WiFiSurveyor.Mac.Tests</RootNamespace>
+		<ImplicitUnsings>enable</ImplicitUnsings>
+		<Nullable>enable</Nullable>
+	</PropertyGroup>
+	<ItemGroup>
+		<PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+		<PackageReference Include="NSubstitute" Version="6.0.0" />
+		<PackageReference Include="xunit" Version="2.9.3" />
+		<PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
+		<PackageReference Include="coverlet.collector" Version="10.1.0" />
+		<ProjectReference Include="..\Mac\Mac.csproj" />
+		<None Include="system_profiler-output.txt" CopyToOutputDirectory="PreserveNewest" />
+	</ItemGroup>
+</Project>

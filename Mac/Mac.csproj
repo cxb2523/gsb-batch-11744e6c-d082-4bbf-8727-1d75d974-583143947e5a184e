@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+	<PropertyGroup>
+		<PackageVersion>2.2.1</PackageVersion>
+		<OutputType>Exe</OutputType>
+		<TargetFramework>net10.0</TargetFramework>
+		<AssemblyName>WiFiSurveyor</AssemblyName>
+		<RootNamespace>WiFiSurveyor.Mac</RootNamespace>
+		<RuntimeIdentifier>osx-x64</RuntimeIdentifier>
+		<PublishSingleFile>true</PublishSingleFile>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+	</PropertyGroup>
+	<ItemGroup>
+		<ProjectReference Include="..\Core\Core.csproj" />
+	</ItemGroup>
+</Project>

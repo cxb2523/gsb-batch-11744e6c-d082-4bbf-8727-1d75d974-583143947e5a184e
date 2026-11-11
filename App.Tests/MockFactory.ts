@@ -1,0 +1,38 @@
+import Mockito from "ts-mockito";
+
+import Factory from "../App/Factory";
+import SignalService from "../App/SignalService";
+import { any } from "./MockHelpers";
+
+export default class MockFactory {
+	static backgroundParser() {
+		return Factory.backgroundParser();
+	}
+
+	static signalService(): SignalService {
+		const signal_service = Mockito.mock<SignalService>();
+		Mockito.when(signal_service.status).thenReturn("");
+		Mockito.when(signal_service.lastUpdated).thenReturn("");
+		return signal_service;
+	}
+
+	static webGL2RenderingContext(): WebGL2RenderingContext {
+		const shader = Mockito.mock<WebGLShader>();
+		const program = Mockito.mock<WebGLProgram>();
+
+		const gl = Mockito.mock<WebGL2RenderingContext>();
+		Mockito.when(gl.createShader(any())).thenReturn(Mockito.instance(shader));
+		Mockito.when(gl.createProgram()).thenReturn(Mockito.instance(program));
+
+		return gl;
+	}
+
+	static canvas(): HTMLCanvasElement {
+		const gl = MockFactory.webGL2RenderingContext();
+
+		const canvas = Mockito.mock<HTMLCanvasElement>();
+		Mockito.when(canvas.getContext("webgl2")).thenReturn(Mockito.instance(gl));
+
+		return canvas;
+	}
+}

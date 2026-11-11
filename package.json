@@ -1,0 +1,67 @@
+{
+	"name": "wifisurveyor",
+	"version": "2.2.1",
+	"description": "Visualize Wi-Fi signal strength over a geographic area",
+	"main": "app.js",
+	"engines": {
+		"node": ">= 26"
+	},
+	"scripts": {
+		"dev": "vite",
+		"build": "vite build --outDir ../Core/wwwroot --emptyOutDir --assetsDir .",
+		"test": "vite build App.Tests && xunit dist/tests"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+ssh://git@github.com/ecoAPM/WiFiSurveyor.git"
+	},
+	"keywords": [
+		"WiFi",
+		"Wi-Fi",
+		"HeatMap",
+		"Heat",
+		"Map",
+		"Signal",
+		"Strength",
+		"dBm",
+		"SNR",
+		"dB"
+	],
+	"author": "Steve Desmond, ecoAPM <steve@ecoAPM.com> (https://ecoAPM.com)",
+	"license": "GPL-3.0-or-later",
+	"bugs": {
+		"url": "https://github.com/ecoAPM/WiFiSurveyor/issues"
+	},
+	"homepage": "https://github.com/ecoAPM/WiFiSurveyor#readme",
+	"devDependencies": {
+		"@eslint/js": "10.0.1",
+		"@fontsource/noto-sans": "5.3.0",
+		"@fontsource/roboto": "5.3.0",
+		"@microsoft/signalr": "10.0.11",
+		"@stylistic/eslint-plugin": "5.10.0",
+		"@types/delaunator": "5.1.0",
+		"@types/jsdom": "30.0.0",
+		"@types/node": "26.6.6",
+		"@vitejs/plugin-vue": "6.0.10",
+		"@vue/compiler-dom": "3.5.45",
+		"@vue/test-utils": "2.5.1",
+		"buffer": "6.0.3",
+		"delaunator": "5.1.0",
+		"eslint": "10.14.0",
+		"eslint-plugin-simple-import-sort": "14.0.0",
+		"eslint-plugin-vue": "10.12.0",
+		"global-jsdom": "30.0.0",
+		"jiti": "2.7.0",
+		"jsdom": "30.1.3",
+		"ts-mockito": "2.6.1",
+		"typescript": "6.0.3",
+		"typescript-eslint": "8.72.1",
+		"vite": "8.3.6",
+		"vue": "3.5.45",
+		"vue-eslint-parser": "10.4.2",
+		"xunit.ts": "3.0.0"
+	},
+	"browserslist": [
+		"Firefox ESR"
+	]
+}

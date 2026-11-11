@@ -1,0 +1,34 @@
+<template>
+	<div v-if="status" class="status">
+		<pre>{{ status }}</pre>
+	</div>
+</template>
+
+<script setup lang="ts">
+import { defineProps } from "vue";
+
+const { status } = defineProps<{ status: string }>();
+</script>
+
+<style scoped>
+.status {
+	position: absolute;
+	display: flex;
+	width: 100%;
+	height: 100%;
+	align-items: center;
+	justify-content: center;
+	background-color: rgba(0, 0, 0, 0.25);
+}
+
+pre {
+	padding: 1rem;
+	background: white;
+	border: 2px solid black;
+	border-radius: 0.5rem;
+	box-shadow: 0 0 1rem 1rem rgba(0, 0, 0, 0.5);
+	max-width: 75%;
+	white-space: pre-wrap;
+	text-align: center;
+}
+</style>
