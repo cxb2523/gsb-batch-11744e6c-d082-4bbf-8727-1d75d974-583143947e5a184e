@@ -60,6 +60,15 @@
 	"engines": {
 		"node": ">=18"
 	},
+	"devDependencies": {
+		"@gltf-transform/core": "^4",
+		"@gltf-transform/extensions": "^4",
+		"@gltf-transform/functions": "^4",
+		"draco3dgltf": ">=1.5",
+		"gltf-validator": "^2.0.0-dev.3.10",
+		"meshoptimizer": ">=1.1",
+		"sharp": ">=0.33"
+	},
 	"peerDependencies": {
 		"@gltf-transform/core": ">=4",
 		"@gltf-transform/extensions": ">=4",

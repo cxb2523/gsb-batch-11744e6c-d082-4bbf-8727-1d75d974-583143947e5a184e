@@ -22,3 +22,5 @@ export {
 } from './format.js';
 
 export { A3SStream, bytesSource, httpSource } from './reader.js';
+
+export { auditStream } from './audit.js';
