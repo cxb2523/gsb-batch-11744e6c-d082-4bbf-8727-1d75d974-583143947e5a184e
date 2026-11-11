@@ -16,6 +16,7 @@ import {
   type OrbVariant,
 } from "@/data/orb";
 import type { Bands, LevelSource } from "@/lib/orb/audio";
+import { diagnoseFrame, type FrameDiagnosis } from "@/lib/orb/diagnose";
 import { cssColor, getOrbRenderer, type OrbFrame, type OrbView } from "@/lib/orb/renderer";
 import styles from "./VoiceOrb.module.css";
 
@@ -45,6 +46,12 @@ interface VoiceOrbProps {
   label?: string;
   /** Called with the levels every drawn frame (the board's meters). */
   onFrame?: (meter: OrbMeter) => void;
+  /**
+   * Called with a calibration diagnosis of the latest frame every drawn
+   * frame in which a source is read — pure data, for diagnostics panels.
+   * Changes nothing the orb renders.
+   */
+  onDiagnose?: (diagnosis: FrameDiagnosis) => void;
   /**
    * A painted image of a ball to move instead of the procedural field (the
    * artwork shader). The image must be same-origin or served with CORS.
@@ -136,6 +143,7 @@ export default function VoiceOrb({
   className,
   label,
   onFrame,
+  onDiagnose,
   artwork,
 }: VoiceOrbProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -150,8 +158,8 @@ export default function VoiceOrb({
   const resolvedSeed = seed ?? seedFor(Array.isArray(palette) ? palette.join() : palette);
 
   // The latest props, read by the render loop without restarting it.
-  const props = useRef({ variant, state, voice, caller, stops, params, seed: resolvedSeed, onFrame });
-  props.current = { variant, state, voice, caller, stops, params, seed: resolvedSeed, onFrame };
+  const props = useRef({ variant, state, voice, caller, stops, params, seed: resolvedSeed, onFrame, onDiagnose });
+  props.current = { variant, state, voice, caller, stops, params, seed: resolvedSeed, onFrame, onDiagnose };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -237,6 +245,10 @@ export default function VoiceOrb({
         cur.scale += (targetScale - cur.scale) * (1 - Math.exp(-dt * 9));
 
         p.onFrame?.({ bands: [...cur.bands] as Bands, level: cur.level, input: cur.input });
+        // The calibration diagnosis of the frame just read, for whoever
+        // watches the source's health; it only observes, never steers.
+        const levels = heard ?? said;
+        if (levels && p.onDiagnose) p.onDiagnose(diagnoseFrame(heard ? "voice" : "caller", dt, levels));
 
         return {
           variant: imageRef.current ? "artwork" : p.variant,
