@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:test";
 import { BASE, call, post, readJson } from "./helpers.js";
 import { newId } from "../src/ids.js";
-import { renderHtmlFragment } from "../src/html.js";
+import { renderHtmlFragment, formatRenderAudit } from "../src/html.js";
 import { MAX_TEX_DEPTH, texTooDeep } from "../src/markdown.js";
 
 async function create(content: string) {
@@ -274,5 +274,63 @@ describe("hostile input", () => {
     const html = await fragment("---\nbase: &base {x: 1}\nfirst: *base\nsecond: [*base, *base]\n---\n");
     expect(html).toContain("<td>{&#34;x&#34;:1}</td>");
     expect(html).toContain("<td>{&#34;x&#34;:1}, {&#34;x&#34;:1}</td>");
+  });
+});
+
+describe("render audit", () => {
+  it("reports a clean document as all zeros, alongside the usual headers", async () => {
+    const share = await create("# Hello\n\n[site](https://example.com)\n");
+    const response = await call(`/${share.id}.html`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-render-audit")).toBe("tex-depth=0");
+    expect(response.headers.get("content-security-policy")).toContain("script-src 'none'");
+    expect(response.headers.get("x-robots-tag")).toContain("noindex");
+    expect(response.headers.get("cache-control")).toContain("no-store");
+  });
+
+  it("counts removed tags and attributes by name, and the cache hit reports the same", async () => {
+    const share = await create(
+      '<script>alert(1)</script>\n\n<iframe src="https://example.com"></iframe>\n\n<img src="x" onerror="alert(1)">'
+    );
+    const response = await call(`/${share.id}.html`);
+    const header = response.headers.get("x-render-audit");
+    expect(header).toBe("removed-tags=iframe:1,script:1; removed-attrs=onerror:1; tex-depth=0");
+    // The audit carries no document text, only names and counts.
+    expect(header).not.toContain("alert");
+
+    const again = await call(`/${share.id}.html`);
+    expect(again.status).toBe(200);
+    expect(again.headers.get("x-render-audit")).toBe(header);
+  });
+
+  it("counts refused URL attributes apart from other removed attributes", async () => {
+    const share = await create('<a href="javascript:alert(1)">a</a>\n\n<a href="&#106;avascript:alert(2)">b</a>');
+    const response = await call(`/${share.id}.html`);
+    expect(response.headers.get("x-render-audit")).toBe("blocked-urls=href:2; tex-depth=0");
+  });
+
+  it("marks the TeX depth fallback", async () => {
+    const deep = "{".repeat(5000) + "x" + "}".repeat(5000);
+    const share = await create(`Before $a^2$\n\n$$${deep}$$`);
+    const response = await call(`/${share.id}.html`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-render-audit")).toBe("tex-depth=1");
+  });
+
+  it("exposes the audit on the fragment as names and counts only", async () => {
+    const { audit } = await renderHtmlFragment('<script>alert(1)</script>\n\n<img src="x" onerror="alert(1)">');
+    expect(audit).toEqual({ removedTags: { script: 1 }, removedAttrs: { onerror: 1 }, blockedUrls: {}, texDepth: 0 });
+    expect(formatRenderAudit(audit)).toBe("removed-tags=script:1; removed-attrs=onerror:1; tex-depth=0");
+    expect(formatRenderAudit({ removedTags: {}, removedAttrs: {}, blockedUrls: {}, texDepth: 0 })).toBe("tex-depth=0");
+  });
+
+  it("appears only on the .html representation", async () => {
+    const share = await create("<script>alert(1)</script>");
+    for (const path of [`/${share.id}`, `/${share.id}.md`, `/${share.id}.json`]) {
+      const response = await call(path);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-render-audit"), path).toBeNull();
+    }
+    expect((await call(`/${share.id}.html`)).headers.get("x-render-audit")).toBe("removed-tags=script:1; tex-depth=0");
   });
 });

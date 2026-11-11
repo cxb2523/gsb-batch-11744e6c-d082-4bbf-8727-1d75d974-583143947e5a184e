@@ -14,7 +14,7 @@
 import { getShare } from "./db.js";
 import { shareLinks } from "./links.js";
 import { json, text, withShareHeaders, SHARE_HEADERS } from "./http.js";
-import { renderHtmlDocument, HTML_CONTENT_SECURITY_POLICY } from "./html.js";
+import { renderHtmlDocument, HTML_CONTENT_SECURITY_POLICY, RENDER_AUDIT_HEADER, formatRenderAudit, emptyRenderAudit } from "./html.js";
 
 const FALLBACK_TITLE = "Shared markdown";
 const MAX_TITLE_LENGTH = 90;
@@ -87,19 +87,22 @@ function isoDates(share) {
 /**
  * The rendered HTML, cached per share. A share never changes, so its rendering can be
  * kept until it expires; the D1 lookup still runs first on every request, so a deleted
- * or expired share is a 404 whatever the cache holds.
+ * or expired share is a 404 whatever the cache holds. The render audit is cached with
+ * the page — as a header on the cached response — so a cache hit reports the same
+ * X-Render-Audit as the render that populated it.
  */
 async function cachedHtml(env, share, links) {
   const key = new Request(`https://${env.SITE_HOST}/__rendered/${share.id}/${share.createdAt}.html`);
   // Workers' default cache; the typings in scope know only the standard CacheStorage.
   const cache = /** @type {{ default: Cache }} */ (/** @type {unknown} */ (caches)).default;
   const hit = await cache.match(key);
-  if (hit) return hit.text();
+  if (hit) return { html: await hit.text(), audit: hit.headers.get(RENDER_AUDIT_HEADER) ?? formatRenderAudit(emptyRenderAudit()) };
 
-  const html = await renderHtmlDocument({ id: share.id, content: share.content, title: shareTitle(share.content), url: links.url });
+  const { html, audit } = await renderHtmlDocument({ id: share.id, content: share.content, title: shareTitle(share.content), url: links.url });
+  const auditHeader = formatRenderAudit(audit);
   const ttl = Math.max(1, Math.min(3600, Math.floor((share.expiresAt - Date.now()) / 1000)));
-  await cache.put(key, new Response(html, { headers: { "Cache-Control": `max-age=${ttl}` } }));
-  return html;
+  await cache.put(key, new Response(html, { headers: { "Cache-Control": `max-age=${ttl}`, [RENDER_AUDIT_HEADER]: auditHeader } }));
+  return { html, audit: auditHeader };
 }
 
 /** @param {string} id @param {"page" | "md" | "json" | "html"} format */
@@ -127,11 +130,13 @@ export async function serveShare(request, env, id, format) {
 
   if (format === "html") {
     if (!share) return text("Not found. Shared links are deleted after 1 hour, 24 hours or 3 days.\n", 404);
-    return new Response(await cachedHtml(env, share, links), {
+    const { html, audit } = await cachedHtml(env, share, links);
+    return new Response(html, {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         ...SHARE_HEADERS,
         "Content-Security-Policy": HTML_CONTENT_SECURITY_POLICY,
+        [RENDER_AUDIT_HEADER]: audit,
         "Access-Control-Allow-Origin": "*",
         Link: `<${links.url}>; rel="canonical"`
       }

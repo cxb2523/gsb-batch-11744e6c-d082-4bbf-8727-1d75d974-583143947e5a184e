@@ -101,6 +101,36 @@ const decodeTex = (value) =>
   value.replace(/&#(\d+);/g, (_, dec) => codePoint(Number(dec)))
     .replace(/&(amp|lt|gt|quot);/g, (_, name) => ({ amp: "&", lt: "<", gt: ">", quot: '"' })[name]);
 
+/** The header /{id}.html carries its render audit in. Only the .html representation has it. */
+export const RENDER_AUDIT_HEADER = "X-Render-Audit";
+
+/**
+ * An empty render audit. The audit counts what the cleaning took out, by name only —
+ * tag names, attribute names and integers, never a document's text or a URL — so it is
+ * safe to carry into a response header or a log line.
+ */
+export function emptyRenderAudit() {
+  return { removedTags: {}, removedAttrs: {}, blockedUrls: {}, texDepth: 0 };
+}
+
+/**
+ * The audit as one compact, stable string for the X-Render-Audit header:
+ * `removed-tags=script:1,iframe:1; removed-attrs=onerror:1; blocked-urls=href:2; tex-depth=1`.
+ * Sections come in a fixed order, names sorted within a section, empty sections left out
+ * — except tex-depth, which is always present so a clean render still parses the same.
+ */
+export function formatRenderAudit(audit) {
+  const sections = [];
+  for (const [section, counts] of [["removed-tags", audit.removedTags], ["removed-attrs", audit.removedAttrs], ["blocked-urls", audit.blockedUrls]]) {
+    const entries = Object.entries(counts)
+      .filter(([, count]) => count > 0)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    if (entries.length > 0) sections.push(`${section}=${entries.map(([name, count]) => `${name}:${count}`).join(",")}`);
+  }
+  sections.push(`tex-depth=${audit.texDepth ? 1 : 0}`);
+  return sections.join("; ");
+}
+
 /**
  * Markdown → the cleaned HTML fragment, math rendered. Exported for the tests.
  * @param {string} markdown
@@ -108,6 +138,11 @@ const decodeTex = (value) =>
 export async function renderHtmlFragment(markdown) {
   let tex = "";
   let hasMath = false;
+  const audit = emptyRenderAudit();
+  /** @param {Record<string, number>} counts @param {string} name */
+  const count = (counts, name) => {
+    counts[name] = (counts[name] ?? 0) + 1;
+  };
 
   const rewriter = new HTMLRewriter()
     .onDocument({ comments: (comment) => void comment.remove() })
@@ -115,10 +150,12 @@ export async function renderHtmlFragment(markdown) {
       element(element) {
         const tag = element.tagName.toLowerCase();
         if (DROPPED.has(tag)) {
+          count(audit.removedTags, tag);
           element.remove();
           return;
         }
         if (!ALLOWED.has(tag)) {
+          count(audit.removedTags, tag);
           element.removeAndKeepContent();
           return;
         }
@@ -126,7 +163,12 @@ export async function renderHtmlFragment(markdown) {
         // cast: the DOM typings in scope describe a different `attributes`.)
         const attributes = [.../** @type {Iterable<[string, string]>} */ (/** @type {unknown} */ (element.attributes))];
         for (const [name, value] of attributes) {
-          if (!attributeAllowed(tag, name.toLowerCase(), value)) element.removeAttribute(name);
+          const attribute = name.toLowerCase();
+          if (attributeAllowed(tag, attribute, value)) continue;
+          element.removeAttribute(name);
+          // A refused URL is counted apart from a merely unlisted attribute.
+          if (URL_ATTRIBUTES.has(attribute) && (TAG_ATTRIBUTES[tag] ?? []).includes(attribute)) count(audit.blockedUrls, attribute);
+          else count(audit.removedAttrs, attribute);
         }
         if (tag === "a" && !(element.getAttribute("href") ?? "#").startsWith("#")) {
           element.setAttribute("rel", "noopener noreferrer nofollow ugc");
@@ -146,7 +188,9 @@ export async function renderHtmlFragment(markdown) {
           // One formula KaTeX cannot handle stays as its TeX; it must not take the page down.
           /** @type {string | null} */
           let html = null;
-          if (!texTooDeep(source)) {
+          const tooDeep = texTooDeep(source);
+          if (tooDeep) audit.texDepth = 1;
+          if (!tooDeep) {
             try {
               html = katex.renderToString(source, {
                 displayMode,
@@ -172,17 +216,18 @@ export async function renderHtmlFragment(markdown) {
     });
 
   const html = await rewriter.transform(new Response(md.render(markdown))).text();
-  return { html, hasMath };
+  return { html, hasMath, audit };
 }
 
 /**
- * The whole page: a light document in this site's styles, no script.
+ * The whole page: a light document in this site's styles, no script. Returns the audit
+ * of the cleaning alongside, so the response can carry it in X-Render-Audit.
  * @param {{ id: string, content: string, title: string, url: string }} share
  */
 export async function renderHtmlDocument(share) {
-  const { html, hasMath } = await renderHtmlFragment(share.content);
+  const { html, hasMath, audit } = await renderHtmlFragment(share.content);
   const stylesheets = ["/vendor/highlight.css", ...(hasMath ? ["/vendor/katex/katex.css"] : []), "/styles.css"];
-  return `<!doctype html>
+  const document = `<!doctype html>
 <html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
@@ -200,6 +245,7 @@ ${html}
 </body>
 </html>
 `;
+  return { html: document, audit };
 }
 
 /**
