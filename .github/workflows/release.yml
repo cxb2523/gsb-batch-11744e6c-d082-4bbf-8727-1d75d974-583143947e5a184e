@@ -1,0 +1,37 @@
+name: release
+permissions:
+  contents: write   # needed to create the GitHub release
+on:
+  push:
+    tags:
+      - "v*"
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7 # v4
+      - uses: actions/setup-python@v7 # v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          pip install build
+          python -m build ./mcp_authscan --outdir ./dist
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -z "$TWINE_PASSWORD" ]; then
+            echo "PYPI_API_TOKEN secret not set — skipping PyPI publish (GitHub release still created)."
+            exit 0
+          fi
+          pip install twine
+          twine upload --non-interactive dist/*
+      - name: Create GitHub release with artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Automated release for ${GITHUB_REF_NAME}. See CHANGELOG.md."

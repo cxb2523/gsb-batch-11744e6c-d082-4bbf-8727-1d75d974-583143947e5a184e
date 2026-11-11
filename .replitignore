@@ -1,0 +1,40 @@
+# Local findings exports must not be included in published builds.
+vata_findings_backup.json
+
+# The web app installs requirements-runtime.txt explicitly with a writable prefix.
+# CLI metadata lives under mcp_authscan/. These root-only rules are defense in
+# depth for published files, not controls for pre-build package detection.
+/pyproject.toml
+/uv.lock
+
+# Runtime uses system python3 -m gunicorn and retains all installed libraries.
+# The build removes this launcher tree; this rule records the intended exclusion.
+/.pythonlibs/bin/
+
+# Do not ship private workspace findings to the public application.
+vata.db
+vata.db-*
+
+# Exclude all local recovery fixtures and private snapshots, not just vata.db.
+*.db
+*.db-*
+**/*.db
+**/*.db-*
+*.sqlite
+*.sqlite-*
+**/*.sqlite
+**/*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+**/*.sqlite3
+**/*.sqlite3-*
+runtime-data/
+generated-artifacts/
+**/.vata-restore-*/
+**/.vata-recovery-*/
+**/*.vata-dr
+**/*.dump
+
+# Standalone workspace scan exports are not application fixtures.
+/*findings*.json
+/*scan_results*.json

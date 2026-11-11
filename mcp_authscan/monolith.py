@@ -1,0 +1,3050 @@
+from .owasp_mapping import MAPPING_VERSION, owasp_block, sarif_rules, tag
+import sys
+#!/usr/bin/env python3
+"""
+VATA mcp_authscan v{VERSION} -- Live OAuth endpoint scanner for MCP servers.
+
+Tests RFC 9728 → RFC 8414 OAuth discovery chain and probes OAuth server configuration
+for authentication, token caching, CORS, PKCE, key rotation, and other security properties.
+
+Scanner mode: HTTP request/response analysis against live MCP server endpoints.
+Protocol: Tests JSON-RPC /initialize endpoint for 401 (OAuth required) or 200 (zero-auth).
+Exit codes: see EXIT_CODES.md. Contract 2026.10.31.1 is stamped into every report with the condition that fired.
+Output: Human-readable security report with probe results and deterministic SHA256 hash.
+"""
+from mcp_authscan import __version__
+from mcp_authscan.report_copy import render_summary, check_counts
+from mcp_authscan.counts import count_probes, coverage, CoverageError, verdict_line
+import argparse, hashlib, json, re, sys, ipaddress, os, time, subprocess
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+# ---- Live MCP Server Scanning ----
+import socket
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+from urllib.error import URLError, HTTPError
+from urllib.parse import urlparse
+from mcp_authscan.cors import probe_cors_urllib
+from .errors import EgressRefusalError
+from .tools_digest_footer import footer_line
+from mcp_authscan import _common
+
+LIVE_ENDPOINTS = {
+    "/sse": "GET",
+    "/message": "POST", 
+    "/mcp": "POST",
+    "/tools/list": "GET",
+}
+
+# ---- Security Hardening ----
+PRIVATE_IP_RANGES = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
+def is_private_ip(ip_str):
+    """True unless the address is globally routable.
+
+    Delegates to is_global_address so the target validator and the discovery
+    egress guard agree on what "public" means; the previous hand-written range
+    list missed CGNAT (100.64.0.0/10 - also Tailscale), 0.0.0.0, multicast and
+    IPv4-mapped IPv6.
+    """
+    try:
+        ipaddress.ip_address(str(ip_str).split("%", 1)[0])
+    except ValueError:
+        return False
+    return not is_global_address(ip_str)
+
+def validate_target_host(hostname, port):
+    """Refuse a target whose *any* resolved address is not globally routable.
+
+    Checking only the first record let a name that answers with both a public
+    and a private address through: the scanner validated the public one and
+    then connected to whichever the stack preferred.
+    """
+    try:
+        addr_info = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise ValueError(f"DNS resolution failed for {hostname}: {e}") from e
+    if not addr_info:
+        raise ValueError(f"Cannot resolve {hostname}")
+    addresses = sorted({info[4][0] for info in addr_info})
+    for address in addresses:
+        if not is_global_address(address):
+            raise ValueError(
+                f"Target {hostname} resolves to private IP {address} "
+                f"(DNS rebinding protection)"
+            )
+    return addresses[0]
+
+
+def missing_scheme(target):
+    """Refuse a target that is neither an existing path nor a URL with a scheme.
+
+    Three branches, no heuristics: a target containing "://" goes to URL handling, a target that
+    exists on disk goes to source mode, and anything else is refused with one message naming both
+    readings. There is no dot, port or leading-slash test: the tool does not guess intent.
+    """
+    if "://" in target or os.path.exists(target):
+        return
+    raise ValueError("Target is neither an existing path nor a URL with a scheme. For a live "
+                     "endpoint use https://host/path. For source mode, pass a path that exists.")
+
+
+# Set from --allow-private so explicitly authorized local targets keep working.
+ALLOWED_HOSTS: set[str] = set()  # Authorized domains for discovery
+
+
+def is_global_address(address):
+    """True only for addresses that are globally routable.
+
+    ipaddress.is_global already excludes CGNAT (100.64.0.0/10, which is also
+    Tailscale's range), 0.0.0.0, reserved and documentation ranges that a
+    hand-written list misses - but CPython reports 224.0.0.0/4 (multicast) as
+    global, so multicast, unspecified and link-local are excluded explicitly.
+    IPv4-mapped IPv6 is unwrapped first so ::ffff:127.0.0.1 cannot slip past as
+    "not in the list".
+    """
+    try:
+        ip = ipaddress.ip_address(str(address).split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    if ip.is_multicast or ip.is_unspecified or ip.is_link_local or ip.is_reserved:
+        return False
+    return ip.is_global
+
+
+ALLOW_PRIVATE_TARGETS = False
+def assert_url_is_fetchable(url, allow_private=None):
+    """Refuse to fetch a URL that could reach the scanner's own network.
+
+    Discovery URLs arrive inside the target's HTTP responses, so the target
+    chooses them: a server can point resource_metadata at 169.254.169.254 or at
+    a Tailscale peer and turn the scanner into a request proxy. Only http(s) is
+    accepted, and every address the host resolves to must be globally routable.
+    """
+    if allow_private is None:
+        allow_private = ALLOW_PRIVATE_TARGETS
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"refusing to fetch non-HTTP(S) URL: {url}")
+    if not parsed.hostname:
+        raise ValueError(f"refusing to fetch URL without a host: {url}")
+    if allow_private:
+        return
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"cannot resolve {parsed.hostname}: {exc}") from exc
+    for info in infos:
+        address = info[4][0]
+        if not is_global_address(address):
+            raise ValueError(
+                f"refusing to fetch {url}: {parsed.hostname} resolves to "
+                f"non-public address {address}"
+            )
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise HTTPError(req.full_url, code, f"redirect refused: {newurl}", headers, fp)
+
+
+
+def open_without_redirects(req, timeout=5):
+    """urlopen that refuses redirects.
+
+    Following a 30x would hand the destination choice back to the target and
+    defeat the address check above: a public URL that 302s to 127.0.0.1 passes
+    validation and lands internally.
+    """
+    return build_opener(_NoRedirect).open(req, timeout=timeout)
+
+
+MAX_RESPONSE_SIZE = 10_000_000
+
+def safe_read_response(req, timeout=5, max_size=MAX_RESPONSE_SIZE):
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            data = b''
+            chunk_size = 65536
+            while len(data) < max_size:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                data += chunk
+            if len(data) >= max_size:
+                raise ValueError(f"Response exceeded {max_size} bytes (DoS protection)")
+            return data
+    except HTTPError as e:
+        if e.fp:
+            e.fp.read()
+        raise
+
+class RateLimiter:
+    def __init__(self, requests_per_second=10):
+        self.min_interval = 1.0 / requests_per_second
+        self.last_request = 0
+    
+    def wait(self):
+        elapsed = time.time() - self.last_request
+        if elapsed < self.min_interval:
+            time.sleep(self.min_interval - elapsed)
+        self.last_request = time.time()
+
+def validate_input_path(path_str):
+    path = Path(path_str).resolve()
+    if not path.exists():
+        raise ValueError(f"Path does not exist: {path_str}")
+    if not os.access(path, os.R_OK):
+        raise ValueError(f"No read permission: {path_str}")
+    forbidden = {'/proc', '/sys', '/dev', '/etc', '/root', '/boot', '/var', '/lib', '/usr/bin', '/bin'}
+    for fd in forbidden:
+        if str(path).startswith(fd):
+            raise ValueError(f"Cannot scan sensitive directory {fd}: {path_str}")
+    return path
+
+
+def _derived_resource_metadata(base, allow_private=False, allowed_hosts=None):
+    """Fetch RFC 9728 metadata derived from the target, path form then host form."""
+    parsed = urlparse(base)
+    host = parsed.hostname
+    if not host:
+        return None, None
+    origin = parsed.scheme + "://" + parsed.netloc
+    path = parsed.path.rstrip("/")
+    candidates = []
+    if path:
+        candidates.append(origin + "/.well-known/oauth-protected-resource" + path)
+    candidates.append(origin + "/.well-known/oauth-protected-resource")
+    for url in candidates:
+        try:
+            assert_url_is_fetchable(url, allow_private=allow_private)
+            req = Request(url)
+            req.add_header("User-Agent", f"mcp-authscan/{VERSION}")
+            with open_without_redirects(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as e:
+            print(f"Derived metadata failed for {url}: {e}", file=sys.stderr)
+            continue
+        servers = data.get("authorization_servers") or []
+        if not servers:
+            continue
+        endpoints = {}
+        for server in servers:
+            meta_url = server.rstrip("/") + "/.well-known/oauth-authorization-server"
+            as_host = urlparse(server).hostname or ""
+            if as_host and as_host != host and as_host not in (allowed_hosts or set()):
+                print(f"[!] not fetching {as_host}: not in scope, add --allow-host {as_host}", file=sys.stderr)
+                continue
+            try:
+                assert_url_is_fetchable(meta_url, allow_private=allow_private)
+                req2 = Request(meta_url)
+                req2.add_header("User-Agent", f"mcp-authscan/{VERSION}")
+                with open_without_redirects(req2, timeout=5) as r2:
+                    md = json.loads(r2.read().decode())
+            except Exception as e:
+                print(f"AS metadata failed for {meta_url}: {e}", file=sys.stderr)
+                continue
+            if md.get("token_endpoint"):
+                endpoints["token"] = md["token_endpoint"]
+            if md.get("authorization_endpoint"):
+                endpoints["authorize"] = md["authorization_endpoint"]
+        if endpoints:
+            print("[+] OAuth discovery successful via derived RFC 9728", file=sys.stderr)
+            return endpoints, {"method": "RFC 9728 derived", "endpoints": endpoints, "discovered_hosts": [host], "resource_metadata": url, "authorization_servers": servers}
+    return None, None
+def _direct_rfc8414_discovery(base):
+    """Try RFC 8414 discovery directly on the base URL.
+
+    Reached two ways: as the fallback after an RFC 9728 lookup fails, and
+    immediately when a 401 carries no resource_metadata pointer - RFC 9728 is
+    advertised *only* through that parameter, so when it is absent there is no
+    resource-metadata document to fetch, but the base URL may still document
+    its authorization server.
+    """
+    print(f"[*] Trying direct RFC 8414 discovery on {base}", file=sys.stderr)
+    try:
+        oauth_metadata_url = base.rstrip("/") + "/.well-known/oauth-authorization-server"
+        req = Request(oauth_metadata_url)
+        req.add_header("User-Agent", f"mcp-authscan/{VERSION}")
+        with urlopen(req, timeout=5) as resp:
+            oauth_data = json.loads(resp.read().decode())
+            endpoints = {
+                "token": oauth_data.get("token_endpoint"),
+                "authorize": oauth_data.get("authorization_endpoint"),
+            }
+            endpoints = {k: v for k, v in endpoints.items() if v}
+            if endpoints:
+                print("[+] OAuth discovery successful", file=sys.stderr)
+                parsed = urlparse(base)
+                return endpoints, {"method": "RFC 8414 direct", "endpoints": endpoints, "discovered_hosts": [parsed.hostname] if parsed.hostname else []}
+            _common.debug("No endpoints found")
+    except Exception as e:
+        _common.debug(f"Fallback failed: {e}")
+    return None, None
+
+
+def grade_zero_auth(response_body_text):
+    """Grade a zero-auth finding by what the response demonstrated, not by the absence
+    of auth. Returns (severity, severity_basis). Calibration SEVERITY_CALIBRATION_VERSION.
+
+    CRITICAL only when a returned tool's NAME shows a write/delete/execute/admin action.
+    HIGH when tools were returned but none names such an action. MEDIUM otherwise,
+    including a response that demonstrated no tools or did not parse. Record-level data
+    in the body is deliberately NOT inspected (a loose sniffer re-creates over-grading);
+    the basis says so.
+    """
+    import json as _json
+    WRITE_VERBS = ("write", "delete", "remove", "create", "update", "exec", "execute",
+                   "run", "admin", "drop", "modify", "destroy")
+    try:
+        doc = _json.loads(response_body_text) if response_body_text else None
+    except (ValueError, TypeError):
+        return "MEDIUM", ("zero-auth endpoint; response body did not parse as JSON, so no tool "
+                          "surface was observed; body not inspected for record-level data")
+    tools = None
+    if isinstance(doc, dict):
+        res = doc.get("result")
+        if isinstance(res, dict):
+            tools = res.get("tools")
+        if tools is None:
+            tools = doc.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return "MEDIUM", ("zero-auth endpoint; initialize response carried no tool list; body not "
+                          "inspected for record-level data")
+    for t in tools:
+        name = (t.get("name", "") if isinstance(t, dict) else "")
+        low = name.lower()
+        for verb in WRITE_VERBS:
+            if verb in low:
+                return "CRITICAL", ("zero-auth endpoint; tool '%s' name matches write/execute "
+                                    "action '%s'; body not inspected for record-level data"
+                                    % (name, verb))
+    return "HIGH", ("zero-auth endpoint; %d tool(s) returned, none with a write, delete or "
+                    "execute action in the name" % len(tools))
+
+
+def discover_oauth_endpoints(base_url, allowed_hosts=None, allow_private=False):
+    """
+    RFC 9728 (MCP) → RFC 8414 (OAuth) discovery chain.
+
+    Returns (endpoints_dict, discovery_info) where:
+    - endpoints_dict: {endpoint_name: url} for discovered OAuth endpoints
+    - discovery_info: metadata about discovery chain
+    or (None, None) if not an OAuth server
+    """
+    base = base_url.rstrip("/")
+    discovered_hosts = set()
+    base_parsed = urlparse(base)
+    base_host = base_parsed.hostname
+    if base_host:
+        discovered_hosts.add(base_host)
+
+    print(f"[*] RFC 9728 → RFC 8414 discovery", file=sys.stderr)
+
+    # Step 1: POST /initialize (RFC 9728)
+    init_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "mcp-authscan", "version": VERSION}
+        }
+    }
+
+    # Use the target URL as-is (already the MCP endpoint path)
+    init_url = base
+
+    try:
+        req = Request(init_url, method="POST")
+        req.add_header("User-Agent", f"mcp-authscan/{VERSION}")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json, text/event-stream")
+        req.data = json.dumps(init_payload).encode()
+
+        try:
+            with urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    _de, _di = _derived_resource_metadata(base, allow_private=allow_private, allowed_hosts=allowed_hosts)
+                    if _de:
+                        print('[*] metadata names an authorization server, assessing OAuth not zero-auth', file=sys.stderr)
+                        return _de, _di
+                    # Unauthenticated access - zero-auth vulnerability detected
+                    print(f"[!] ZERO-AUTH: Target responds to /initialize without authentication", file=sys.stderr)
+                    _zb = resp.read(65536).decode("utf-8", "replace")
+                    _sev, _basis = grade_zero_auth(_zb)
+                    zero_auth_info = {
+                        "status": "ZERO_AUTH_DETECTED",
+                        "severity": _sev,
+                        "severity_basis": _basis,
+                        "request_method": "POST",
+                        "request_body": json.dumps(init_payload),
+                        "response_status": resp.status,
+                        "response_body": _zb[:2000],
+                        "response_body_truncated": len(_zb) > 2000,
+                        "response_preview": _zb[:200],
+                    }
+                    return None, zero_auth_info
+        except HTTPError as e:
+            if e.code != 401:
+                # Not an MCP server (404, 405, etc). Try direct RFC 8414 instead
+                print(f"[*] HTTP {e.code} - Not an MCP server, trying direct RFC 8414", file=sys.stderr)
+                return _direct_rfc8414_discovery(base)
+
+            # Step 2: Parse 401 www-authenticate header (RFC 9728)
+            www_auth = e.headers.get("www-authenticate", "")
+            print(f"[+] OAuth detected (HTTP 401)", file=sys.stderr)
+
+            # Look for resource_metadata URL in www-authenticate header
+            match = re.search(r'resource_metadata="([^"]+)"', www_auth)
+            if not match:
+                # No pointer in the header. RFC 9728 also defines well-known
+                # locations derived from the resource URL, so try those first.
+                print("[*] No pointer - trying derived RFC 9728", file=sys.stderr)
+                derived_endpoints, derived_info = _derived_resource_metadata(base, allow_private=allow_private, allowed_hosts=allowed_hosts)
+                if derived_endpoints:
+                    return derived_endpoints, derived_info
+                return _direct_rfc8414_discovery(base)
+            resource_url = match.group(1)
+            resource_parsed = urlparse(resource_url)
+            if resource_parsed.hostname:
+                discovered_hosts.add(resource_parsed.hostname)
+
+            print(f"[*] Resource metadata: {resource_url}", file=sys.stderr)
+
+            # Step 3: Fetch resource metadata
+            try:
+                assert_url_is_fetchable(resource_url, allow_private=ALLOW_PRIVATE_TARGETS)
+                req = Request(resource_url)
+                req.add_header("User-Agent", f"mcp-authscan/{VERSION}")
+
+                with open_without_redirects(req, timeout=5) as resp:
+                    resource_data = json.loads(resp.read().decode())
+                    auth_servers = resource_data.get("authorization_servers", [])
+                    print(f"[*] Found {len(auth_servers)} OAuth server(s)", file=sys.stderr)
+
+                    if not auth_servers:
+                        return None, None
+
+                    # Step 4: Fetch OAuth server metadata (RFC 8414)
+                    all_endpoints = {}
+                    for oauth_server in auth_servers:
+                        oauth_parsed = urlparse(oauth_server)
+                        if oauth_parsed.hostname:
+                            discovered_hosts.add(oauth_parsed.hostname)
+
+                        try:
+                            oauth_metadata_url = oauth_server.rstrip("/") + "/.well-known/oauth-authorization-server"
+                            assert_url_is_fetchable(oauth_server, allow_private=ALLOW_PRIVATE_TARGETS)
+                            req = Request(oauth_metadata_url)
+                            req.add_header("User-Agent", f"mcp-authscan/{VERSION}")
+
+                            with open_without_redirects(req, timeout=5) as resp:
+                                oauth_data = json.loads(resp.read().decode())
+
+                                # Extract OAuth endpoints
+                                endpoints_found = {
+                                    "token": oauth_data.get("token_endpoint"),
+                                    "authorize": oauth_data.get("authorization_endpoint"),
+                                    "register": oauth_data.get("registration_endpoint"),
+                                    "revoke": oauth_data.get("revocation_endpoint"),
+                                    "device": oauth_data.get("device_authorization_endpoint"),
+                                    "jwks": oauth_data.get("jwks_uri"),
+                                }
+                                endpoints_found = {k: v for k, v in endpoints_found.items() if v}
+                                all_endpoints.update(endpoints_found)
+                                print(f"[+] Discovered {len(endpoints_found)} endpoints on {oauth_server}", file=sys.stderr)
+
+                        except (HTTPError, URLError, socket.timeout, json.JSONDecodeError, ValueError):
+                            continue
+
+                    if all_endpoints:
+                        discovery_info = {
+                            "method": "RFC 9728 → RFC 8414",
+                            "resource_metadata": resource_url,
+                            "auth_servers": auth_servers,
+                            "discovered_hosts": list(discovered_hosts),
+                            "endpoints": all_endpoints
+                        }
+                        print(f"[+] Discovery complete - {len(all_endpoints)} endpoints found", file=sys.stderr)
+                        return all_endpoints, discovery_info
+
+            except (HTTPError, URLError, socket.timeout, json.JSONDecodeError, ValueError):
+                print(f"[!] Failed to fetch OAuth metadata via RFC 9728", file=sys.stderr)
+                pass
+
+    except (URLError, socket.timeout):
+        pass
+
+    # Fallback: try direct RFC 8414 discovery on base_url (for standalone OAuth servers)
+    return _direct_rfc8414_discovery(base)
+
+def scan_live_server(target_url, allowed_hosts=None, allow_private=False, rate_limit_count=None, rate_limit_window=None):
+    """Scan a running MCP server for zero-auth, CORS, token validation issues.
+    Returns (findings, reachable, probe_status, discovery_info, (oauth_records, probe_results)) tuple.
+    
+    Probes test whether authentication properties are enforced. Each probe demonstrates a property
+    and returns: PASS (property demonstrated), FAIL (property violated), NOT_OBSERVED (could not test),
+    EXCLUDED (out of scope), or NOT_IMPLEMENTED (probe not yet built, never sent).
+    """
+    findings = []
+    probe_status = {'passed': 0, 'not_observed': 0, 'findings': 0}
+    oauth_records = []  # Initialize at function start - every return path will have this
+    probe_results = []  # Track (endpoint, method, status, reason) for detailed reporting
+    discovery_info = None
+    # Client registration entries are per scan; drop any left by an earlier scan in this process.
+    from mcp_authscan import oauth_probes_v2 as _oauth_probes
+    del _oauth_probes.CLIENT_REPORTS[:]
+
+
+    print(f"[*] Detected live server URL", file=sys.stderr)
+    print(f"[*] Preflight: Checking if target is an MCP server...", file=sys.stderr)
+
+    # PREFLIGHT: Verify target is an MCP server before running probes
+    # POST /initialize should return 401 with WWW-Authenticate OR 200 with JSON
+    mcp_verified = False
+    init_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "mcp-authscan", "version": VERSION}
+        }
+    }
+
+    try:
+        req = Request(target_url, method="POST")
+        req.add_header("User-Agent", f"mcp-authscan/{VERSION}")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json, text/event-stream")
+        req.data = json.dumps(init_payload).encode()
+
+        try:
+            with urlopen(req, timeout=5) as resp:
+                if resp.status in [200, 201, 202]:
+                    # Should be JSON-RPC response
+                    body = resp.read(65536).decode(errors='ignore')
+                    try:
+                        data = json.loads(body)
+                        if isinstance(data, dict) and ('jsonrpc' in data or ('result' in data or 'error' in data)):
+                            mcp_verified = True
+                            print(f"[+] MCP server verified (HTTP {resp.status})", file=sys.stderr)
+                    except json.JSONDecodeError:
+                            pass
+                    else:
+                        # 200 but not JSON-RPC - not an MCP server, continue to OAuth discovery
+                        pass
+                elif resp.status == 400 or resp.status == 406:
+                    # 400: JSON-RPC error (malformed but MCP aware)
+                    # 406: Wrong content-type (path exists, headers wrong)
+                    # 405 is not accepted: the path refuses POST, so it is not an MCP endpoint
+                    body = resp.read(65536).decode(errors='ignore')
+                    if 'jsonrpc' in body or '{' in body:
+                        mcp_verified = True
+                        print(f"[+] MCP server verified (HTTP {resp.status} with JSON-RPC error)", file=sys.stderr)
+        except HTTPError as e:
+            if e.code == 401:
+                # OAuth challenge - this is MCP
+                mcp_verified = True
+                print(f"[+] MCP server verified (HTTP 401 with OAuth)", file=sys.stderr)
+            elif e.code in [400, 406]:
+                # Server returned error but in JSON format - still MCP (405 does not verify)
+                body = e.fp.read(65536).decode(errors='ignore') if e.fp else ""
+                if 'jsonrpc' in body or '{' in body:
+                    mcp_verified = True
+                    print(f"[+] MCP server verified (HTTP {e.code} with JSON-RPC response)", file=sys.stderr)
+    except (URLError, socket.timeout, ConnectionError) as e:
+        # The target did not answer (refused, reset by peer, timeout): unreachable, not "not MCP".
+        print(f"[!] Target unreachable: {target_url} did not answer ({getattr(e, 'reason', e)})", file=sys.stderr)
+        return findings, False, probe_status, None, ([], [])
+
+    if not mcp_verified:
+        print(f"[!] No MCP surface detected at {target_url}", file=sys.stderr)
+        print(f"[!] POST /initialize did not respond as MCP server (expected 401 with WWW-Authenticate, 200-202 with JSON-RPC, or 400 with JSON-RPC error)", file=sys.stderr)
+        preflight_info = {"status": "PREFLIGHT_FAILED"}
+    else:
+        preflight_info = {"status": "MCP_VERIFIED"}
+
+    print(f"[*] Attempting OAuth discovery...", file=sys.stderr)
+
+    # Perform RFC 9728 → RFC 8414 discovery
+    _scope_pre = set(allowed_hosts) if allowed_hosts else set(ALLOWED_HOSTS)
+    oauth_endpoints, discovery_info = discover_oauth_endpoints(target_url, allowed_hosts=_scope_pre, allow_private=allow_private)
+    from mcp_authscan.target_probes import run_target_probes
+    _th = urlparse(target_url).hostname
+    _scope = set(allowed_hosts) if allowed_hosts else set(ALLOWED_HOSTS)
+    if _th:
+        _scope.add(_th)
+    target_records, target_findings = run_target_probes(target_url, _scope, allow_private, rate_limit_count, rate_limit_window) if mcp_verified else ([], [])
+    _common.debug(f"oauth_endpoints={oauth_endpoints}")
+
+    if oauth_endpoints:
+        # Use discovered OAuth endpoints
+        print(f"[+] Using {len(oauth_endpoints)} discovered OAuth endpoints", file=sys.stderr)
+        # Add discovered OAuth hosts to allowed scope
+        if discovery_info and 'discovered_hosts' in discovery_info:
+            for host in discovery_info['discovered_hosts']:
+                ALLOWED_HOSTS.add(host)
+                print(f"[*] Added discovered host to allowed scope: {host}", file=sys.stderr)
+
+
+        # Phase 1: Run OAuth server probes (RFC 8414 metadata assessment)
+        oauth_server_urls = set()
+        for endpoint_url in oauth_endpoints.values():
+            parsed = urlparse(endpoint_url)
+            oauth_server_urls.add(f"{parsed.scheme}://{parsed.netloc}")
+
+        for oauth_server_url in oauth_server_urls:
+            print(f"[*] Assessing OAuth server: {oauth_server_url}", file=sys.stderr)
+            # Fetch resource_metadata document from URL in discovery_info
+            resource_metadata_doc = None
+            if discovery_info and discovery_info.get("resource_metadata"):
+                try:
+                    resource_url = discovery_info["resource_metadata"]
+                    assert_url_is_fetchable(resource_url)
+                    req = Request(resource_url)
+                    req.add_header("User-Agent", f"mcp-authscan/{VERSION}")
+                    with open_without_redirects(req, timeout=5) as resp:
+                        resource_metadata_doc = json.loads(resp.read().decode())
+                except Exception as e:
+                    print(f"[!] Resource metadata not fetched: {e}", file=sys.stderr)
+                    pass  # Silently fail, resource_metadata_doc stays None
+            
+            from mcp_authscan.oauth_probes_v2 import run_oauth_assessment, render_probe
+            try:
+                records, oauth_findings = run_oauth_assessment(oauth_server_url, resource_metadata_doc, target_url)
+            except (ValueError, RuntimeError) as e:
+                print(f"[!] Probe error: {e}", file=sys.stderr)
+                # Return error record instead of crashing
+                from mcp_authscan.oauth_probes_v2 import ProbeRecord
+                records = [ProbeRecord(
+                    probe_id=0,
+                    name="assessment-error",
+                    status="NOT_OBSERVED",
+                    limitation=f"Assessment failed: {e}"
+                )]
+                oauth_findings = []
+            
+            for _rec in records:
+                _rec.server = oauth_server_url
+            oauth_records.extend(records)
+
+            for finding in oauth_findings:
+                findings.append({
+                    "rule": f"OAuth-{finding['rule']}",
+                    "owasp": tag(f"OAuth-{finding['rule']}"),
+                    "severity": finding['severity'],
+                    "confidence": "HIGH",
+                    "title": finding['title'],
+                    "file": oauth_server_url,
+                    "line": 0,
+                    "ref": finding['rule'],
+                    "evidence": finding.get('evidence', ''),
+                    "snippet": "",
+                    "is_live_finding": True,
+                    "request_method": finding.get('request_method', 'POST'),
+                    "request_body": finding.get('request_body', ''),
+                    "response_status": finding.get('response_status', 0),
+                    "response_body": finding.get('response_body', ''),
+                    "response_preview": finding.get('response_body', ''),
+                    "interpretation": finding.get('interpretation', 'OAuth configuration issue detected'),
+                    "remediation": finding.get('remediation', 'Review and correct OAuth server metadata'),
+                })
+
+            # Sort probes by ID for consistent ordering
+            sorted_records = sorted(records, key=lambda r: r.probe_id)
+            for record in sorted_records:
+                print(render_probe(record), file=sys.stderr)
+
+        
+        # Verify accounting using new count_probes
+        try:
+            oauth_counts = count_probes(oauth_records)
+        except RuntimeError as e:
+            # Invariant violation: a scan error (exit 4 in main), whether or not anything was found
+            print(f"[!] ACCOUNTING ERROR: {e}", file=sys.stderr)
+            raise
+        
+        # Extract findings from FAIL records (new architecture)
+        for record in oauth_records:
+            if record.status == "FAIL":
+                findings.append({
+                    "rule": f"OAuth-{record.probe_id}",
+                    "owasp": tag(f"OAuth-{record.probe_id}"),
+                    "severity": record.severity or "HIGH",
+                    "confidence": "HIGH",
+                    "title": record.name,
+                    "file": getattr(record, "server", None) or oauth_server_url,
+                    "line": 0,
+                    "ref": f"OAuth-{record.probe_id}",
+                    "evidence": record.detail or "",
+                    "snippet": "",
+                    "is_live_finding": True,
+                    "request_method": "GET" if record.probe_id in (1, 5, 7, 8) else "POST",
+                    "request_body": "",
+                    "response_status": record.http_status or 0,
+                    "response_body": record.body_excerpt or "",
+                    "response_preview": record.body_excerpt or "",
+                    "interpretation": record.detail or "OAuth configuration issue",
+                    "remediation": "Restrict Access-Control-Allow-Origin on the token endpoint to the specific origins that need it" if record.probe_id == 4 else "Review OAuth server configuration",
+                })
+        
+        alias_of = {}
+        for r in oauth_records:
+            d = getattr(r, 'detail', '') or ''
+            if 'issuer=' in d and 'base_url=' in d:
+                base = d.split('base_url=', 1)[1].split(' ')[0].strip()
+                iss = d.split('issuer=', 1)[1].split(' ')[0].strip()
+                if base and iss and base != iss:
+                    alias_of[base] = iss
+        kept = []
+        grouped = {}
+        for f in findings:
+            if not f.get('is_live_finding'):
+                kept.append(f)
+                continue
+            label = f.get('file') or ''
+            canon = alias_of.get(label, label)
+            k = (f.get('rule'), f.get('evidence'), f.get('response_status'), canon)
+            if k not in grouped:
+                if canon and canon != label:
+                    f['also_seen_under'] = [label]
+                    f['file'] = canon
+                grouped[k] = f
+                kept.append(f)
+                continue
+            prev = grouped[k]
+            seen_under = prev.get('also_seen_under') or []
+            if label and label != prev.get('file') and label not in seen_under:
+                seen_under.append(label)
+                prev['also_seen_under'] = seen_under
+        findings = kept
+        # Phase 2: Skip endpoint-by-endpoint testing
+        # OAuth server probes (Phase 1) are sufficient for this assessment.
+        # Individual endpoint testing would repeat OAuth probe logic with wrong rules.
+        # Future: accept --client-id to run PKCE/redirect-URI rules (OAuth-7, OAuth-8)
+        all_records = list(oauth_records) + target_records
+        status_from_counts(probe_status, count_probes(all_records))
+        return findings + target_findings, True, probe_status, discovery_info, (all_records, probe_results)
+    else:
+        if not mcp_verified:
+            # Discovery did not establish an OAuth surface either. Do not
+            # misreport an HTML/non-MCP target as a verified OAuth challenge.
+            return findings, False, probe_status, preflight_info, ([], [])
+        # Discovery failed - STOP, don't fallback to guessing
+        # Discovery observed an unauthenticated MCP surface. Keep that
+        # observation rather than overwriting it with DISCOVERY_INCOMPLETE.
+        if (discovery_info or {}).get("status") == "ZERO_AUTH_DETECTED":
+            from mcp_authscan._common import record as mk_rec
+            _ids = "1 2 3 4 5 6 7 8 9 10 11 12".split()
+            _names = "issuer-identity resource-binding token-cache-control token-cors jwks-keys password-grant pkce-s256 redirect-uri-exact client-auth cross-tenant token-audience resource-authservers".split()
+            _ran = set(r.probe_id for r in target_records)
+            target_records = tuple(target_records) + tuple(mk_rec(probe_id=int(i), name=n, status="EXCLUDED", probe_class="authserver", prerequisites=("OAuth discovery RFC 9728 to RFC 8414",), prerequisite_met=False, limitation="No authorization server was discovered, so this probe was never sent") for i, n in zip(_ids, _names) if int(i) not in _ran)
+            return findings + target_findings, True, probe_status, discovery_info, (list(target_records), [])
+
+        # Report DISCOVERY_INCOMPLETE with forensic details
+        print(f"[!] DISCOVERY_INCOMPLETE: OAuth endpoint discovery failed", file=sys.stderr)
+        print(f"[!] The preflight verified an MCP surface, but RFC 9728 → RFC 8414 chain did not complete", file=sys.stderr)
+        print(f"[!] Cannot test OAuth endpoints without discovery. Halting.", file=sys.stderr)
+
+        # Return with DISCOVERY_INCOMPLETE status
+        discovery_incomplete = {
+            "status": "DISCOVERY_INCOMPLETE",
+            "preflight_verified": True,
+            "preflight_status": "MCP_VERIFIED",
+            "discovery_attempted": True,
+            "discovery_failed_at": "resource_metadata_or_oauth_server_metadata",
+            "message": "OAuth server detected but endpoint discovery chain incomplete"
+        }
+        status_from_counts(probe_status, count_probes(list(target_records)))
+        return findings + target_findings, True, probe_status, discovery_incomplete, (list(target_records), [])
+
+def status_from_counts(status, counts):
+    for name, key in {"attempted": "attempted", "passed": "PASS", "failed": "FAIL", "not_observed": "NOT_OBSERVED", "excluded": "EXCLUDED", "not_implemented": "NOT_IMPLEMENTED"}.items():
+        status[name] = counts[key]
+    return status
+
+
+VERSION = __version__  # derived from the package; see mcp_authscan/__init__.py
+SEVERITY_CALIBRATION_VERSION = "2026.11.07.1"  # YYYY.MM.DD.N: zero-auth severity now reflects the demonstrated surface, not the mere absence of auth. CRITICAL only when a tool name shows a write/delete/execute action; see CHANGELOG "Severity calibration".
+PROBE_SET_VERSION = "2026.11.10.1"  # YYYY.MM.DD.N: America/New_York date the probe set changed, per-day counter from 1. History: CHANGELOG.md "Probe set stamps"; tests/test_probe_set_stamp.py fails if the probe set changes without a new stamp.
+
+def get_git_metadata(target_path):
+    """Extract git information if target is in a git repo."""
+    try:
+        original_cwd = os.getcwd()
+        os.chdir(target_path)
+
+        repo_url = subprocess.check_output(
+            ["git", "config", "--get", "remote.origin.url"],
+            stderr=subprocess.DEVNULL,
+            timeout=2
+        ).decode().strip()
+
+        branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            timeout=2
+        ).decode().strip()
+
+        commit_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            timeout=2
+        ).decode().strip()[:12]  # short SHA
+
+        os.chdir(original_cwd)
+        return repo_url, branch, commit_sha
+    except Exception:
+        return None, None, None
+
+SRC_EXT = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".mjs", ".cjs"}
+SKIP_DIR = {".git", "node_modules", "dist", "build", "vendor", ".venv", "__pycache__"}
+# A scanner must not flag its own rule definitions. Skip our own source file.
+SELF_PATH = __import__("pathlib").Path(__file__).resolve()
+TEST_DIR = {"__tests__", "test", "tests", "e2e", "testdata", "spec",
+            "testhelpers", "testhelper", "mocks", "fixtures", "testutil", "testutils"}
+TEST_FILE = re.compile(
+    r"(_test\.go$|\.test\.[jt]sx?$|\.spec\.[jt]sx?$|_test\.py$|(^|/)test_[^/]+\.py$|"
+    r"(^|/)testhelpers?\.go$|(^|/)mock_[^/]+\.go$|_mock\.go$)", re.I)
+
+# Minified / hashed JS-CSS bundles are build output, not source. Skip scanner-wide.
+MINIFIED_FILE = re.compile(
+    r"(\.min\.(js|css)$|\.bundle\.(js|css)$|\.[0-9a-f]{8,}\.(js|css)$|"
+    r"(^|/)static/js/[^/]+\.js$)", re.I)
+
+def is_test_path(p):
+    if any(part.lower() in TEST_DIR for part in p.parts):
+        return True
+    return bool(TEST_FILE.search(p.as_posix()))
+
+def iter_files(root, include_tests, exclude=()):
+    root = Path(root)
+    excl = [ (root / e).resolve() for e in exclude ]
+    paths = [root] if root.is_file() else root.rglob("*")
+    skipped = 0
+    for p in paths:
+        if p.is_symlink():
+            continue
+        if not (p.is_file() and p.suffix in SRC_EXT):
+            continue
+        if p.resolve() == SELF_PATH:
+            continue
+        if any(s in p.parts for s in SKIP_DIR):
+            continue
+        if MINIFIED_FILE.search(p.as_posix()):
+            continue
+        if not include_tests and is_test_path(p):
+            skipped += 1
+            continue
+        rp = p.resolve()
+        if any(rp == e or e in rp.parents for e in excl):
+            continue
+        yield p
+    if skipped:
+        print(f"skipped {skipped} test/fixture path(s); pass --include-tests to scan them", file=sys.stderr)
+
+def lineno(text, idx):
+    return text.count("\n", 0, idx) + 1
+
+def linetext(text, idx):
+    lines = text.splitlines()
+    return lines[lineno(text, idx) - 1] if lines else ""
+
+def snippet(text, idx, span=1):
+    lines = text.splitlines()
+    ln = lineno(text, idx) - 1
+    lo, hi = max(0, ln - span), min(len(lines), ln + span + 1)
+    return "\n".join(f"  {i+1}: {lines[i]}" for i in range(lo, hi))
+
+def defname(head):
+    """Pull the identifier from a func/function/def match head (handles Go receiver), or ''."""
+    m = re.search(r"(?:func|function|def)\s+(?:\([^)]*\)\s+)?(\w+)", head)
+    return m.group(1) if m else ""
+
+def brace_block(text, start):
+    """Return substring of the { } block beginning at/after start. Fallback: 40-line window."""
+    i = text.find("{", start)
+    if i == -1:
+        lines = text[start:].splitlines()[:40]
+        return "\n".join(lines)
+    depth, j = 0, i
+    while j < len(text):
+        if text[j] == "{": depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0: return text[i:j+1]
+        j += 1
+    return text[i:i+4000]
+
+DEF_ANY = re.compile(r"(func\s+(?:\([^)]*\)\s+)?\w+|function\s+\w+|def\s+\w+)")
+
+def enclosing_block(text, idx):
+    """Best-effort body of the function enclosing idx (Go/JS via braces; else a line window)."""
+    last = None
+    for m in DEF_ANY.finditer(text):
+        if m.start() > idx:
+            break
+        last = m
+    if last is None:
+        s = text.rfind("\n", 0, max(0, idx - 1500))
+        return text[max(0, s):idx + 400]
+    return brace_block(text, last.start())
+
+def add(findings, rule, sev, title, path, text, idx, evidence, ref, conf):
+    findings.append({
+        "rule": rule, "severity": sev, "confidence": conf, "title": title,
+        "file": str(path), "line": lineno(text, idx),
+        "evidence": evidence, "snippet": snippet(text, idx), "ref": ref,
+    })
+
+def validate_response_format(response_preview, endpoint_type):
+    """
+    Validate response format matches endpoint type.
+    - JWKS: should be JSON with keys
+    - OAuth metadata: should be JSON  
+    - JSON-RPC: should have jsonrpc field or be valid JSON
+    
+    Returns True if format matches, False (NOT_OBSERVED) if format is wrong.
+    """
+    if not response_preview:
+        return False
+    
+    # HTML responses are never findings (SPA shells, error pages, etc)
+    if response_preview.strip().startswith(('<!DOCTYPE', '<html', '<?xml')):
+        return False
+    
+    # Should be JSON for OAuth/JWKS endpoints
+    if endpoint_type in ['jwks', 'metadata', 'oauth']:
+        try:
+            import json as json_module
+            json_module.loads(response_preview[:500])
+            return True
+        except (json_module.JSONDecodeError, ValueError, TypeError):
+            return False
+    
+    return False
+
+
+def add_live_finding(findings, rule, sev, title, url, method, request_body,
+                      response_status, response_preview, interpretation, remediation, ref, conf):
+    """Add finding from live endpoint assessment with full request/response evidence."""
+    findings.append({
+        "rule": rule, "severity": sev, "confidence": conf, "title": title,
+        "file": url, "line": 0,
+        "evidence": interpretation,
+        "snippet": "",
+        "ref": ref,
+        # Live endpoint specifics
+        "is_live_finding": True,
+        "request_method": method,
+        "request_body": request_body,
+        "response_status": response_status,
+        "response_preview": response_preview,
+        "interpretation": interpretation,
+        "remediation": remediation,
+    })
+
+# ---- Rule A1: OAuth authorize endpoint never validates client_id / redirect_uri ----
+# Confidence: HIGH. lucky-aeon handleOAuthAuthorize() class.
+AUTHZ_HANDLER = re.compile(
+    r"(function\s+\w*[Aa]uthoriz\w*|"
+    r"func\s+(\([^)]*\)\s+)?\w*[Aa]uthoriz\w*|"
+    r"def\s+\w*authoriz\w*|"
+    r"\w*[Aa]uthoriz\w*\s*[:=]\s*(async\s*)?\()", re.I)
+VALIDATES_CLIENT = re.compile(
+    r"client_id[\s\S]{0,160}?(includes|find|lookup|exists|validat|verif|allow|"
+    r"registr|db\.|query|SELECT|WHERE|clients?\[)", re.I)
+# Anchor is underscore-optional so it matches snake_case redirect_uri AND camelCase
+# RedirectURI/redirectUri (Go/TS validate the camelCase form, often via a helper).
+VALIDATES_REDIRECT = re.compile(
+    r"redirect[_]?uri[s]?[\s\S]{0,200}?(includes|startsWith|indexOf|allow|whitelist|allowlist|"
+    r"validat|verif|\.match|registr|registered|RedirectURIs\b|GetClient|checkRedirect|contains)", re.I)
+# Handler that delegates the whole authorize to an authorization service/helper
+# (e.g. h.authorize.StartAuthorization(req)) validates there, not inline. Action-verb
+# prefix required so boolean checks (usesInternalAuthorizationServer) do NOT match.
+DELEGATES_AUTHZ = re.compile(
+    r"\.\s*(?:Start|Handle|Process|Do|Perform|Run|Begin)[Aa]uthoriz(?:e|ation)\w*\s*\(|"
+    r"ValidateRedirect\w*\s*\(|registeredRedirect\s*\(", re.I)
+
+# A1 server/client discriminators: only an authorization SERVER endpoint is vulnerable.
+# A client doing token exchange legitimately handles redirect_uri (sends it outbound).
+CLIENT_EXCHANGE = re.compile(
+    r"(grant_type|token_endpoint|tokenEndpoint|URLSearchParams|postFormToToken|"
+    r"new FormData|params\.(set|append)\s*\(\s*['\"]redirect_uri|"
+    r"urlencode|authorization_url|authorizationUrl|credentials\[|generate_pkce)", re.I)
+SERVER_AUTHZ_ROLE = re.compile(
+    r"(response_type|FormValue|\.Query\(|searchParams|req\.query|request\.query|"
+    r"\.Redirect\(|res\.redirect|\.redirect\(|StatusFound|Location|authorization_endpoint)", re.I)
+
+INBOUND_REQ = re.compile(
+    r"(\.Query\(\)|\.FormValue\(|URL\.Query|request\.args|request\.query_params|"
+    r"req\.query|request\.GET\b|searchParams\.get|query_params|c\.Query\(|ctx\.Query\(|"
+    r"http\.Request|http\.ResponseWriter|@(?:app|router|bp|blueprint)\.(?:get|post))", re.I)
+
+def rule_oauth_authorize(path, text, F):
+    for m in AUTHZ_HANDLER.finditer(text):
+        if defname(m.group(0)).lower().startswith("test"):
+            continue
+        block = brace_block(text, m.start())
+        reads_client = "client_id" in block
+        reads_redirect = "redirect_uri" in block
+        if not (reads_client or reads_redirect):
+            continue
+        missing = []
+        if reads_client and not VALIDATES_CLIENT.search(block):
+            missing.append("client_id")
+        if reads_redirect and not VALIDATES_REDIRECT.search(block):
+            missing.append("redirect_uri")
+        if missing:
+            # server-role gate: skip client token-exchange / outbound URL builders;
+            # require authorize-server signals. Use a forward window (brace_block on
+            # Python grabs an inner dict literal and misses trailing client signals).
+            gate = text[m.start():m.start() + 900]
+            if CLIENT_EXCHANGE.search(gate) or not SERVER_AUTHZ_ROLE.search(gate):
+                continue
+            if not INBOUND_REQ.search(gate):   # outbound URL builder, not a server handler
+                continue
+            # Validation may be delegated to a helper/service or sit just past the
+            # brace_block (Go/TS validate camelCase RedirectURI via a called function).
+            # Re-check the wider gate before firing so we don't FP on handlers that
+            # validate via registeredRedirect()/ValidateRedirectURI()/StartAuthorization().
+            if "redirect_uri" in missing and (VALIDATES_REDIRECT.search(gate) or DELEGATES_AUTHZ.search(gate)):
+                missing.remove("redirect_uri")
+            if "client_id" in missing and (VALIDATES_CLIENT.search(gate) or DELEGATES_AUTHZ.search(gate)):
+                missing.remove("client_id")
+            if not missing:
+                continue
+            add(F, "A1", "MEDIUM",
+                f"OAuth authorize handler reads {', '.join(missing)} \u2014 verify validation (here or in a downstream service)",
+                path, text, m.start(),
+                f"handler reads {'/'.join(missing)} with no validation/allowlist in THIS function; confirm it is enforced here or in a called service",
+                "VATA:lucky-aeon auth-bypass/ATO chain (review-list)", "LOW")
+
+# ---- Rule A2: hardcoded default admin credentials ----
+# Confidence: HIGH literal creds; MEDIUM re-seed. Value must be whitespace-free (no err-string FPs).
+DEFAULT_CRED = re.compile(
+    r"(admin@[\w.-]+\.local|"
+    r"(password|passwd|secret|apikey|api_key|token)\s*[:=]\s*['\"][^'\"\s]{6,}['\"])", re.I)
+RESEED = re.compile(r"(UpsertAdmin|seedAdmin|ensureAdmin|createDefaultAdmin|"
+    r"(func|def|const|async)\s+\w*[Bb]ootstrap\w*|\.[Bb]ootstrap\s*\()", re.I)
+CRED_CONTEXT = re.compile(r"(admin|account|identity|password|credential|passwd|secret)", re.I)
+
+# A2 noise filters: placeholder/example values and doctest/example lines are not real creds.
+CRED_PLACEHOLDER = re.compile(
+    r"(\.\.\.|<[^>]+>|\$\{|your[-_ ]?|example|redacted|changeme|xxx+|placeholder|"
+    r"dummy|sample|test|doctest|foo|bar|jwt\.token\.here|token\.here|"
+    r"(?-i:^[A-Z][A-Z0-9_]+$)|-\d+\.\d+$)", re.I)  # constant-name check stays case-sensitive
+
+def _cred_value(evidence):
+    """Extract the quoted value from an A2 evidence string, or '' if none."""
+    m = re.search(r"['\"]([^'\"]{6,})['\"]", evidence)
+    return m.group(1) if m else ""
+
+# A dangerous re-seed runs on every startup/restart. A bare setup function
+# (idempotent, first-boot) is not a finding. Require a startup trigger nearby.
+RESEED_TRIGGER = re.compile(r"on_?start|startup|on_?boot|every restart|on_event|lifespan|if __name__|OnInitialize", re.I)
+
+def rule_default_creds(path, text, F):
+    for m in DEFAULT_CRED.finditer(text):
+        ev = m.group(0)
+        val = _cred_value(ev)
+        line = linetext(text, m.start())
+        # skip obvious placeholders/examples and doctest/comment lines
+        if val and CRED_PLACEHOLDER.search(val):
+            continue
+        if re.match(r"\s*(>>>|\.\.\.|#|//|\*)", line):
+            continue
+        if "pragma: allowlist secret" in line.lower():
+            continue
+        if val and "@" not in ev and (re.search(r"\{[^}]*\}|\$\{|%[sd]\b|%\(", val)
+                    or re.fullmatch(r"(\S)\1{5,}", val)
+                    or re.fullmatch(r"[\w$]+(?:\.[\w$]+)+", val)):
+            continue
+        if re.search(r"(#|//)\s*nosec\b", line, re.I):
+            continue
+        if "nolint:gosec" in line.lower() or "not a credential" in line.lower():
+            continue
+        if val and val.lower().startswith("urn:"):
+            continue
+        if any(seg in str(path).lower() for seg in ("/demo", "demo_", "/example", "example_", "/sample", "sample_")):
+            continue
+        pl = str(path).lower()
+        if "@" not in ev and any(seg in pl for seg in (".config.", "/scripts/", "tsdown", "vite.config", "webpack", "rollup", "/config/", ".env.example")):
+            continue
+        if val and (re.search(r"\.(ts|js|tsx|jsx|py|go|json|ya?ml)$", val) or val.startswith("eyJ")):
+            continue
+        add(F, "A2", "CRITICAL", "Hardcoded default credential literal",
+            path, text, m.start(), ev[:80],
+            "VATA:lucky-aeon default admin creds", "HIGH")
+    for m in RESEED.finditer(text):
+        window = text[max(0, m.start()-200):m.start()+200]
+        if not CRED_CONTEXT.search(window):
+            continue
+        if "idempotent" in window.lower():
+            continue
+        if not RESEED_TRIGGER.search(window):
+            continue
+        add(F, "A2", "HIGH", "Admin re-seed routine (verify not run every restart)",
+            path, text, m.start(), m.group(0),
+            "VATA:lucky-aeon UpsertAdmin/Bootstrap on restart", "MEDIUM")
+
+# ---- Rule A3: auth MIDDLEWARE validates a token but enforces no role/tenant/scope ----
+# Confidence: MEDIUM. Name must contain "middleware" (metamcp v1AuthMiddleware class).
+MIDDLEWARE = re.compile(
+    r"(func\s+(\([^)]*\)\s+)?\w*[Mm]iddleware\w*|"
+    r"\w*[Mm]iddleware\w*\s*[:=]\s*(async\s*)?\(|"
+    r"def\s+\w*middleware\w*)", re.I)
+AUTHZ_CHECK = re.compile(r"(role|tenant|workspace|scope|permission|rbac|org(_?id)?|is_?admin)", re.I)
+# A3 must read an INBOUND credential to be an authentication gate (not a rate limiter,
+# a handler factory, or a client-side OAuth flow that merely obtains a token).
+INBOUND_AUTH = re.compile(
+    r"(Bearer\b|[\"']?[Aa]uthorization[\"']?\s*[)\]:,]|\.[Gg]etHeader\s*\(|"
+    r"[Rr]equest\(\)\.Header|req\.[Hh]eaders?|headers\[|bearerToken|parseBearer|"
+    r"stripBearer|extractToken|jwt\.(Parse|Verify)|ParseWithClaims|[Vv]alidateToken|"
+    r"[Vv]erifyToken|[Ii]ntrospect)", re.I)
+
+def rule_middleware_authz(path, text, F):
+    for m in MIDDLEWARE.finditer(text):
+        if defname(m.group(0)).lower().startswith("test"):
+            continue
+        block = brace_block(text, m.start())
+        reads_inbound_cred = INBOUND_AUTH.search(block)
+        if reads_inbound_cred and not AUTHZ_CHECK.search(block):
+            add(F, "A3", "HIGH",
+                "Auth middleware validates token but enforces no role/tenant/scope",
+                path, text, m.start(),
+                "token checked; no role/tenant/workspace/scope in block",
+                "VATA:metamcp cross-tenant CWE-863", "MEDIUM")
+
+# ---- Rule A4: SSRF -- HTTP request to a non-literal, externally-influenced URL, no guard ----
+# Confidence: MEDIUM-LOW. Sink-first: find the HTTP call, inspect its URL argument.
+# Catches mcpjungle upstream_oauth.go RegistrationEndpoint fetch (Go http.NewRequest*/Do).
+# Each sink: (regex, group# holding the URL argument expression).
+HTTP_SINKS = [
+    (re.compile(r"http\.NewRequestWithContext\s*\([^,]+,[^,]+,\s*([^,\)]+)", re.I), 1),
+    (re.compile(r"http\.NewRequest\s*\([^,]+,\s*([^,\)]+)", re.I), 1),
+    (re.compile(r"http\.(?:Get|Post|Head|PostForm)\s*\(\s*([^,\)]+)", re.I), 1),
+    (re.compile(r"\bfetch\s*\(\s*([^,\)]+)", re.I), 1),
+    (re.compile(r"\baxios(?:\.\w+)?\s*\(\s*([^,\)]+)", re.I), 1),
+    (re.compile(r"requests\.(?:get|post|put|delete|request)\s*\(\s*([^,\)]+)", re.I), 1),
+    (re.compile(r"(?:urlopen|urllib\.request\.urlopen)\s*\(\s*([^,\)]+)", re.I), 1),
+    (re.compile(r"\bgot\s*\(\s*([^,\)]+)", re.I), 1),
+]
+# URL arg that suggests external influence (config/discovered/request-derived), not a fixed host.
+URL_INFLUENCE = re.compile(
+    r"(endpoint|\buri\b|url|issuer|metadata|redirect|registration|jwks|"
+    r"server|host|target|resource|upstream|discover|callback|input\.|cfg\.|config\.|req\.|request\.|params|query)", re.I)
+# Guards that make an outbound fetch defensible.
+SSRF_GUARD = re.compile(
+    r"(allowlist|allow_list|whitelist|isInternal|is_internal|isPrivate|is_private|"
+    r"isLoopback|privateIP|private_ip|blockedHost|blocklist|denylist|deny_list|"
+    r"ssrf|ParseIP|net\.IP|isPublic|validateURL|validate_url|assertURL)", re.I)
+
+def _is_literal(expr):
+    e = expr.strip()
+    if e[:1] in ("\"", "'"):        # plain string literal
+        return True
+    if e[:1] == "`" and "${" not in e:  # Go raw / JS template with no interpolation
+        return True
+    return False
+
+def rule_ssrf(path, text, F):
+    pl = path.as_posix().lower()
+    if any(x in pl for x in ("/internal/httpx", "/oryx/httpx", "/fosite/integration", "/examples/", "cypress")):
+        return
+    # Frontend and demo-script fetches to the app's own backend are not SSRF.
+    pl = path.as_posix().lower()
+    if any(s in pl for s in ("/frontend/", "/web/", "/ui/", "/scripts/save-demo", "/skills/")):
+        return
+    seen = set()
+    for rx, g in HTTP_SINKS:
+        for m in rx.finditer(text):
+            urlarg = m.group(g) or ""
+            if _is_literal(urlarg):
+                continue
+            if not URL_INFLUENCE.search(urlarg):
+                continue
+            # Configured base URL, not caller-controlled. Leave those to review by hand.
+            if re.search(r"gateway_url|provisioner_url|sandbox_url|discovery_url|jwks_uri|token_endpoint|userinfo_endpoint|getenv|os\.environ|_host\(", urlarg):
+                continue
+            # Configured base URL, not caller-controlled. Leave those to review by hand.
+            if re.search(r"gateway_url|provisioner_url|sandbox_url|discovery_url|jwks_uri|token_endpoint|userinfo_endpoint|getenv|os\.environ|_host\(", urlarg):
+                continue
+            block = enclosing_block(text, m.start())
+            if SSRF_GUARD.search(block):
+                continue
+            key = lineno(text, m.start())
+            if key in seen:
+                continue
+            seen.add(key)
+            add(F, "A4", "MEDIUM",
+                "SSRF surface: outbound request to non-literal URL, no guard in function (review each)",
+                path, text, m.start(), f"url arg: {urlarg.strip()[:60]}",
+                "VATA:mcpjungle OAuth DCR SSRF", "LOW")
+
+# ---- Rule A5: excluded_tools / blocklist defined but thinly enforced ----
+# Confidence: LOW. Review pointer, not a detector. Skips comments and help-text strings.
+EXCLUDED = re.compile(r"(excluded_tools|blocked_tools|tool_blocklist|disabled_tools)", re.I)
+
+def _is_noise_line(line):
+    s = line.strip()
+    if s.startswith(("//", "#", "*", "/*")):
+        return True
+    # help-text / doc string fragment: line is dominated by a quoted string ending with \n
+    if ('\\n"' in s or s.endswith('" +') or s.endswith('",')) and '"' in s and "excluded" in s.lower() and ":" not in s.split("excluded")[0][-3:]:
+        # crude: mentions inside prose strings, not a struct field/tag
+        if "`json" not in s and "[]string" not in s:
+            return True
+    return False
+
+def rule_excluded_tools(path, text, F):
+    hits = [m for m in EXCLUDED.finditer(text) if not _is_noise_line(linetext(text, m.start()))]
+    if len(hits) == 1:
+        m = hits[0]
+        add(F, "A5", "MEDIUM", "excluded_tools referenced once - verify all surfaces enforce it",
+            path, text, m.start(), m.group(0),
+            "VATA:mcpjungle excluded_tools bypass / REST Enabled-flag gap", "LOW")
+
+# ---- Rule A6: authz/deny check gated on a specific method/path (review-list) ----
+# Confidence: LOW. Review pointer, NOT a detector. Static analysis cannot prove
+# whether OTHER methods bypass the check (that is control-flow reasoning), so this
+# only surfaces authz checks that sit inside a method/path conditional for a human
+# to verify a catch-all deny exists. Seeded by VATA:ttokkime tools/list bypass.
+METHOD_GATE = re.compile(
+    r"(if\s+[^\n{]*\b(req\.)?[Mm]ethod\s*==|switch\s+[^\n{]*[Mm]ethod\b|"
+    r"case\s+[\"'][a-z]+/[a-z]+[\"']|==\s*[\"'](tools|resources|prompts)/)", re.I)
+AUTHZ_DECISION = re.compile(
+    r"(DeniedRBAC|Unauthorized|[Ff]orbidden|StatusForbidden|403|"
+    r"!\s*\w*\.?(ToolAllowed|IsWildcard|hasRole|canAccess|isAllowed)|"
+    r"return\s+[^\n]*(deny|denied|unauthor))", re.I)
+
+def rule_method_scoped_authz(path, text, F):
+    # Skip test/mock fixtures: they dispatch by method but carry no real authz.
+    if is_test_path(path) or "mock" in str(path).lower():
+        return
+    seen = set()
+    for m in METHOD_GATE.finditer(text):
+        # Look only in a tight window around the method conditional (the gated
+        # branch), not the whole function, so an authz word drifting elsewhere
+        # in the file does not trigger a match.
+        near = text[m.start():m.start()+400]
+        if not AUTHZ_DECISION.search(near):
+            continue
+        key = lineno(text, m.start())
+        if key in seen:
+            continue
+        seen.add(key)
+        line = linetext(text, m.start()).strip()
+        if line.startswith(("//", "#", "*", "/*")):
+            continue
+        add(F, "A6", "MEDIUM",
+            "Authz check gated on a specific method/path - verify other methods are not bypassed (review each)",
+            path, text, m.start(), line[:70],
+            "VATA:ttokkime method-scoped RBAC (tools/list bypass)", "LOW")
+
+# ===================== Client-side rules (C-series) =====================
+# Issuer binding on MCP OAuth CLIENT providers holding pre-provisioned credentials.
+# These credentials were not obtained by the SDK, so only the configured issuer says
+# which authorization server they belong to. Without it, a malicious or compromised
+# MCP server can advertise its own AS (RFC 9728 PRM) and receive the client secret
+# or signed JWT assertion. A fixed SDK version alone does NOT close this.
+
+PY_M2M = re.compile(r"\b(ClientCredentialsOAuthProvider|PrivateKeyJWTOAuthProvider)\s*\(")
+TS_M2M = re.compile(r"\bnew\s+(ClientCredentialsProvider|PrivateKeyJwtProvider|"
+                    r"StaticPrivateKeyJwtProvider|CrossAppAccessProvider)\s*\(")
+PY_LEGACY = re.compile(r"\bRFC7523OAuthClientProvider\s*\(")
+ISSUER_ESCAPE = re.compile(
+    r"(skip\w*Issuer\w*\s*[:=]\s*(true|True|1)\b|"
+    r"skip_\w*issuer\w*\s*[:=]\s*(true|True|1)\b|"
+    r"(validate|verify|check)_?[Ii]ssuer\w*\s*[:=]\s*(false|False|0)\b|"
+    r"[\"']verify_iss[\"']\s*:\s*(false|False)\b)")
+
+def call_args(text, open_idx):
+    """Return the argument text of a call whose '(' is at open_idx (paren-balanced,
+    string-aware), or the next 1500 chars if unbalanced."""
+    depth, i, q = 0, open_idx, None
+    while i < len(text):
+        c = text[i]
+        if q:
+            if c == "\\":
+                i += 2; continue
+            if c == q:
+                q = None
+        elif c in "\"'`":
+            q = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1:i]
+        i += 1
+    return text[open_idx + 1:open_idx + 1500]
+
+def _comment_line(line):
+    return line.strip().startswith(("#", "//", "*", "/*"))
+
+def _resolve_ts_options(text, name, before_idx):
+    """If args are a bare identifier, find `const|let|var name = {...}` earlier in the
+    file and return that object literal, else None."""
+    rx = re.compile(r"\b(?:const|let|var)\s+" + re.escape(name) + r"\b[^=\n]*=\s*\{")
+    last = None
+    for m in rx.finditer(text, 0, before_idx):
+        last = m
+    if not last:
+        return None
+    return brace_block(text, last.end() - 1)
+
+def rule_client_issuer_binding(path, text, F):
+    # C1 (Python): issuer= missing
+    for m in PY_M2M.finditer(text):
+        line = linetext(text, m.start())
+        if _comment_line(line) or re.match(r"\s*(class|def|from|import)\b", line):
+            continue
+        args = call_args(text, m.end() - 1)
+        if re.search(r"\bissuer\s*=", args):
+            continue
+        if "**" in args:
+            add(F, "C1", "HIGH",
+                f"{m.group(1)} built from **kwargs - verify issuer= is set (review)",
+                path, text, m.start(), "options spread from elsewhere; issuer not visible at call site",
+                "GHSA-qx49-fqc8-xw99 (python-sdk issuer binding)", "MEDIUM")
+            continue
+        add(F, "C1", "HIGH",
+            f"{m.group(1)} constructed without issuer= - credentials follow any AS the MCP server advertises",
+            path, text, m.start(), f"{m.group(1)}(...) has no issuer= argument",
+            "GHSA-qx49-fqc8-xw99 (python-sdk issuer binding)", "HIGH")
+
+    # C1 (TypeScript/JS): expectedIssuer missing
+    for m in TS_M2M.finditer(text):
+        line = linetext(text, m.start())
+        if _comment_line(line):
+            continue
+        args = call_args(text, m.end() - 1)
+        if "expectedIssuer" in args:
+            continue
+        ident = re.fullmatch(r"\s*([A-Za-z_$][\w$]*)\s*,?\s*", args)
+        if ident:
+            obj = _resolve_ts_options(text, ident.group(1), m.start())
+            if obj is not None and "expectedIssuer" in obj:
+                continue
+            if obj is None:
+                add(F, "C1", "HIGH",
+                    f"{m.group(1)} options built elsewhere - verify expectedIssuer is set (review)",
+                    path, text, m.start(), f"options identifier '{ident.group(1)}' not resolvable in file",
+                    "typescript-sdk PR #2887 (SEP-2352 issuer binding)", "MEDIUM")
+                continue
+        elif "..." in args:
+            add(F, "C1", "HIGH",
+                f"{m.group(1)} options spread from elsewhere - verify expectedIssuer is set (review)",
+                path, text, m.start(), "object spread; expectedIssuer not visible at call site",
+                "typescript-sdk PR #2887 (SEP-2352 issuer binding)", "MEDIUM")
+            continue
+        add(F, "C1", "HIGH",
+            f"{m.group(1)} constructed without expectedIssuer - credentials follow any AS the MCP server advertises",
+            path, text, m.start(), f"new {m.group(1)}(...) has no expectedIssuer",
+            "typescript-sdk PR #2887 (SEP-2352 issuer binding)", "HIGH")
+
+    # Wrapper that cannot pass issuer= through to the SDK.
+    for m in re.finditer(r"class\s+\w+\((?:\w*ClientCredentialsOAuthProvider|\w*PrivateKeyJWTOAuthProvider)\)", text):
+        block = text[m.start():m.start()+1200]
+        sup = re.search(r"super\(\)\.__init__\((.*?)\)", block, re.S)
+        if sup and not re.search(r"\bissuer\s*=", sup.group(1)):
+            add(F, "C1", "HIGH",
+                "M2M provider wrapper calls super().__init__ without issuer= - callers cannot bind the secret",
+                path, text, m.start(), "super().__init__ has no issuer=",
+                "GHSA-qx49-fqc8-xw99 (python-sdk issuer binding)", "HIGH")
+    for m in re.finditer(r"expectedIssuer[^\n]{0,80}\?[^\n]{0,120}:\s*\{\s*\}", text):
+        add(F, "C1", "HIGH",
+            "expectedIssuer is omitted when the issuer value is missing - binding is conditional",
+            path, text, m.start(), m.group(0)[:80],
+            "typescript-sdk PR #2887 (SEP-2352 issuer binding)", "HIGH")
+
+    # C2: legacy provider with no issuer option at all
+    for m in PY_LEGACY.finditer(text):
+        line = linetext(text, m.start())
+        if _comment_line(line) or re.match(r"\s*(class|def|from|import)\b", line):
+            continue
+        add(F, "C2", "HIGH",
+            "Deprecated RFC7523OAuthClientProvider - has no issuer option; cannot be bound, migrate",
+            path, text, m.start(), "RFC7523OAuthClientProvider(...)",
+            "GHSA-qx49-fqc8-xw99 (legacy provider, no fix by config)", "HIGH")
+
+    # C3: issuer validation switched off
+    for m in ISSUER_ESCAPE.finditer(text):
+        line = linetext(text, m.start())
+        if _comment_line(line):
+            continue
+        add(F, "C3", "HIGH",
+            "Issuer validation disabled - mix-up / credential redirection guard turned off",
+            path, text, m.start(), m.group(0)[:70],
+            "RFC 8414 s3.3 / RFC 9207 / SEP-2352 escape hatch", "MEDIUM")
+
+# ===================== SARIF 2.1.0 output (GitHub code scanning) =====================
+# Rule metadata for the Security tab. Rules absent here still emit results via a
+# graceful fallback, so adding a new detector rule never breaks SARIF output.
+# security-severity is a string float GitHub buckets as: >=9 critical, 7-8.9 high,
+# 4-6.9 medium, <4 low. It is a rule-level property, so a rule that spans severities
+# (e.g. A2) buckets by its canonical value; the per-finding severity still rides on
+# the result `level` (error/warning/note) below.
+RULE_META = {
+    "A1": {"name": "OAuthAuthorizeClientValidationUnverified",
+           "desc": "Authorize handler reads client_id/redirect_uri; validation not seen in the handler itself. Review pointer \u2014 single-file analysis cannot follow validation into a downstream service, so confirm manually (auth bypass / open redirect / ATO if truly absent).",
+           "sev": 3.5, "cwe": ["CWE-862", "CWE-863", "CWE-601"]},
+    "A2": {"name": "HardcodedDefaultAdminCredential",
+           "desc": "Hardcoded default admin credential, or an admin re-seed routine that may run on every restart.",
+           "sev": 9.0, "cwe": ["CWE-798", "CWE-1392"]},
+    "A3": {"name": "AuthMiddlewareNoAuthorization",
+           "desc": "Auth middleware validates a token but enforces no role/tenant/scope (cross-tenant access).",
+           "sev": 7.5, "cwe": ["CWE-862", "CWE-863"]},
+    "A4": {"name": "SSRFOutboundNonLiteralURL",
+           "desc": "Outbound HTTP request to a non-literal, externally-influenced URL with no allowlist / internal-IP guard (review-list).",
+           "sev": 5.0, "cwe": ["CWE-918"]},
+    "A5": {"name": "ToolBlocklistEnforcementUnverified",
+           "desc": "excluded_tools/blocklist defined but enforcement unverified across surfaces (review pointer).",
+           "sev": 3.0, "cwe": ["CWE-863"]},
+    "A6": {"name": "MethodScopedAuthorization",
+           "desc": "Authorization check gated on a specific method/path; other methods may bypass it (review-list).",
+           "sev": 5.0, "cwe": ["CWE-863"]},
+    "A7": {"name": "CrossTenantUnscopedList",
+           "desc": "Unscoped list (findAll/listAll) on a repo that also exposes a tenant-scoped sibling, reached from a request handler - cross-tenant read.",
+           "sev": 7.5, "cwe": ["CWE-863", "CWE-862"]},
+    "A10": {"name": "FastMCPAuthNoneByDefault",
+            "desc": "FastMCP server on a network transport (http/sse/0.0.0.0) with auth=None or an auth var that defaults to None unless an opt-in flag is set - unauthenticated by default.",
+            "sev": 7.5, "cwe": ["CWE-306", "CWE-1188"]},
+    "C1": {"name": "MCPClientMissingIssuerBinding",
+           "desc": "M2M MCP OAuth client provider built without issuer/expectedIssuer; pre-provisioned credentials follow whatever AS the MCP server advertises.",
+           "sev": 7.5, "cwe": ["CWE-346", "CWE-290"]},
+    "C2": {"name": "MCPClientLegacyProviderNoIssuer",
+           "desc": "Deprecated RFC7523OAuthClientProvider has no issuer option and cannot be bound; migrate.",
+           "sev": 7.5, "cwe": ["CWE-346"]},
+    "C3": {"name": "MCPClientIssuerValidationDisabled",
+           "desc": "Issuer validation explicitly disabled; authorization-server mix-up / credential-redirection guard turned off.",
+           "sev": 7.5, "cwe": ["CWE-346", "CWE-290"]},
+    "B1": {"name": "PKCEAcceptedbutNeverEnforced",
+           "desc": "Self-rolled authorization server accepts a PKCE code_verifier (or is explicitly told to skip local PKCE) but never performs the SHA-256/S256 challenge check.",
+           "sev": 8.1, "cwe": ["CWE-287", "CWE-1390"]},
+    "B2": {"name": "AuthorizationCodeNotSingleUse",
+           "desc": "Authorization code is redeemed at the token endpoint but is never invalidated (delete/mark-used/revoke) in the same file; the code may be replayable. Review pointer: confirm invalidation is not delegated to an unscanned storage layer.",
+           "sev": 8.6, "cwe": ["CWE-294", "CWE-384"]},
+    "B3": {"name": "AuthorizationCodeExcessiveLifetime",
+           "desc": "Large TTL found near authorization-code context. Review pointer \u2014 regex cannot prove the number governs the auth code (vs an access/refresh-token TTL), so confirm manually; an auth code far exceeding RFC 6749's ~600s is the real risk.",
+           "sev": 3.5, "cwe": ["CWE-613"]},
+    "E1": {"name": "MCPCrossSessionDataLeak",
+           "desc": "Module-level store keyed by session id is returned whole to a caller, or a missing session id falls back to a constant key - one session reads another's data.",
+           "sev": 7.5, "cwe": ["CWE-200", "CWE-639"]},
+    "E2": {"name": "MCPSensitiveDataInLogs",
+           "desc": "Secret-named value, tool argument kept as session data, or a whole session store written raw to logs/stderr, which MCP hosts routinely collect.",
+           "sev": 5.5, "cwe": ["CWE-532"]},
+    "E3": {"name": "MCPToolOutputPromptInjection",
+           "desc": "Model-visible tool result or tool description contains a prompt-injection phrase (instruction override, system-prompt exfiltration, concealment from the user).",
+           "sev": 8.0, "cwe": ["CWE-74", "CWE-1427"]},
+}
+SARIF_LEVEL = {"CRITICAL": "error", "HIGH": "error", "MEDIUM": "warning", "LOW": "note"}
+
+def _ghsa_uri(ref):
+    m = re.search(r"GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}", ref or "", re.I)
+    return f"https://github.com/advisories/{m.group(0)}" if m else None
+
+def to_sarif(findings, target):
+    """Build a SARIF 2.1.0 log. Carries the same report_sha256 receipt as --json
+    (over the identical findings payload) in run.properties so a SARIF run is as
+    anchorable as a JSON one."""
+    root = Path(target).resolve()
+    # declare every known rule, plus any rule that fired but isn't in RULE_META
+    rule_ids = list(RULE_META.keys())
+    for f in findings:
+        if f["rule"] not in rule_ids:
+            rule_ids.append(f["rule"])
+    rule_index = {rid: i for i, rid in enumerate(rule_ids)}
+    rules = []
+    for rid in rule_ids:
+        meta = RULE_META.get(rid, {})
+        rules.append({
+            "id": rid,
+            "name": meta.get("name", f"Rule{rid}"),
+            "shortDescription": {"text": meta.get("desc", f"VATA mcp-authscan rule {rid}")},
+            "helpUri": "https://github.com/LHMisme420/mcp-authscan#rules",
+            "properties": {
+                "security-severity": f"{meta.get('sev', 5.0):.1f}",
+                "tags": ["security", "mcp", "oauth"] + meta.get("cwe", []),
+            },
+        })
+    results = []
+    for f in findings:
+        rid = f["rule"]
+        try:
+            uri = Path(f["file"]).resolve().relative_to(root).as_posix()
+        except Exception:
+            uri = Path(f["file"]).as_posix()
+        ref = f.get("ref", "")
+        fp = hashlib.sha256(f"{rid}|{uri}|{f.get('evidence','')}".encode()).hexdigest()[:16]
+        props = {"confidence": f.get("confidence", ""), "vataSeverity": f.get("severity", ""),
+                 "ref": ref, "evidence": f.get("evidence", "")}
+        adv = _ghsa_uri(ref)
+        if adv:
+            props["advisory"] = adv
+        if f.get('severity_basis'):
+            props['severityBasis'] = f['severity_basis']
+        results.append({
+            "ruleId": rid,
+            "ruleIndex": rule_index[rid],
+            "level": SARIF_LEVEL.get(f["severity"], "warning"),
+            "message": {"text": f"{f['title']} [{f['severity']}/{f['confidence']}] ({ref})"},
+            "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": uri},
+                "region": {"startLine": max(1, int(f.get("line", 1)))},
+            }}],
+            "partialFingerprints": {"vataAuthscan/v1": fp},
+            "properties": props,
+        })
+    blob = json.dumps({"target": target, "count": len(findings), "findings": findings},
+                      sort_keys=True).encode()
+    return {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "mcp-authscan",
+                "informationUri": "https://github.com/LHMisme420/mcp-authscan",
+                "version": VERSION,
+                "rules": sarif_rules(rules),
+            }},
+            "properties": {"reportSha256": hashlib.sha256(blob).hexdigest(), "exitContract": EXIT_CONTRACT},
+            "results": results,
+        }],
+    }
+# ---- Rules B1/B2/B3: self-rolled OAuth authorization-code lifecycle ----
+# Seeded from VATA findings akshay5995 / atrawog / webrix. Validated v4 against a
+# 4-repo ground-truth corpus (3/3 seeded recovered, 0 FP on IdP-delegating control).
+# Per-file by design (matches the scan() driver). KNOWN LIMITS, not faked:
+#   * B1 does NOT detect PKCE-*optional* (validated-when-present, skippable-when-
+#     absent) -- that is control-flow, not a regex shape (atrawog's B1 case).
+#   * B2 is SAME-FILE only: a redeem path whose invalidation lives in a different
+#     file (storage layer) will false-positive. Hence MEDIUM/warning + review note.
+#   * B3 "no expiry field anywhere in schema" (cross-file absence) is out of scope;
+#     only explicit excessive TTL is detected.
+
+B_OAUTH_HINT = re.compile(r"authorization_code|grant_type|code_verifier|code_challenge|token_endpoint|oauth|pkce|/token|/authorize", re.I)
+B_AS_ROUTE  = re.compile(r"""(?:@\w+\.(?:post|get|route|api_route)|(?:router|app|server|blueprint|bp)\.(?:post|get|route)|add_api_route|add_route)\s*\(\s*['"][^'"]*/(?:token|authorize|authorization|oauth)""", re.I)
+B_AS_FORM   = re.compile(r"\bForm\s*\(", re.I)
+B_AS_INBOUND = re.compile(r"""request\.(?:form|json|body|data|query|args|POST)|req\.(?:body|query|params)|\.get\(\s*['"](?:grant_type|code_verifier|code)['"]""", re.I)
+B_AS_FUNC   = re.compile(r"""exchange[_]?authorization[_]?code|exchangeAuthorizationCode|create[_]?authorization[_]?code|createAuthorizationCode|store[_]?authorization[_]?code|storeAuthorizationCode|validate[_]?(?:authorization[_]?)?code|issue[_]?(?:access[_]?)?token|issueToken|def\s+token\b|def\s+authorize\b""", re.I)
+B_CLIENT_REQ = re.compile(r"""(?:requests|httpx|aiohttp|urllib|session|axios)\.(?:post|request|get)\b|fetch\s*\([^\n]{0,120}token|data\s*=\s*\{[^}\n]*grant_type|token_(?:endpoint|url|uri)\s*[,=)]""", re.I)
+
+def _b_is_authz_server(text):
+    strong = bool(B_AS_ROUTE.search(text) or B_AS_FORM.search(text) or B_AS_INBOUND.search(text))
+    func   = bool(B_AS_FUNC.search(text))
+    client = bool(B_CLIENT_REQ.search(text))
+    return strong or (func and not client)
+
+B_SKIP_PKCE = re.compile(r"skip[_-]?local[_-]?pkce[_-]?validation\s*[:=]\s*true", re.I)
+# PKCE downgradeable to 'plain': challenge method defaults to / falls back to 'plain'
+# (plain -> challenge == verifier, no protection). CVE-2025-4144 class.
+B_PKCE_PLAIN_DEFAULT = re.compile(
+    # JS idiom: code_challenge_method || 'plain' / ?? 'plain'
+    r"code[_-]?challenge[_-]?method\b[^;\n]{0,60}(?:\|\||\?\?)\s*[\'\"]plain[\'\"]"
+    # Python/generic default idiom: .get("code_challenge_method", "plain") or (= ... or "plain")
+    r"|code[_-]?challenge[_-]?method[\'\"]?\s*,\s*[\'\"]plain[\'\"]"
+    r"|code[_-]?challenge[_-]?method[^\n]{0,40}\bor\s+[\'\"]plain[\'\"]"
+    # The smoking gun: non-S256 branch falls through to a RAW verifier compare
+    # (calc = verifier / = code_verifier), i.e. plain is honored, not rejected.
+    r"|==\s*[\'\"]S256[\'\"][^\n]*\n(?:[^\n]*\n){0,8}?\s*else\s*:\s*\n\s*\w+\s*=\s*(?:code_)?verifier\b", re.I | re.M)
+B_PKCE_HASH = re.compile(r"sha-?256|s256|createhash|crypto\.createHash|subtle\.digest|hashlib\.sha256|\.digest\(|hashes\.SHA256", re.I)
+B_VERIFIER  = re.compile(r"code[_]?verifier", re.I)
+B_GEN_VERIFIER = re.compile(r"code[_]?verifier\s*=\s*.*(?:secrets|token_|randombytes|random\.|base64|createhash|uuid|getrandom)", re.I)
+B_RECV_HINT = re.compile(r"""Form\s*\(|Body\s*\(|Query\s*\(|:\s*Optional|:\s*str\b|\?\s*:\s*str|\.get\(\s*['"]code_verifier|request\.|req\.|body\.|params|\bdef\s|\bfunction\s|[(,]\s*code[_]?verifier\s*[:?,)]""", re.I)
+
+B_GRANT_AC    = re.compile(r"grant_type[^\n]{0,40}authorization_code|authorization_code[^\n]{0,40}grant_type|['\"]authorization_code['\"]", re.I)
+B_REDEEM_FUNC = re.compile(r"exchange[_]?authorization[_]?code|exchangeAuthorizationCode|redeem[_\s\w]{0,20}code|validate[_]?authorization[_]?code|validateAuthorizationCode|consume[_\s\w]{0,20}code", re.I)
+B_LOOKUP_CODE = re.compile(r"(?:get|find|lookup|fetch|load|retrieve)[_\s\w.]*authorization[_]?code|getAuthorizationCode|findAuthorizationCode|getByCode|authorization[_]?codes?\s*\[[^\]]+\]|where\s+code\s*=|from\s+\w*codes?\b|codes?\.get\(|codes?\.find", re.I)
+B_INVALIDATE  = re.compile(
+    r"delete[_\s]+\w*code|del\s+\w*code|delete\s+from\s+\w*codes?\b"
+    r"|revoke\w*code|revokeCode|revoke_authorization|invalidate\w*code|invalidateCode"
+    r"|mark[_]?used|markUsed|mark[_]?code[_]?used|consume\w*code|consumeCode|consume_authorization"
+    r"|redeemed\s*[:=]\s*[Tt]rue|used\s*[:=]\s*[Tt]rue|is[_]?used\s*[:=]\s*[Tt]rue"
+    r"|codes?\.(?:delete|remove|pop)\(|authorization[_]?codes?\.(?:delete|remove|pop)\("
+    # timestamp-column single-use (cortex idiom): usedAt/consumedAt/redeemedAt set to a
+    # date/now, plus the .usedAt read-guard that enforces it. KNOWN LIMIT: a file that
+    # SETS usedAt but never CHECKS it is now silenced too (set-but-unchecked); acceptable
+    # for a MEDIUM review-pointer.
+    r"|(?:used|consumed|redeemed|revoked)_?at\s*[:=]\s*(?:new\s+Date|Date\.now|datetime|now\(|timezone\.now|Time\.now|\bnow\b|sql\w*\.now)"
+    r"|(?:\.|\?\.)(?:used|consumed|redeemed|revoked)_?at\b"
+    r"|data\s*:\s*\{[^}\n]*(?:used|consumed|redeemed)_?at"
+    r"|(?:delete|remove|pop|del)\([^)\n]*\bcode\b|\.(?:delete|remove|pop)\([^)\n]*\bcode", re.I)
+B_EXPIRY_FIELD = re.compile(r"expires?(_at|_in)?\b|\bexp\b|\bttl\b|expiry|valid[_-]?until|not[_-]?after", re.I)
+B_CODE_CTX = re.compile(r"\bcode\b|authorization", re.I)
+# B3 gating: the excessive number must govern an AUTHORIZATION CODE.
+B_AUTHCODE_TTL_CTX = re.compile(r"auth(?:oriz\w*)?[_ ]?code|authorization_code|code[_]?ttl|code[_]?expir|code[_]?lifetime|codes?\s*\[|store[_]?auth\w*code|create[_]?auth\w*code|issue\w*code", re.I)
+# strong signal that THIS is explicitly an auth-code TTL (overrides the exclusion)
+B_AUTHCODE_STRONG = re.compile(r"authorization_code|auth[_]?code[_]?(?:ttl|expir|lifetime|max_?age)|code[_]?ttl|oauth:code|code:\{|:code:|setex\([^)]*code", re.I)
+# access/refresh/session/id-token lifetimes: 3600-class values here are NORMAL, not B3
+B_OTHER_TOKEN_TTL = re.compile(r"access[_]?token|refresh[_]?token|id[_]?token|session|jwt|bearer|expires_in|cookie|max_?age", re.I)
+B_TTL_PATTERNS = [
+    (re.compile(r"timedelta\(\s*days\s*=\s*(\d+)", re.I), 86400),
+    (re.compile(r"timedelta\(\s*hours\s*=\s*(\d+)", re.I), 3600),
+    (re.compile(r"(\d+)\s*\*\s*86400"), 86400),
+    (re.compile(r"(\d+)\s*\*\s*3600"), 3600),
+]
+B_BIG_INT_TTL = re.compile(r"(expires?_in|\bttl\b|code[_-]?ttl|code[_-]?lifetime|auth\w*code\w*(?:ttl|expir|lifetime)|expiry)\s*[:=]\s*(\d{3,})", re.I)
+# Lines where a 3600/86400/etc. is definitely NOT an auth-code TTL.
+B_B3_HARD_EXCLUDE = re.compile(r"cache-control|max-age|max_age|s-maxage|stale-while|expires:|\*\s*3600|3600\s*\*|\*\s*86400|86400\s*\*|\*\s*1000|CORS|Access-Control", re.I)
+B_KNOWN_SECS = (31536000, 2592000, 604800)
+B_RFC_MAX = 600
+
+def _b_ttl_seconds(line):
+    for rx, mult in B_TTL_PATTERNS:
+        m = rx.search(line)
+        if m:
+            try: return int(m.group(1)) * mult
+            except (IndexError, ValueError): pass
+    m = B_BIG_INT_TTL.search(line)
+    if m:
+        try: return int(m.group(2))
+        except ValueError: pass
+    for c in B_KNOWN_SECS:
+        if re.search(r"\b%d\b" % c, line): return c
+    return None
+
+def rule_pkce_not_enforced(path, text, F):
+    if not B_OAUTH_HINT.search(text):
+        return
+    # B1a: PKCE explicitly skipped (definitive -> HIGH/error)
+    for m in B_SKIP_PKCE.finditer(text):
+        add(F, "B1", "HIGH", "PKCE validation explicitly disabled",
+            path, text, m.start(),
+            "skipLocalPkceValidation=true with no local verifier check taking over",
+            "VATA:webrix skipLocalPkceValidation", "HIGH")
+    # B1c: PKCE downgradeable to 'plain' (CVE-2025-4144 class). With method 'plain',
+    # challenge == verifier, so anyone who observes the authorize request can replay it;
+    # OAuth 2.1 requires S256. Defaulting/falling back to 'plain' is the downgrade.
+    for m in B_PKCE_PLAIN_DEFAULT.finditer(text):
+        add(F, "B1", "HIGH", "PKCE downgradeable to 'plain' method",
+            path, text, m.start(),
+            "code_challenge_method defaults/falls back to 'plain'; plain PKCE has "
+            "challenge==verifier and is bypassable by anyone who sees the authorize request",
+            "VATA:cloudflare CVE-2025-4144 PKCE plain downgrade", "HIGH")
+    # B1b: verifier received as input but never hashed (AS-gated -> MEDIUM/warning)
+    if _b_is_authz_server(text) and not B_PKCE_HASH.search(text):
+        for m in B_VERIFIER.finditer(text):
+            ls = text.rfind("\n", 0, m.start()) + 1
+            le = text.find("\n", m.start());  le = len(text) if le < 0 else le
+            line = text[ls:le]
+            if B_GEN_VERIFIER.search(line) or not B_RECV_HINT.search(line):
+                continue
+            # Client generating a verifier is not an authorization server failing to check one.
+            if re.search(r"generate_code_verifier|compute_code_challenge|code_challenge\s*=", text):
+                if not re.search(r"request\.(?:form|json|body)|req\.(?:body|query)|code_verifier\s*=\s*request", text):
+                    continue
+            add(F, "B1", "MEDIUM", "PKCE code_verifier received but never validated",
+                path, text, m.start(),
+                "code_verifier received as input; no SHA-256/S256 transform in this file",
+                "VATA:atrawog/webrix verifier-never-hashed", "MEDIUM")
+            break
+    # B3: explicit excessive authorization-code TTL (definitive number -> HIGH/error)
+    for m in B_BIG_INT_TTL.finditer(text):
+        pass  # covered by line loop below for context gating
+    for mline in re.finditer(r"[^\n]*\n?", text):
+        line = mline.group(0)
+        if not line.strip():
+            continue
+        if B_B3_HARD_EXCLUDE.search(line):
+            continue
+        secs = _b_ttl_seconds(line)
+        if secs is None or secs <= B_RFC_MAX:
+            continue
+        ctx = text[max(0, mline.start()-240):mline.start()+240]
+        # Must be tied to an AUTHORIZATION CODE specifically, not generic OAuth
+        # context. 3600 etc. is the usual access-token lifetime; only fire when the
+        # vicinity names an auth code and does NOT read as access/refresh/session TTL.
+        if not B_AUTHCODE_STRONG.search(ctx):
+            continue
+        if B_OTHER_TOKEN_TTL.search(ctx) and not B_AUTHCODE_STRONG.search(ctx):
+            continue
+        add(F, "B3", "MEDIUM", f"Large TTL ~{secs}s near auth-code context \u2014 verify it governs the authorization code (RFC 6749 ~600s)",
+            path, text, mline.start(),
+            f"TTL {secs}s within auth-code context; confirm it is the authorization-code lifetime and not an access/refresh-token TTL (RFC 6749 4.1.2 recommends <=600s)",
+            "VATA:atrawog 1-year auth-code TTL (review-list)", "LOW")
+
+def rule_authcode_replay(path, text, F):
+    # B2 same-file: redeem path present, no invalidation in THIS file. MEDIUM/warning
+    # + review note, because true single-use may be enforced in a separate storage file.
+    if not B_OAUTH_HINT.search(text) or not _b_is_authz_server(text):
+        return
+    if not (B_GRANT_AC.search(text) or B_REDEEM_FUNC.search(text)):
+        return
+    rm = B_REDEEM_FUNC.search(text) or B_LOOKUP_CODE.search(text)
+    if rm is None:
+        return
+    if B_INVALIDATE.search(text):
+        return  # something in this file invalidates a code -> not a same-file replay
+    add(F, "B2", "MEDIUM", "Authorization code redeemed but never invalidated (same-file)",
+        path, text, rm.start(),
+        "code redeemed/looked up here; no delete/mark-used/revoke in this file -- confirm storage layer before filing",
+        "VATA:webrix auth-code replay", "MEDIUM")
+
+# ---- Rule A7: cross-tenant unscoped list (seed: metamcp, CWE-863) ----
+# Unscoped list on a repo that ALSO exposes a tenant-scoped sibling, reached from a
+# request/auth handler -> cross-tenant read. Needs repo-wide context (SCOPED_REPOS).
+SCOPED_REPOS: set[str] = set()
+SCANNED_FILES: list[str] = []  # files scan() actually read, set on every scan()
+A7_SCOPED_CALL = re.compile(
+    r"(\w*(?:[Rr]epository|[Rr]epo|[Ss]tore|[Dd]ao))\."
+    r"(?:findAllAccessibleTo\w*|findAccessibleTo\w*|listAccessibleTo\w*|"
+    r"findVisibleTo\w*|visibleTo\w*|\w*ScopedTo\w*|findAllForUser\w*)\s*\(", re.I)
+A7_UNSCOPED_LIST = re.compile(
+    r"(\w*(?:[Rr]epository|[Rr]epo|[Ss]tore|[Dd]ao))\."
+    r"(findAll|listAll|getAll|findMany|list)\s*\(\s*\)")
+A7_BOOT_PATH = re.compile(
+    r"(startup|bootstrap|seed|migrat|/cli|scripts?/|/bin/|(^|/)main\.|(^|/)index\.)", re.I)
+A7_REQ_CTX = re.compile(
+    r"(routers?/|controllers?/|handlers?/|req\.|request\.|res\.|ctx\.|"
+    r"userId|user_id|session|getServerSession|currentUser|current_user|principal)", re.I)
+
+def rule_cross_tenant_list(path, text, F):
+    if not SCOPED_REPOS:
+        return
+    ppath = path.as_posix()
+    if A7_BOOT_PATH.search(ppath):
+        return
+    for m in A7_UNSCOPED_LIST.finditer(text):
+        repo = m.group(1)
+        if repo not in SCOPED_REPOS:
+            continue
+        window = text[max(0, m.start() - 400):m.start() + 160]
+        if not (A7_REQ_CTX.search(ppath) or A7_REQ_CTX.search(window)):
+            continue
+        add(F, "A7", "HIGH",
+            f"Unscoped {repo}.{m.group(2)}() in a handler; a tenant-scoped sibling exists",
+            path, text, m.start(),
+            f"{repo} exposes a *AccessibleTo* method but this handler calls the "
+            f"unscoped {m.group(2)}() - cross-tenant read (CWE-863)",
+            "VATA:metamcp cross-tenant unscoped list", "MEDIUM")
+
+# ---- Rule A10: MCP server on a network transport with auth None by default ----
+# Seed: startreedata/mcp-pinot GHSA-73cv - FastMCP(auth=_auth) where _auth stays None
+# unless oauth_enabled (default False); transport defaults http on 0.0.0.0. VATA class A
+# (fail-open / disabled-by-default). External ground truth (reporter: GitHub advisory).
+A10_FASTMCP   = re.compile(r"\bFastMCP\s*\(", re.I)
+A10_NET       = re.compile(r"(0\.0\.0\.0|uvicorn\.run|transport\s*[:=]\s*['\"](?:http|sse|streamable[-_]?http)['\"]|\.run\([^)]*transport\s*=\s*['\"](?:http|sse|streamable))", re.I)
+A10_AUTH_NONE = re.compile(r"FastMCP\s*\([^)]*\bauth\s*=\s*None\b", re.I)
+A10_AUTH_VAR  = re.compile(r"FastMCP\s*\([^)]*\bauth\s*=\s*([A-Za-z_]\w*)")
+
+def rule_fastmcp_auth_default(path, text, F):
+    if not A10_FASTMCP.search(text) or not A10_NET.search(text):
+        return  # not a FastMCP server, or not network-exposed (stdio-only is not this bug)
+    hit = A10_AUTH_NONE.search(text)
+    if not hit:
+        mv = A10_AUTH_VAR.search(text)
+        if not (mv and mv.group(1).lower() != "none"
+                and re.search(r"\b" + re.escape(mv.group(1)) + r"\s*=\s*None\b", text)):
+            return  # auth is a real provider, not a None-defaulting var
+        hit = mv
+    add(F, "A10", "HIGH",
+        "FastMCP network server with auth None by default",
+        path, text, hit.start(),
+        "FastMCP on an http/sse transport with auth=None (or an auth var that defaults to "
+        "None unless an opt-in flag is set) - unauthenticated by default (class A)",
+        "VATA:mcp-pinot GHSA-73cv auth-disabled-by-default", "MEDIUM")
+
+
+DEP_NAMES = {"requirements.txt", "requirements-dev.txt", "pyproject.toml", "setup.cfg", "Pipfile", "package.json", "uv.lock", "package-lock.json", "poetry.lock"}
+
+def _ver_tuple(s):
+    nums = re.findall(r"\d+", s)
+    if not nums:
+        return None
+    vt = tuple(int(n) for n in nums[:3])
+    return vt + (0,) * (3 - len(vt))
+
+def _in_advisory(vt):
+    if not vt:
+        return False
+    if vt[0] == 1 and (1, 9, 1) <= vt < (1, 30, 0):
+        return True
+    if vt[0] == 2 and vt < (2, 2, 0):
+        return True
+    return False
+
+def _overlaps(low, high):
+    """True if [low, high) can install a GHSA-qx49-fqc8-xw99 version."""
+    if low is None:
+        low = (0, 0, 0)
+    if high is None:
+        high = (99, 0, 0)
+    for a, b in (((1, 9, 1), (1, 30, 0)), ((2, 0, 0), (2, 2, 0))):
+        if low < b and a < high:
+            return True
+    return False
+
+def _mcp_vulnerable(spec):
+    spec = spec.strip().strip("\"'")
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    low = high = None
+    for p in parts:
+        m = re.match(r"(?:==|===)\s*(.+)", p)
+        if m:
+            return _in_advisory(_ver_tuple(m.group(1)))
+        m = re.match(r"~=\s*(.+)", p)
+        if m:
+            vt = _ver_tuple(m.group(1))
+            if not vt:
+                return False
+            upper = (vt[0], vt[1] + 1, 0) if len(vt) >= 2 else (vt[0] + 1, 0, 0)
+            return _overlaps(vt, upper)
+        m = re.match(r">=\s*(.+)", p)
+        if m:
+            low = _ver_tuple(m.group(1))
+        m = re.match(r">\s*(.+)", p)
+        if m and _ver_tuple(m.group(1)):
+            vt = _ver_tuple(m.group(1))
+            low = vt[:-1] + (vt[-1] + 1,)
+        m = re.match(r"<\s*(.+)", p)
+        if m:
+            high = _ver_tuple(m.group(1))
+        m = re.match(r"<=\s*(.+)", p)
+        if m and _ver_tuple(m.group(1)):
+            vt = _ver_tuple(m.group(1))
+            high = vt[:-1] + (vt[-1] + 1,)
+    if low is None and high is None:
+        return False
+    return _overlaps(low, high)
+
+def _npm_vulnerable(name, spec):
+    spec = spec.strip().strip("\"'")
+    if spec.startswith("^"):
+        low = _ver_tuple(spec[1:])
+        if not low:
+            return False
+        high = (low[0] + 1, 0, 0)
+        if name == "@modelcontextprotocol/sdk":
+            return _overlaps(low, high) and low < (1, 31, 0)
+        if name == "@modelcontextprotocol/client":
+            return low < (2, 2, 0) and high > (2, 0, 0)
+        return False
+    vt = _ver_tuple(spec.lstrip("=v"))
+    if not vt:
+        return False
+    if name == "@modelcontextprotocol/sdk":
+        return (1, 12, 0) <= vt < (1, 31, 0)
+    if name == "@modelcontextprotocol/client":
+        return (2, 0, 0) <= vt < (2, 2, 0)
+    return False
+
+def rule_mcp_sdk_version(path, text, F):
+    if path.name in {"uv.lock", "package-lock.json", "poetry.lock"}:
+        for m in re.finditer(r'name\s*=\s*"mcp"|"(?:mcp|@modelcontextprotocol/(?:sdk|client))"\s*:\s*\{[^}]{0,200}"version"\s*:\s*"([^"]+)"', text):
+            spec = m.group(1) if m.lastindex else ""
+            window = text[m.start():m.start()+240]
+            vm = re.search(r'version\s*=\s*"([^"]+)"', window)
+            pin = spec or (vm.group(1) if vm else "")
+            if not pin:
+                continue
+            bad = _mcp_vulnerable("=="+pin) if path.name != "package-lock.json" else _npm_vulnerable("@modelcontextprotocol/sdk", pin) or _mcp_vulnerable("=="+pin)
+            if bad:
+                add(F, "D1", "HIGH",
+                    "lockfile pin is inside the MCP issuer-binding advisory range",
+                    path, text, m.start(), pin, "GHSA-qx49-fqc8-xw99", "HIGH")
+        return
+    if path.name == "package.json":
+        for m in re.finditer(r'"(@modelcontextprotocol/(?:sdk|client))"\s*:\s*"([^"]+)"', text):
+            if not _npm_vulnerable(m.group(1), m.group(2)):
+                continue
+            add(F, "D1", "HIGH",
+                "MCP TypeScript SDK pin is inside GHSA-6qxp-vccf-f47h; upgrade sdk to 1.31.0 or client to 2.2.0 and set expectedIssuer",
+                path, text, m.start(), m.group(0)[:80],
+                "GHSA-6qxp-vccf-f47h", "HIGH")
+        return
+
+    if path.name not in DEP_NAMES and not path.name.startswith("requirements"):
+        return
+    for m in re.finditer(r"(?m)^\s*(?:[\"']|)mcp(?:\[[^\]]*\])?\s*([=~<>!]+[^\s#\"']+)", text):
+        spec = m.group(1)
+        if not _mcp_vulnerable(spec):
+            continue
+        add(F, "D1", "HIGH",
+            "mcp SDK pin is inside GHSA-qx49-fqc8-xw99; upgrade to 1.30.0 or 2.2.0 and set issuer=",
+            path, text, m.start(), m.group(0)[:80],
+            "GHSA-qx49-fqc8-xw99", "HIGH")
+
+# ---- E-series: MCP server runtime data handling ----
+# Seed: examples/vulnerable_gold_server.py (stdio JSON-RPC server). Fixed twin:
+# examples/gold_server_fixed.py must stay silent. Gated on files that look like an MCP
+# server so generic web code with module-level dicts or logging is not swept in.
+E_MCP_SERVER = re.compile(
+    r"""['"]tools/(?:call|list)['"]|@\w+\.tool\b|\bFastMCP\s*\(|\bMcpServer\b|"""
+    r"""CallToolRequest|\.call_tool\b|server\.tool\s*\(""")
+E_LOG_CALL = re.compile(
+    r"\b(?:logger|logging|log|_log|LOGGER|LOG)\s*\.\s*"
+    r"(?:debug|info|warning|warn|error|exception|critical|fatal|log)\s*\(|"
+    r"\bconsole\.(?:log|error|warn|info|debug)\s*\(|"
+    r"\bprint\s*\((?=[^\n]*file\s*=\s*sys\.stderr)|"
+    r"\b(?:sys|process)\.stderr\.write\s*\(")
+E_STORE_DEF = re.compile(
+    r"^(?:(?:const|let|var)\s+)?([A-Za-z_]\w*)\s*(?::[^=\n]+)?=\s*"
+    r"(?:\{\s*\}|dict\(\s*\)|(?:collections\.)?defaultdict\([^)\n]*\)|new\s+Map\s*\(\s*\))\s*;?\s*$",
+    re.M)
+E_SESSION_NAME = re.compile(r"session|^sid$|_sid$|conn|client|user|tenant|caller", re.I)
+
+def _e_session_stores(text):
+    """Module-level dicts/Maps written with a session-like key: {name: write_idx}."""
+    stores = {}
+    for m in E_STORE_DEF.finditer(text):
+        name = m.group(1)
+        n = re.escape(name)
+        w = re.compile(r"\b" + n + r"\s*\[\s*([\w.]+)\s*\]\s*=(?!=)|\b" + n + r"\.set\(\s*([\w.]+)\s*,")
+        for wm in w.finditer(text, m.end()):
+            key = (wm.group(1) or wm.group(2)).split(".")[-1]
+            if E_SESSION_NAME.search(key):
+                stores[name] = wm.start()
+                break
+    return stores
+
+def _e_is_log_line(line):
+    return bool(E_LOG_CALL.search(line))
+
+def rule_session_leak(path, text, F):
+    if not E_MCP_SERVER.search(text):
+        return
+    stores = _e_session_stores(text)
+    for name in stores:
+        n = re.escape(name)
+        whole = re.compile(
+            r"\b(?:str|repr|dict|list|json\.dumps|JSON\.stringify)\(\s*" + n + r"\s*[,)]|"
+            r"\{" + n + r"(?:![rsa])?\}|\$\{" + n + r"\}|"
+            r"\breturn\s+" + n + r"\s*;?\s*$|"
+            r"\b" + n + r"\.(?:items|values)\(\s*\)|"
+            r"\bObject\.(?:values|entries|fromEntries)\(\s*" + n + r"\s*\)|\bArray\.from\(\s*" + n + r"\b|"
+            r"\.\.\." + n + r"\.values\(", re.M)
+        for m in whole.finditer(text):
+            line = linetext(text, m.start())
+            if _comment_line(line) or _e_is_log_line(line):
+                continue  # logging the store is E2's finding, not a response leak
+            add(F, "E1", "HIGH",
+                f"Session-keyed shared store '{name}' returned whole to a caller",
+                path, text, m.start(),
+                f"'{name}' is a module-level dict keyed by session, and this line exposes "
+                f"every session's entries at once - any caller reads other sessions' data",
+                "VATA:gold-server cross-session store", "MEDIUM")
+    # A missing session id that falls back to a constant puts every such caller in
+    # one shared bucket of a session-keyed store.
+    fallback = re.compile(
+        r"""\b(\w+)\s*=\s*[^\n]*(?:\.get\(\s*['"](?:session_?id|sessionId|sid)['"]\s*,\s*['"][^'"\n]*['"]\s*\)|"""
+        r"""session_?[Ii]d\s*(?:\?\?|\|\|)\s*['"][^'"\n]*['"])""")
+    for m in fallback.finditer(text):
+        var = re.escape(m.group(1))
+        if not any(re.search(r"\b" + re.escape(s) + r"\s*\[\s*" + var + r"\s*\]|\b" + re.escape(s) + r"\.set\(\s*" + var + r"\b", text)
+                   for s in stores):
+            continue
+        add(F, "E1", "HIGH",
+            "Missing session id falls back to a constant key into a session-keyed store",
+            path, text, m.start(),
+            f"'{m.group(1)}' defaults to a fixed string when the caller sends no session id; "
+            f"all such callers share one bucket and read each other's data",
+            "VATA:gold-server cross-session store", "MEDIUM")
+
+E_ARG_SOURCE = re.compile(
+    r"""^\s*(?:(?:const|let|var)\s+)?([A-Za-z_]\w*)\s*(?::[^=\n]+)?=\s*[^\n]*"""
+    r"""(?:\b(?:args|arguments|tool_args|tool_input)\b\s*(?:\.get\s*\(|\[|\.)|\[\s*['"]arguments['"]\s*\])""", re.M)
+E_TOOL_DEF = re.compile(r"@\w+\.tool\b[^\n]*\n(?:\s*@[^\n]*\n)*\s*(?:async\s+)?def\s+\w+\s*\(([^)]*)\)")
+# The name must END in the secret noun: client_secret / apiKey yes, token_kind / cookie_names no.
+E_SECRET_NAME = re.compile(
+    r"(?i:(?:^|_)(?:password|passwd|secret|token|api_?key|apikey|credentials?|private_?key|authorization|bearer|cookie)s?$)|"
+    r"[a-z0-9](?:Password|Passwd|Secret|Token|ApiKey|Credentials?|PrivateKey|Cookie)s?$")
+
+def _e_interpolates(args, var):
+    """True if a log call's argument text embeds var's raw value (not len(var) etc.)."""
+    v = re.escape(var)
+    # f-string / template-literal placeholders
+    if re.search(r"(?<![{])\{" + v + r"(?:\[[^}\]]*\])?(?:![rsa])?(?::[^}]*)?\}|\$\{" + v + r"\}", args):
+        return True
+    code = re.sub(r"""(['"`])(?:\\.|(?!\1)[^\\])*\1""", '""', args)  # drop string literals
+    return bool(re.search(
+        r"(?:^|[,+%]\s*)" + v + r"\b(?!\s*[(.\[])|"
+        r"\b(?:str|repr|json\.dumps|JSON\.stringify)\(\s*" + v + r"\b", code.strip()))
+
+def rule_secrets_in_logs(path, text, F):
+    if not E_MCP_SERVER.search(text):
+        return
+    # Tool arguments count only once they are kept as session data (written into a
+    # session-keyed store); logging an ordinary argument like host/port is not a leak.
+    args_in = {m.group(1) for m in E_ARG_SOURCE.finditer(text)}
+    for m in E_TOOL_DEF.finditer(text):
+        for p in m.group(1).split(","):
+            p = p.strip().split(":")[0].split("=")[0].strip().lstrip("*")
+            if p and p not in ("self", "ctx", "context"):
+                args_in.add(p)
+    stores = _e_session_stores(text)
+    tainted = {}
+    for v in args_in:
+        if any(re.search(r"\b" + re.escape(s) + r"\s*\[[^\]\n]+\]\s*=\s*" + re.escape(v) + r"\b|"
+                         r"\b" + re.escape(s) + r"\.set\([^,\n]+,\s*" + re.escape(v) + r"\b", text)
+               for s in stores):
+            tainted[v] = "tool argument kept as session data"
+    for name in stores:
+        tainted.setdefault(name, "whole session store")
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*=", text):
+        if E_SECRET_NAME.search(m.group(1)):
+            tainted.setdefault(m.group(1), "secret-named value")
+    if not tainted:
+        return
+    for m in E_LOG_CALL.finditer(text):
+        if _comment_line(linetext(text, m.start())):
+            continue
+        args = call_args(text, m.end() - 1)
+        hits = [v for v in tainted if _e_interpolates(args, v)]
+        if not hits:
+            continue
+        what = ", ".join(f"{v} ({tainted[v]})" for v in hits)
+        add(F, "E2", "MEDIUM",
+            "Sensitive value written raw to logs/stderr",
+            path, text, m.start(),
+            f"log call embeds {what} verbatim; MCP stderr/log files are routinely "
+            f"collected by hosts - log a length, hash or redacted form instead",
+            "VATA:gold-server secrets in logs", "MEDIUM")
+
+E_INJECTION = re.compile(
+    r"ignore\s+(?:all\s+|any\s+)?(?:previous|prior|above|earlier)\s+instructions|"
+    r"disregard\s+(?:all\s+|any\s+)?(?:previous|prior|above|earlier)|"
+    r"(?:reveal|print|show|output|repeat|leak)\s+(?:your\s+|the\s+)?system\s+prompt|"
+    r"\byou\s+are\s+now\s+(?:a|an|in)\b|"
+    r"<\s*/?\s*(?:IMPORTANT|SYSTEM|system[-_]prompt)\s*>|"
+    r"\[\s*INJECT(?:ION)?\s*\]|"
+    r"do\s+not\s+(?:tell|inform|alert)\s+the\s+user", re.I)
+E_STR_LIT = re.compile(r"""(['"`])((?:\\.|(?!\1)[^\\\n])*)\1""")
+E_OUTPUT_CTX = re.compile(
+    r"""['"](?:text|description|content|result|message)['"]\s*:|\b(?:text|description)\s*=|"""
+    r"""\breturn\b|TextContent\s*\(|\bresolve\s*\(""")
+E_MATCHER_CTX = re.compile(r"\bre\.(?:compile|search|match|findall|sub)\s*\(|\bRegExp\s*\(|\.test\s*\(|\bin\s+\w+\.lower\(\)")
+
+def rule_tool_output_injection(path, text, F):
+    if not E_MCP_SERVER.search(text):
+        return
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if _comment_line(line) or _e_is_log_line(line) or E_MATCHER_CTX.search(line):
+            continue
+        ctx = "\n".join(lines[max(0, i - 2):i + 1])
+        if not E_OUTPUT_CTX.search(ctx):
+            continue
+        for sm in E_STR_LIT.finditer(line):
+            im = E_INJECTION.search(sm.group(2))
+            if not im:
+                continue
+            idx = sum(len(l) + 1 for l in lines[:i]) + sm.start()
+            add(F, "E3", "HIGH",
+                "Tool output/description carries a prompt-injection payload",
+                path, text, idx,
+                f"model-visible string contains '{im.group(0)}' - the host LLM reads tool "
+                f"results and descriptions as context and may follow it",
+                "VATA:gold-server tool-output injection", "HIGH")
+            break
+
+RULES = [rule_oauth_authorize, rule_default_creds, rule_middleware_authz,
+         rule_ssrf, rule_excluded_tools, rule_method_scoped_authz,
+         rule_client_issuer_binding,
+         rule_pkce_not_enforced, rule_authcode_replay,
+         rule_cross_tenant_list, rule_fastmcp_auth_default, rule_mcp_sdk_version,
+         rule_session_leak, rule_secrets_in_logs, rule_tool_output_injection]
+
+def scan(root, include_tests, exclude=()):
+    global SCOPED_REPOS, SCANNED_FILES
+    docs = []
+    for path in iter_files(root, include_tests, exclude):
+        try:
+            docs.append((path, path.read_text(errors="ignore")))
+        except Exception:
+            continue
+    rootp = Path(root)
+    excl = [(rootp / e).resolve() for e in exclude]
+    for path in rootp.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.name not in DEP_NAMES and not path.name.startswith("requirements"):
+            continue
+        if any(s in path.parts for s in SKIP_DIR):
+            continue
+        rp = path.resolve()
+        if any(rp == e or e in rp.parents for e in excl):
+            continue
+        try:
+            docs.append((path, path.read_text(errors="ignore")))
+        except Exception:
+            continue
+    SCANNED_FILES = sorted({str(path) for path, _ in docs})
+    SCOPED_REPOS = set()
+    for _, text in docs:
+        for m in A7_SCOPED_CALL.finditer(text):
+            SCOPED_REPOS.add(m.group(1))
+    F = []
+    for path, text in docs:
+        for r in RULES:
+            r(path, text, F)
+    return F
+
+def generate_html_report(findings, target, output_file, payload=None):
+    """Render the report from the completed scan payload.
+
+    Refuses to write a page that cannot state what was tested and how much of it
+    reached a verdict, because a page like that reads as a clean result.
+    """
+    from html import escape
+
+    if not payload or 'report_hash' not in payload or not payload.get('counts'):
+        raise ValueError('HTML report requires a completed scan payload with counts and a report hash')
+
+    counts = payload['counts']
+    coverage = payload.get('coverage')
+    auth = payload.get('authorization') or {}
+
+    if coverage is None:
+        cov_text = 'not computed, zero testable probes'
+    else:
+        cov_text = '%.1f%% of testable probes' % (coverage * 100)
+
+    ex = payload.get('excluded') or []
+    ex_text = ', '.join('%s (%s)' % (e.get('name'), e.get('reason') or 'reason not recorded') for e in ex) if ex else 'none'
+    rows = [
+        ('Scope', payload.get('scope', '')),
+        ('Scan mode', payload.get('scan_mode', '')),
+        ('Probe set', payload.get('probe_set_version', '')),
+        ('Severity calibration', payload.get('severity_calibration_version')
+            or 'n/a (no zero-auth finding in this report)'),
+        ('OWASP mapping', payload.get('owasp_mapping_version', MAPPING_VERSION)),
+        ('Exit contract', payload.get('exit_contract', '')),
+        ('Fail on', payload.get('fail_on', '')),
+        ('Exit code', '%s (%s)' % (payload.get('exit_code'), payload.get('exit_condition', ''))),
+        ('Verdicts', verdict_line(counts)),
+        ('Coverage', cov_text),
+        ('Excluded', ex_text),
+        ('Authorised by', '%s on %s' % (auth.get('authorized_by', 'not recorded'), auth.get('date', ''))),
+        ('Basis', auth.get('basis', 'not recorded')),
+        ('Contact', auth.get('contact', 'not recorded')),
+        ('Assessed by', auth.get('assessed_by', 'not recorded')),
+    ]
+    detail = ''.join('<tr><td>%s</td><td>%s</td></tr>' % (escape(str(k)), escape(str(v))) for k, v in rows)
+    counter = ''.join('<div class="card"><div class="num">%s</div><div>%s</div></div>' % (escape(str(counts.get(k, 0))), escape(k)) for k in ('in_scope', 'attempted', 'PASS', 'FAIL', 'NOT_OBSERVED', 'EXCLUDED', 'NOT_IMPLEMENTED'))
+
+    css = '<style>body{font-family:sans-serif;margin:0;padding:20px;background:#f5f5f5}.container{max-width:1100px;margin:0 auto;background:#fff;border-radius:8px;padding:30px}.summary{display:flex;flex-wrap:wrap;gap:12px;margin:20px 0}.card{min-width:120px;text-align:center;padding:14px;background:#f4f4f4;border-radius:4px}.num{font-size:1.6em;font-weight:bold}.finding{border-left:4px solid #ddd;padding:12px;margin:12px 0}table{border-collapse:collapse;width:100%}td{border-bottom:1px solid #eee;padding:8px;vertical-align:top}td:first-child{width:220px;color:#555}</style>'
+
+    items = payload.get('findings') or findings or []
+    if items:
+        body = ''.join('<div class="finding"><h3>%s - %s: %s</h3><p><strong>Evidence:</strong> %s</p><p><strong>Remediation:</strong> %s</p></div>' % (escape(str(f.get('severity'))), escape(str(f.get('rule', 'N/A'))), escape(str(f.get('title', 'N/A'))), escape(str(f.get('evidence', 'N/A'))), escape(str(f.get('remediation', 'N/A')))) for f in items)
+    else:
+        body = '<p>No findings at or above the reporting threshold.</p>'
+
+    not_tested = payload.get('not_tested') or []
+    gap = ''.join('<li>%s</li>' % escape(str(x)) for x in not_tested) or '<li>none recorded</li>'
+
+    html_content = ''.join([
+        '<!DOCTYPE html><html><head><meta charset=UTF-8><title>mcp-authscan Report</title>',
+        css,
+        '</head><body><div class="container">',
+        '<h1>mcp-authscan Report</h1><p>Target: %s</p>' % escape(str(target)),
+        '<div class="summary">', counter, '</div>',
+        '<h2>Run detail</h2><table>', detail, '</table>',
+        '<h2>Not tested</h2><ul>', gap, '</ul>',
+        '<h2>Findings</h2>', body,
+        "<p>%s</p>" % escape(footer_line(payload)),
+        '<hr><footer><p><strong>Report hash (SHA256):</strong><br><code>%s</code></p>' % escape(str(payload['report_hash'])),
+        '<p>Hash covers: %s.</p><p>Evidence and remediation text are outside the hash.</p></footer>' % escape(', '.join(payload.get('hash_covers') or ['not recorded'])),
+        '</div></body></html>',
+    ])
+
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    return output_file
+
+
+def open_tee(path):
+    fh = open(path, "w", encoding="utf-8")
+    out = sys.stdout
+    t = type("T", (), {})()
+    t.write = lambda x: (out.write(x), fh.write(x), len(x))[2]
+    t.flush = lambda: (out.flush(), fh.flush())
+    return t
+
+
+def main():
+    ap = argparse.ArgumentParser(description=f"VATA mcp_authscan v{VERSION}")
+
+
+    ap.add_argument("target", help="path to MCP server repo/dir OR http(s)://host:port for live scanning")
+    ap.add_argument("--json", action="store_true", help="emit JSON + report sha256")
+    ap.add_argument("--verbose", "-v", action="store_true",
+                    help="print [DEBUG] diagnostics (discovered endpoints, token Cache-Control) to stderr")
+    ap.add_argument("--html", action="store_true", help="emit HTML report (shareable, print-friendly)")
+    ap.add_argument("--sarif", action="store_true", help="emit SARIF 2.1.0 (GitHub code scanning)")
+    ap.add_argument("--include-tests", action="store_true", help="also scan test files")
+    ap.add_argument("--exclude", action="append", default=[], metavar="DIR",
+                    help="skip a directory relative to target (repeatable)")
+    ap.add_argument("--output", "-o", metavar="FILE",
+                    help="output file for HTML/JSON report")
+    ap.add_argument("--fail-on", choices=["critical", "high", "medium"], default="high",
+                    help="exit 1 if findings at or above this severity are found (default: high)")
+    ap.add_argument("--acquire-token", action="store_true",
+                    help="token-cors [4]: obtain a real access token through an attended authorization-code "
+                         "exchange (PKCE S256, dynamically registered or MCPAUTHSCAN_CLIENT_ID client): the "
+                         "scanner prints an authorization URL to stderr, you approve in a browser and paste "
+                         "the redirect address back on stdin; it then tests the cross-origin read on the "
+                         "token response. The token is revoked before the report and never printed. Off by "
+                         "default; without it the scanner never reads stdin")
+    ap.add_argument("--surface-baseline", metavar="FILE",
+                    help="pin or compare the MCP surface the server declares; a missing file is written, an existing file is diffed")
+    ap.add_argument("--allow-private", action="store_true",
+                    help="allow scanning private/loopback targets (127.0.0.0/8, 10.0.0.0/8, etc) - opt-in for lab and staging")
+
+    # Authorization and compliance tracking
+    ap.add_argument("--authorized-by", metavar="NAME",
+                    help="person who authorized the scan")
+    ap.add_argument("--client-name", metavar="NAME",
+                    help="client organization name")
+    ap.add_argument("--client-title", metavar="TITLE",
+                    help="authorizer's title/role at client")
+    ap.add_argument("--auth-basis", metavar="BASIS",
+                    help="authorization basis (VRP, contract, scope document)")
+    ap.add_argument("--ticket-ref", metavar="REF",
+                    help="client's ticket/tracking reference")
+    ap.add_argument("--allow-host", action="append", default=[], help="authorize a host for discovery (repeatable)")
+    ap.add_argument("--rate-limit-count", type=int, metavar="N", help="authorise at most N requests for the rate limit probe")
+    ap.add_argument("--rate-limit-window", type=int, metavar="SECONDS", help="the window those N requests fall inside")
+    ap.add_argument("--contact", metavar="EMAIL", required=True,
+                    help="contact email for scan authorization")
+    ap.add_argument("--scope", metavar="SCOPE",
+                    help="scan scope (what was tested)")
+
+    args = ap.parse_args()
+    if args.output and not (args.html or args.json):
+        sys.stdout = open_tee(args.output)
+
+    # Discovery fetches honour the same opt-in as target validation: with
+    # --allow-private the operator has explicitly authorized local targets, so
+    # target-supplied discovery URLs are allowed to resolve there too.
+    global ALLOW_PRIVATE_TARGETS
+    ALLOW_PRIVATE_TARGETS = bool(getattr(args, "allow_private", False))
+    # Also set it in oauth_probes_v2 module
+    import mcp_authscan.oauth_probes_v2 as oauth_probes_v2
+    oauth_probes_v2.ALLOW_PRIVATE_TARGETS = ALLOW_PRIVATE_TARGETS
+    oauth_probes_v2.ACQUIRE_TOKEN = bool(getattr(args, "acquire_token", False))
+    oauth_probes_v2.ATTENDED_WAIT_SECONDS = 0.0
+    _common.VERBOSE = bool(getattr(args, "verbose", False))
+    # Initialize allowed hosts with target host; --allow-host adds more
+    global ALLOWED_HOSTS
+    target_host = urlparse(args.target).hostname or args.target
+    ALLOWED_HOSTS = {target_host.lower()}
+    for host in getattr(args, "allow_host", []):
+        ALLOWED_HOSTS.add(host.lower())
+    import mcp_authscan.monolith as _realmono
+    _realmono.ALLOWED_HOSTS = ALLOWED_HOSTS
+
+    # AUTHORIZATION CHECK: refuse to run without authorization metadata
+    if not args.authorized_by:
+        print("[!] ERROR: --authorized-by is required", file=sys.stderr)
+        print("[!] Scans must be authorized. Usage: --authorized-by 'Name' --auth-basis 'basis' --contact 'email@example.com'", file=sys.stderr)
+        sys.exit(2)
+
+    if not args.auth_basis:
+        print("[!] ERROR: --auth-basis is required", file=sys.stderr)
+        sys.exit(2)
+
+    if not args.contact:
+        print("[!] ERROR: --contact is required", file=sys.stderr)
+        sys.exit(2)
+
+    # Validate authorization metadata: all fields must be present and non-empty
+    # Exit 2 (authorization refused) triggers on missing or empty fields only—not on placeholder words
+    if not args.authorized_by or not args.auth_basis or not args.contact:
+        print(f"[!] ERROR: Authorization fields are required and must be non-empty.", file=sys.stderr)
+        print(f"[!]   --authorized-by: {args.authorized_by or '(missing)'}", file=sys.stderr)
+        print(f"[!]   --auth-basis: {args.auth_basis or '(missing)'}", file=sys.stderr)
+        print(f"[!]   --contact: {args.contact or '(missing)'}", file=sys.stderr)
+        sys.exit(2)
+
+    # Auto-detect: live server (http(s)://) or source code directory?
+    scan_mode = None
+    scan_start_time = time.time()
+    probes_attempted = 0
+    probes_passed = 0
+    probes_not_observed = 0
+    probes_observed = 0
+    probes_excluded = 0
+    probes_not_implemented = 0
+    discovery_info = None
+    repo_url = None
+    branch = None
+    commit_sha_long = None
+    commit_sha_short = None
+    oauth_records = []  # Initialize for all paths
+    probe_results = []
+
+    is_http_target = args.target.startswith("http://") or args.target.startswith("https://")
+    # Target validation, one refusal path (exit 3): neither an existing path nor a URL, and a private
+    # address when --allow-private is not set (opt-in DNS rebinding protection)
+    try:
+        missing_scheme(args.target)
+        if is_http_target and not args.allow_private:
+            p = urlparse(args.target)
+            if p.hostname:
+                validate_target_host(p.hostname, p.port or (443 if args.target.startswith("https") else 80))
+    except ValueError as e:
+        print(f"[!] Target validation failed: {e}", file=sys.stderr)
+        sys.exit(3)
+
+    if is_http_target:
+        try:
+            result_tuple = scan_live_server(args.target, allow_private=args.allow_private, rate_limit_count=args.rate_limit_count, rate_limit_window=args.rate_limit_window)
+            F, server_reachable, probe_status, discovery_info, oauth_result = result_tuple
+            if isinstance(oauth_result, tuple) and len(oauth_result) == 2:
+                oauth_records, probe_results = oauth_result
+            else:
+                raise ValueError(f"Expected (oauth_records, probe_results) tuple, got {type(oauth_result)}: {oauth_result}")
+        except EgressRefusalError as e:
+            print(f"[!] Scope enforcement: {e}", file=sys.stderr)
+            sys.exit(6)
+        except HTTPError as e:
+            print(f"[!] Internal scan error: {type(e).__name__}: {e}", file=sys.stderr)
+            sys.exit(4)
+        except (URLError, socket.timeout, ConnectionError) as e:
+            print(f"[!] Target unreachable: {args.target} stopped answering ({getattr(e, 'reason', e)}). Scan aborted.", file=sys.stderr)
+            sys.exit(3)
+        except Exception as e:
+            print(f"[!] Internal scan error: {type(e).__name__}: {e}", file=sys.stderr)
+            sys.exit(4)
+        scan_mode = "LIVE_ENDPOINT_ASSESSMENT"
+
+        # Log discovery results only when discovery actually returned OAuth endpoints
+        if discovery_info and discovery_info.get('endpoints'):
+            print(f"[+] OAuth discovery successful", file=sys.stderr)
+            if 'method' in discovery_info:
+                print(f"    Method: {discovery_info['method']}", file=sys.stderr)
+            if 'endpoints' in discovery_info:
+                print(f"    Endpoints: {len(discovery_info['endpoints'])} discovered", file=sys.stderr)
+            if 'discovered_hosts' in discovery_info:
+                print(f"    Hosts: {', '.join(discovery_info['discovered_hosts'])}", file=sys.stderr)
+
+        # Check for zero-auth vulnerability
+        if discovery_info and discovery_info.get("status") == "ZERO_AUTH_DETECTED":
+            print(f"[!] ZERO-AUTH VULNERABILITY: MCP server is accessible without authentication", file=sys.stderr)
+            findings = [{
+                "rule": "ZERO-AUTH",
+                "severity": discovery_info.get("severity", "MEDIUM"),
+                "severity_basis": discovery_info.get("severity_basis",
+                    "zero-auth endpoint; severity basis not recorded"),
+                "title": "Unauthenticated MCP endpoint",
+                "evidence": "POST /initialize responded with HTTP 200 without authentication",
+                "confidence": "HIGH",
+                "file": args.target,
+                "line": 0,
+                "ref": "ZERO-AUTH",
+                "is_live_finding": True,
+                "request_method": "POST",
+                "request_body": discovery_info.get("request_body", ""),
+                "response_status": discovery_info.get("response_status", 200),
+                "response_body": discovery_info.get("response_body", ""),
+                "response_preview": discovery_info.get("response_preview", "HTTP 200 - MCP endpoint accessible"),
+                "interpretation": "MCP server requires no authentication. Any client can call tools, resources and prompts.",
+                "remediation": "Implement authentication and authorization controls for all MCP endpoints."
+            }]
+            probe_status = {'attempted': 0, 'passed': 0, 'failed': 0, 'not_observed': 0, 'observation': 0}
+            from mcp_authscan.target_probes import counts as _tcounts
+            probe_status = _tcounts(oauth_records) if oauth_records else probe_status
+            F = findings + list(F)
+
+        if is_http_target:
+            from mcp_authscan import content_probe
+            try:
+                cobs = content_probe.observe(
+                    args.target, token=os.environ.get("MCPAUTHSCAN_TOKEN") or None, allow_private=args.allow_private)
+            except EgressRefusalError as e:
+                print("[!] %s" % e, file=sys.stderr)
+                sys.exit(6)
+            F.extend(cobs.get("findings") or [])
+            args.content_observed = {k: cobs.get(k) for k in ("version", "inspected", "reasons")}
+
+        # Check for discovery incomplete (OAuth detected but discovery chain failed)
+        if discovery_info and discovery_info.get("status") == "DISCOVERY_INCOMPLETE":
+            print(f"[!] Discovery chain failed; no OAuth endpoints discovered. Cannot complete scan.", file=sys.stderr)
+            pass  # HALTED: fall through so the report prints and decide_exit returns 5
+
+        if not server_reachable:
+            # Distinguish failure modes by discovery_info status
+            if discovery_info is None:
+                # Can't connect at all
+                print(f"[!] Target unreachable. Scan aborted.", file=sys.stderr)
+                sys.exit(3)
+            elif discovery_info.get("status") == "PREFLIGHT_FAILED":
+                # Preflight failed (target not MCP), but OAuth assessment may have succeeded
+                if oauth_records:
+                    pass  # Continue - OAuth records exist
+                else:
+                    # No OAuth either - fail
+                    sys.exit(4)
+            else:
+                # Other error (e.g., connection timeout)
+                sys.exit(3)
+        else:
+            # Server reachable: use actual probe status counts from scanner
+            # This correctly distinguishes:
+            # - PASSED: 401/403 (server correctly rejected)
+            # - NOT_OBSERVED: 404/5xx (endpoint doesn't exist or error)
+            # - FINDINGS: vulnerabilities detected
+            probes_attempted = probe_status.get('attempted', 0)
+            if not probes_attempted and not F and (discovery_info or {}).get("status") != "DISCOVERY_INCOMPLETE":
+                print(f"[!] Refused: no probes attempted against {args.target}; no report produced", file=sys.stderr)
+                sys.exit(3)
+            if not probes_attempted:
+                print(f"[!] No probe ran against {args.target}; reporting content findings only", file=sys.stderr)
+            probes_passed = probe_status['passed']
+            probes_not_observed = probe_status['not_observed']
+            probes_observed = probe_status.get('observation', 0)
+            probes_excluded = probe_status.get('excluded', 0)
+            probes_not_implemented = probe_status.get('not_implemented', 0)
+
+        # Verify accounting before rendering
+        # Attempted = probes actually sent (may exclude those with unmet prerequisites)
+        # Excluded = probes never sent (prerequisite_met=False)
+        # Not implemented = probes not yet built, never sent
+        # Total probe set is whatever the assessment declared for this run
+        from mcp_authscan.counts import count_probes as _cp
+        _c = _cp(oauth_records if oauth_records is not None else [])
+        probe_status = {"attempted": _c["attempted"], "passed": _c["PASS"], "failed": _c["FAIL"], "not_observed": _c["NOT_OBSERVED"], "excluded": _c["EXCLUDED"], "not_implemented": _c["NOT_IMPLEMENTED"], "observation": 0} if _c else probe_status
+        attempted = probe_status.get("attempted", 0)
+        excluded = probe_status.get("excluded", 0)
+        not_implemented = probe_status.get("not_implemented", 0)
+        passed = probe_status.get("passed", 0)
+        failed = probe_status.get("failed", 0)
+        not_observed = probe_status.get("not_observed", 0)
+        observation = probe_status.get("observation", 0)
+
+        # Verify: verdicts must sum to attempted
+        verdicts = passed + failed + not_observed + observation
+        if verdicts != attempted:
+            print(f"[!] ACCOUNTING ERROR: {verdicts} verdicts (expected {attempted} attempted)", file=sys.stderr)
+            sys.exit(4)  # invariant violation is a scan error, whether or not anything was found
+
+        # Verify: attempted + excluded + not_implemented = declared probe count
+        from mcp_authscan.counts import count_probes as _cp
+        _c = _cp(oauth_records if oauth_records is not None else [])
+        declared_total = _c["in_scope"] if _c else 0
+        probe_status = {"attempted": _c["attempted"], "passed": _c["PASS"], "failed": _c["FAIL"], "not_observed": _c["NOT_OBSERVED"], "excluded": _c["EXCLUDED"], "not_implemented": _c["NOT_IMPLEMENTED"], "observation": 0} if _c else probe_status
+        if attempted + excluded + not_implemented != declared_total:
+            print(f"[!] ACCOUNTING ERROR: {attempted} attempted + {excluded} excluded + {not_implemented} not implemented = {attempted + excluded + not_implemented} (expected {declared_total})", file=sys.stderr)
+            sys.exit(4)  # invariant violation is a scan error, whether or not anything was found
+
+        # Update probes_attempted in case it was 0 before
+        probes_attempted = attempted
+
+        # Incomplete assessment names the probes that could not observe their property; the exit contract decides the code.
+        # Incomplete means a probe tried to observe its property and could not (NOT_OBSERVED).
+        # EXCLUDED (prerequisite absent on this server) is named in the report, not warned on here.
+        if scan_mode == "LIVE_ENDPOINT_ASSESSMENT" and not_observed > 0:
+            not_observed_names = [r.name for r in oauth_records if r.status == "NOT_OBSERVED"]
+            print(f"[!] Incomplete assessment: {not_observed} probe(s) tried and could not observe their property (NOT_OBSERVED): {', '.join(not_observed_names)}", file=sys.stderr)
+
+    else:
+        print(f"[*] Scanning source code directory", file=sys.stderr)
+        F = scan(args.target, args.include_tests, args.exclude)
+        scan_mode = "SOURCE_CODE_ASSESSMENT"
+        probes_attempted = len(F)  # For source code, probes = findings flagged
+        probes_passed = probes_attempted  # All checks ran
+        probe_results = []  # No detailed probe results for source code scan
+        probe_status = {'attempted': 0, 'passed': 0, 'failed': 0, 'not_observed': 0, 'findings': 0}
+        discovery_info = None
+
+    # Excludes the attended --acquire-token wait on stdin: Elapsed Time describes the scan.
+    elapsed_seconds = max(0.0, time.time() - scan_start_time - oauth_probes_v2.ATTENDED_WAIT_SECONDS)
+    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    F.sort(key=lambda x: (order.get(x["severity"], 9), x["file"], x["line"]))
+
+    # Generate report with authorization block if credentials provided
+    report_lines = []
+    surface_drift = None
+    if scan_mode == "LIVE_ENDPOINT_ASSESSMENT" and getattr(args, "surface_baseline", None):
+        from mcp_authscan.surface_drift import run_surface_drift
+        drift_found, surface_drift = run_surface_drift(args.target, args.surface_baseline, allow_private=ALLOW_PRIVATE_TARGETS, allowed_hosts=sorted(ALLOWED_HOSTS))
+        st = surface_drift.get("state")
+        rs = surface_drift.get("reason")
+        bl = surface_drift.get("baseline")
+        if st == "pinned":
+            print("SURFACE BASELINE: none at %s, wrote one, nothing compared" % bl)
+        elif st == "unchanged":
+            print("SURFACE BASELINE: unchanged since %s" % bl)
+        elif st == "drift":
+            print("SURFACE BASELINE: changed since %s, %s change(s)" % (bl, surface_drift.get("changes")))
+        else:
+            print("SURFACE BASELINE: not compared (%s: %s)" % (st, rs))
+        # F is the list the report, the JSON payload and decide_exit all read,
+        # so drift goes into F, re-sorted to keep severity order.
+        if drift_found:
+            F.extend(drift_found)
+            F.sort(key=lambda x: (order.get(x["severity"], 9), x["file"], x["line"]))
+    auth_block = ""
+    metadata_block = ""
+    findings_by_severity = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    for finding in F:
+        sev = finding.get("severity", "LOW")
+        if sev in findings_by_severity:
+            findings_by_severity[sev] += 1
+
+    if args.authorized_by and args.auth_basis and args.contact:
+        from mcp_authscan.authorization import ScanAuthorization, ScanMetadata, report_header_with_authorization
+
+        auth = ScanAuthorization(
+            authorized_by=args.authorized_by,
+            client_name=args.client_name,
+            client_title=args.client_title,
+            auth_basis=args.auth_basis,
+            ticket_ref=args.ticket_ref,
+            contact=args.contact
+        )
+
+        # For source code assessments, extract git metadata and count files
+        files_examined = None
+        files_total = None
+        files_excluded = []
+
+        if scan_mode == "SOURCE_CODE_ASSESSMENT" and not args.target.startswith("http"):
+            repo_url, branch, commit_sha_long = get_git_metadata(args.target)
+            if commit_sha_long:
+                commit_sha_short = commit_sha_long[:12]
+
+            # Count files the scanner actually read (SRC_EXT sources and DEP_NAMES manifests), not files with findings
+            files_examined = len(SCANNED_FILES)
+            if not files_examined:
+                print(f"[!] Refused: no files examined in {args.target}; no report produced", file=sys.stderr)
+                sys.exit(3)
+
+            # Reconcile file counts: excluded vs. irrelevant vs. analyzed
+            try:
+                target_path = Path(args.target).resolve()
+                excluded_by_category = 0
+                recognized_irrelevant = 0
+                total_src = 0
+
+                for file in target_path.rglob("*"):
+                    if not file.is_file():
+                        continue
+
+                    # Count the same files scan() reads: SRC_EXT sources plus dependency manifests
+                    if file.suffix not in SRC_EXT and file.name not in DEP_NAMES and not file.name.startswith("requirements"):
+                        continue
+
+                    total_src += 1
+
+                    # Check if in excluded directory
+                    if any(part in SKIP_DIR for part in file.parts):
+                        excluded_by_category += 1
+                        continue
+
+                    # Check if test file or irrelevant pattern
+                    if (any(part in TEST_DIR for part in file.parts) or
+                        TEST_FILE.search(file.name) or
+                        MINIFIED_FILE.search(file.name)):
+                        recognized_irrelevant += 1
+
+                files_total = total_src
+                # Report as: "113 analyzed; 189 excluded by category, 48 recognized as irrelevant"
+                if excluded_by_category > 0 or recognized_irrelevant > 0:
+                    files_examined_detail = f"{files_examined} analyzed"
+                    exclusions = []
+                    if excluded_by_category > 0:
+                        exclusions.append(f"{excluded_by_category} excluded by category")
+                    if recognized_irrelevant > 0:
+                        exclusions.append(f"{recognized_irrelevant} recognized as irrelevant")
+                    files_excluded = [files_examined_detail] + exclusions
+            except (OSError, IOError, PermissionError):
+                files_excluded = list(SKIP_DIR)
+
+        from mcp_authscan.target_probes import RATE_LIMIT_PROBE_ID as _rl_id
+        from mcp_authscan.report_copy import rate_limit_line
+        _rl = next((r for r in oauth_records if r.probe_id == _rl_id), None)
+        _rate_line = rate_limit_line(_rl)
+        # Define what wasn't tested based on assessment type
+        not_tested = []
+        if scan_mode == "SOURCE_CODE_ASSESSMENT":
+            not_tested = [
+                "Live OAuth flows and endpoint behavior",
+                "Runtime configuration and deployment settings",
+                "Infrastructure setup (TLS, CORS, reverse proxies, WAF)",
+                "Dependency versions at runtime",
+                "Environment secrets and credentials",
+                "Network-level access controls",
+                "What the deployed service actually does vs. code"
+            ]
+        elif scan_mode == "LIVE_ENDPOINT_ASSESSMENT":
+            not_tested = [
+                "Source code review and design patterns",
+                "Dependency vulnerabilities (CVE check)",
+                "Secrets in repository history",
+                "Comments and documentation",
+                "Rate limiting: not tested in this scan. Throttling is reported only when a 429 with Retry-After is observed inside an authorised request budget, and a limit enforced outside the application is not visible here"
+            ]
+            # If we did OAuth discovery, note that MCP resource endpoint itself wasn't tested
+            if discovery_info and discovery_info.get('status') != 'DISCOVERY_INCOMPLETE':
+                not_tested.insert(0, "MCP resource endpoint behavior (only OAuth server configuration assessed via RFC 9728 → RFC 8414 discovery)")
+                if discovery_info and discovery_info.get("authorization_servers"):
+                    not_tested.insert(0, "Authorization servers named in the resource metadata (%s) were contacted only where the written authorization covered that host; any server named there and not assessed carries no verdict, and the servers actually assessed are listed under client registration" % ", ".join(discovery_info["authorization_servers"]))
+
+        if scan_mode == "LIVE_ENDPOINT_ASSESSMENT" and _rl is not None:
+            not_tested = [x for x in not_tested if not x.startswith("Rate limiting")]
+            if _rl.status != "PASS":
+                not_tested.append(_rate_line)
+        metadata = ScanMetadata(
+            scope=args.scope or "OAuth configuration assessment",
+            probe_set_version=PROBE_SET_VERSION,
+            not_tested=not_tested,
+            target=args.target,
+            repo_url=repo_url,
+            branch=branch,
+            commit_sha=commit_sha_short,
+            files_examined=files_examined,
+            files_total=files_total,
+            files_excluded=files_excluded,
+            probes_attempted=probes_attempted,
+            probes_passed=probes_passed,
+            # Live scan: count FAIL probe records; source scan has no records, keeps findings count
+            probes_failed=(
+                sum(1 for r in oauth_records if r.status == "FAIL")
+                if oauth_records
+                else (len(F) if scan_mode == "SOURCE_CODE_ASSESSMENT" else None)
+            ),
+            probes_not_observed=probes_not_observed,
+            probes_excluded=probes_excluded,
+            probes_not_implemented=probes_not_implemented,
+            elapsed_seconds=elapsed_seconds,
+            discovery_info=discovery_info
+        )
+
+        report_lines.append("=" * 80)
+        report_lines.append("MCP-AUTHSCAN SECURITY REPORT")
+        report_lines.append("=" * 80)
+        report_lines.append("")
+        # Get commit hash for lineage verification
+        try:
+            commit_hash = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd="/home/lhmisme/mcp-authscan", text=True).strip()
+        except:
+            commit_hash = "unknown"
+        report_lines.append(f"Scanner: mcp-authscan v{VERSION} ({commit_hash})")
+        report_lines.append(f"Scan Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
+        report_lines.append("Repository: https://github.com/LHMisme420/mcp-authscan")
+        report_lines.append("")
+
+        # Add scan verdict if incomplete
+        if discovery_info and discovery_info.get('status') == 'DISCOVERY_INCOMPLETE':
+            report_lines.append("⚠ SCAN INCOMPLETE")
+            report_lines.append("-" * 80)
+            report_lines.append("MCP server detected, but OAuth endpoint discovery failed.")
+            report_lines.append("No probes executed. Assessment incomplete.")
+            report_lines.append("-" * 80)
+            report_lines.append("")
+
+        report_lines.extend(auth.format_block().split("\n"))
+        report_lines.append("")
+        report_lines.append("ASSESSMENT MODE")
+        report_lines.append("-" * 80)
+        if scan_mode == "LIVE_ENDPOINT_ASSESSMENT":
+            report_lines.append("Type: LIVE ENDPOINT TESTING")
+            report_lines.append("Method: Runtime probing of live MCP server endpoints")
+            report_lines.append("Scope: Network-based assessment of running server")
+        else:
+            report_lines.append("Type: SOURCE CODE ASSESSMENT")
+            report_lines.append("Method: Static analysis of codebase for OAuth/security patterns")
+            report_lines.append("Scope: Code repository examination")
+        report_lines.append("-" * 80)
+        report_lines.append("")
+        report_lines.extend(metadata.format_block().split("\n"))
+        report_lines.append("")
+
+        # Add fixture disclaimer for localhost/test targets
+        parsed_target = urlparse(args.target) if args.target.startswith("http") else None
+        if parsed_target and parsed_target.hostname in ["127.0.0.1", "localhost", "[::1]"]:
+            report_lines.append("⚠ LOOPBACK TARGET")
+            report_lines.append("-" * 80)
+            report_lines.append("Target is a loopback address on the machine that ran the scan.")
+            report_lines.append("Results describe that local instance only, not any deployed or hosted version.")
+            report_lines.append("-" * 80)
+            report_lines.append("")
+
+        # Where probes 7 and 8 got their client, client removal and token revocation (no secrets kept)
+        for entry in oauth_probes_v2.CLIENT_REPORTS:
+            report_lines.append("CLIENT REGISTRATION")
+            report_lines.append("-" * 80)
+            report_lines.append(f"Authorization Server: {entry['authorization_server']}")
+            report_lines.append("Client Registered: %s" % ("yes" if entry["client_registered"] else "no"))
+            report_lines.append(f"Registration: {entry['registration']}")
+            for t in entry.get("redirect_candidates_tried") or []:
+                report_lines.append(f"  Redirect Candidate: {t['redirect_uri']}: {t['result']}")
+            report_lines.append(f"Client Source: {entry['client_source']}")
+            if entry["client_id"]:
+                report_lines.append(f"Client ID: {entry['client_id']}")
+            report_lines.append(f"Redirect URI Used: {entry['redirect_uri']}")
+            report_lines.append(f"Client Removal: {entry['client_removal']}")
+            if entry.get("token_revocation_unconfirmed"):
+                report_lines.append("Token Status: revocation not confirmed for %s (%s). Revoke on the server."
+                                    % (", ".join(entry.get("token_types_unconfirmed") or []),
+                                       entry["token_revocation"]))
+            elif entry.get("token_revocation_unconfirmed") is False:
+                report_lines.append("Token Status: revoked")
+            else:
+                report_lines.append("Token Status: none acquired through client registration (token-audience probe mints separately, see probe 11)")
+            report_lines.append("-" * 80)
+            report_lines.append("")
+
+        report_lines.append("FINDINGS SUMMARY")
+        report_lines.append("-" * 80)
+        for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+            report_lines.append(f"  {sev}: {findings_by_severity[sev]}")
+        report_lines.append(f"  TOTAL: {len(F)}")
+        report_lines.append("-" * 80)
+        report_lines.append("")
+
+    # Build canonical payload dict BEFORE rendering (for integrity: hash covers displayed values)
+    # Serialize oauth_records into probes array
+    probes = []
+    # Serialize ProbeRecord objects using their as_dict() method
+    # Exclude headers that vary between runs (Date, ETag, etc.)
+    varying_headers = {
+                "date", "etag", "set-cookie", "server", "x-powered-by", "x-frame-options",
+                "cf-ray", "x-deno-trace-id", "report-to", "x-trace-id", "x-request-id",
+                "via", "age", "x-cache", "content-length"
+            }
+    for record in oauth_records:
+        probe = record.as_dict()
+        if "headers_observed" in probe and probe["headers_observed"]:
+            probe["headers_observed"] = {
+                k: v for k, v in probe["headers_observed"].items()
+                if k.lower() not in varying_headers
+            }
+        probes.append(probe)
+
+    
+
+    canonical_payload = {
+        "surface_drift": surface_drift,
+        "probes": probes,
+        "target": args.target,
+        "scan_mode": scan_mode,
+        "discovery_status": (discovery_info or {}).get("status"),
+        "probe_set_version": PROBE_SET_VERSION,
+        "severity_calibration_version": (
+            SEVERITY_CALIBRATION_VERSION
+            if (discovery_info or {}).get("status") == "ZERO_AUTH_DETECTED" else None),
+        "owasp_mapping_version": MAPPING_VERSION,
+        "probes_attempted": probes_attempted,
+        "probes_passed": probes_passed,
+        "probes_failed": (
+            sum(1 for r in oauth_records if r.status == "FAIL")
+            if oauth_records
+            else (len(F) if scan_mode == "SOURCE_CODE_ASSESSMENT" else None)
+        ),
+        "probes_observed": probes_observed,
+        "probes_not_observed": probes_not_observed,
+        "probes_excluded": probes_excluded,
+        "findings_count": len(F),
+        "findings": F,
+    }
+    if args.authorized_by:
+        canonical_payload["authorization"] = {
+            "authorized_by": args.authorized_by,
+            "date": __import__("datetime").datetime.now().strftime("%Y-%m-%d"),
+            "basis": args.auth_basis,
+            "contact": args.contact,
+            "assessed_by": "Leroy H. Mason",  # Fixed assessor for now
+        }
+    if commit_sha_long:
+        canonical_payload["commit_sha"] = commit_sha_long
+
+    # Hash the canonical payload (this is what the report signature covers)
+    # Counts from count_probes(), the same function the printed summary counts with. Its keys come
+    # from a set, so their order varies per process; fix the JSON order to the one reports always had.
+    counts = count_probes(oauth_records)
+    _COUNT_KEYS = ("in_scope", "attempted", "PASS", "FAIL", "NOT_OBSERVED", "EXCLUDED", "NOT_IMPLEMENTED")
+    assert set(counts) == set(_COUNT_KEYS), sorted(counts)
+    counts = {k: counts[k] for k in _COUNT_KEYS}
+    canonical_payload["counts"] = counts
+    # Coverage over the testable probes (in_scope - EXCLUDED), from counts.coverage() like the printed line
+    halted = bool(discovery_info and discovery_info.get("status") == "DISCOVERY_INCOMPLETE")
+    zero_testable = False
+    try:
+        canonical_payload["coverage"] = round(coverage(counts), 4)
+    except CoverageError:
+        # Zero testable probes: no coverage number at all; routed to exit 5 below
+        canonical_payload["coverage"] = None
+        zero_testable = True
+    if halted:
+        canonical_payload["coverage"] = None
+        canonical_payload["coverage_withheld"] = "discovery did not complete"
+    canonical_payload["completed"] = not halted
+    canonical_payload["not_implemented"] = [r.name for r in oauth_records if r.status == "NOT_IMPLEMENTED"]
+    excl_raw = [{"name": r.name, "reason": getattr(r, "limitation", "") or "; ".join(getattr(r, "prerequisites", ()) or ()) or "not recorded"} for r in oauth_records if r.status == "EXCLUDED"]
+    excl_keys = []
+    excl_out = []
+    for d in excl_raw:
+        k = (d["name"], d["reason"])
+        if k not in excl_keys:
+            excl_keys.append(k)
+            excl_out.append({"name": k[0], "reason": k[1]})
+    canonical_payload["excluded"] = excl_out
+    canonical_payload["scope"] = args.scope or "OAuth authorization server configuration for %s" % args.target
+    canonical_payload["not_tested"] = list(metadata.not_tested or [])
+    for key in ("probes_attempted", "probes_passed", "probes_failed", "probes_observed", "probes_not_observed", "probes_excluded"):
+        canonical_payload.pop(key, None)
+    
+    canonical_payload["content_observed"] = getattr(args, "content_observed", {})
+    exit_code, exit_condition = decide_exit(F, probe_status, scan_mode, args.fail_on, zero_testable, halted=halted)
+    canonical_payload["exit_contract"] = EXIT_CONTRACT
+    canonical_payload["hash_scheme"] = HASH_SCHEME
+    canonical_payload["run_started_at"] = datetime.fromtimestamp(scan_start_time, timezone.utc).isoformat(timespec="seconds")
+    canonical_payload["exit_condition"] = exit_condition
+    canonical_payload["exit_code"] = exit_code
+    canonical_payload["fail_on"] = args.fail_on
+    # The hash covers the verdict structure only. Evidence and detail prose can carry
+    # values the server generates per run, so it is excluded by construction here
+    # rather than redacted case by case.
+    HASHED_KEYS = (
+        "target", "scan_mode", "probe_set_version", "probes", "counts", "coverage", "completed",
+        "not_implemented", "not_tested", "scope", "exit_contract", "exit_condition",
+        "exit_code", "fail_on", "authorization", "hash_scheme",
+    )
+    hashed = {k: canonical_payload[k] for k in HASHED_KEYS if k in canonical_payload}
+    if isinstance(hashed.get("probes"), list):
+        hashed["probes"] = sorted(str(p) for p in hashed["probes"])
+    hashed["findings"] = sorted(
+        ({k: f[k] for k in ("severity", "rule", "title", "endpoint", "severity_basis") if k in f} for f in F),
+        key=lambda d: json.dumps(d, sort_keys=True),
+    )
+    payload_json = json.dumps(hashed, sort_keys=True)
+    payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
+    canonical_payload["report_hash"] = payload_hash
+    canonical_payload["hash_covers"] = sorted(hashed)
+    # Added after hashing: server-issued client ids differ on every run (PROBE_CONTRACT.md).
+    canonical_payload["client_registration"] = [dict(e) for e in oauth_probes_v2.CLIENT_REPORTS]
+    from mcp_authscan.tools_digest_probe import report_payload as tools_digest_report
+    try:
+        canonical_payload["tools_digest"] = tools_digest_report(args.target, token=os.environ.get("MCPAUTHSCAN_TOKEN") or None, allowed_hosts=sorted(ALLOWED_HOSTS))
+    except EgressRefusalError as e:
+        print("[!] %s" % e, file=sys.stderr)
+        canonical_payload["tools_digest"] = {"captured": False, "endpoint": args.target, "reason": "egress refused at capture"}
+
+    if args.html:
+        html_file = generate_html_report(F, args.target, args.output or "mcp-authscan-report.html", canonical_payload)
+        print(f"[+] HTML report saved to {html_file}")
+    elif args.sarif:
+        print(json.dumps(to_sarif(F, args.target), indent=2))
+    elif args.json:
+        report_json = json.dumps(canonical_payload, indent=2)
+        if args.output:
+            # --output is documented as the HTML/JSON report file; stdout keeps the report too.
+            with open(args.output, "w", encoding="utf-8") as fh:
+                fh.write(report_json + "\n")
+            print(f"[+] JSON report saved to {args.output}", file=sys.stderr)
+        print(report_json)
+    else:
+        # Text output with optional authorization header
+        # Check for discovery incomplete status
+        if discovery_info and discovery_info.get("status") == "DISCOVERY_INCOMPLETE":
+            print("DISCOVERY STATUS")
+            print("-" * 80)
+            print("PREFLIGHT CHECK: PASSED")
+            print("  POST initialize answered with an MCP JSON-RPC response")
+            print("  This confirms an MCP server with OAuth exists at the target path.")
+            print("")
+            print("DISCOVERY CHAIN: INCOMPLETE")
+            print("  RFC 9728 → RFC 8414 discovery attempted but did not complete.")
+            print("  Unable to discover OAuth endpoint URLs (token, authorize, etc.)")
+            print("  Cannot proceed without discovered endpoint URLs.")
+            print("")
+            print("PROBES: NOT RUN")
+            print("  All 12 probes marked NOT_OBSERVED (no endpoints to test)")
+            print("-" * 80)
+            print("")
+            # A halted scan still has content findings (drift, static rules),
+            # so list them rather than reporting an incomplete scan with none.
+            if F:
+                print("FINDINGS SUMMARY")
+                print("-" * 80)
+                for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+                    n = sum(1 for x in F if x.get("severity") == sev)
+                    if n:
+                        print("  %s: %s" % (sev, n))
+                print("  TOTAL: %s" % len(F))
+                print("-" * 80)
+                print("")
+                print("DETAILED FINDINGS")
+                print("-" * 80)
+                print("")
+                for x in F:
+                    print("[%s/%s] %s  %s" % (x.get("severity"), x.get("confidence"), x.get("rule"), x.get("title")))
+                    print("  %s:%s  (%s)" % (x.get("file"), x.get("line"), x.get("ref")))
+                    ev = x.get("evidence")
+                    if ev:
+                        print("  EVIDENCE: %s" % ev)
+                    print("")
+            sys.exit(exit_code)  # halted scan exits on its findings
+
+        # Build summary from actual probe records (data-driven only)
+        report_lines.append("PROBE RESULTS SUMMARY")
+        report_lines.append("-" * 80)
+        if oauth_records:
+            # Accounting check
+            check_counts(oauth_records)
+            # Human-readable evidence driven by the ProbeRecord list
+            summary_lines = render_summary(oauth_records)
+            report_lines.extend(summary_lines)
+        else:
+            # Probes never ran (discovery incomplete, unreachable, etc.)
+            report_lines.append("No OAuth probes were attempted.")
+        report_lines.append("-" * 80)
+        report_lines.append("")
+
+        # Print the main report with all sections (authorization, assessment, scan metadata, findings, probe results)
+        print("\n".join(report_lines))
+
+        if not F:
+            print("No findings. (Absence of finding is not proof of safety.)")
+        else:
+            print("DETAILED FINDINGS")
+            print("-" * 80)
+            print("")
+            for x in F:
+                # For live OAuth findings, show severity only. For code findings, show severity/confidence.
+                if x.get("is_live_finding"):
+                    print(f"[{x['severity']}] {x['rule']}  {x['title']}")
+                    print(f"  {x['file']}  ({x['ref']})")
+                    if x.get('also_seen_under'):
+                        print('  also seen under: ' + ', '.join(x['also_seen_under']))
+                    if x.get('severity_basis'):
+                        print(f"  Severity basis: {x['severity_basis']}")
+                else:
+                    print(f"[{x['severity']}/{x['confidence']}] {x['rule']}  {x['title']}")
+                    print(f"  {x['file']}:{x['line']}  ({x['ref']})")
+
+                # For live endpoint findings, show full request/response evidence
+                if x.get("is_live_finding"):
+                    print(f"\n  REQUEST:")
+                    print(f"    Method: {x['request_method']}")
+                    if x['request_body']:
+                        print(f"    Body: {x['request_body'][:200]}")
+                    print(f"\n  RESPONSE:")
+                    print(f"    Status: HTTP {x['response_status']}")
+                    if x['response_preview']:
+                        print(f"    Body Preview: {x['response_preview'][:200]}")
+                    print(f"\n  INTERPRETATION:")
+                    print(f"    {x['interpretation']}")
+                    print(f"\n  REMEDIATION:")
+                    print(f"    {x['remediation']}")
+                else:
+                    print(f"  {x['evidence']}")
+                    print(x["snippet"])
+                print()
+
+        # Footer with hash if authorization provided
+        if report_lines:
+            report_lines_for_hash = [line for line in report_lines if not line.strip().startswith("Elapsed Time:")]
+            full_report = "\n".join(report_lines_for_hash) + f"\nDETAILED FINDINGS\n{'-' * 80}\n"
+            for x in F:
+                full_report += f"[{x['severity']}/{x['confidence']}] {x['rule']}  {x['title']}\n"
+                if x.get("severity_basis"):
+                    full_report += f"  Severity basis: {x['severity_basis']}\n"
+                if x.get("is_live_finding"):
+                    full_report += f"  {x['file']}  ({x['ref']})\n"
+                else:
+                    full_report += f"  {x['file']}:{x['line']}  ({x['ref']})\n"
+
+                # For live endpoint findings, include full evidence in report hash
+                if x.get("is_live_finding"):
+                    full_report += f"\n  REQUEST:\n"
+                    full_report += f"    Method: {x['request_method']}\n"
+                    if x['request_body']:
+                        full_report += f"    Body: {x['request_body']}\n"
+                    full_report += f"\n  RESPONSE:\n"
+                    full_report += f"    Status: HTTP {x['response_status']}\n"
+                    if x['response_preview']:
+                        full_report += f"    Body Preview: {x['response_preview']}\n"
+                    full_report += f"\n  INTERPRETATION:\n"
+                    full_report += f"    {x['interpretation']}\n"
+                    full_report += f"\n  REMEDIATION:\n"
+                    full_report += f"    {x['remediation']}\n"
+                else:
+                    full_report += f"  {x['evidence']}\n{x['snippet']}\n"
+                full_report += "\n"
+
+            # Use canonical payload hash (covers probe counts, auth, and findings)
+            report_hash = payload_hash
+            print("=" * 80)
+            print("[Hash computed over: authorization + scan mode + probe status + findings + exit contract, condition, code and --fail-on. Excludes: run start time, elapsed time, server-varying headers, tool version, scope statement, client registration block, tools_digest, and finding detail text.]")
+            print(footer_line(canonical_payload))
+            print(owasp_block(canonical_payload))
+            print(f"REPORT HASH (SHA256): {report_hash}")
+            extra = " (no finding at or above --fail-on)" if exit_condition == "below_threshold" else ""
+            if (discovery_info or {}).get("status") == "ZERO_AUTH_DETECTED":
+                print(f"Severity calibration: {SEVERITY_CALIBRATION_VERSION}")
+            print(f"Exit contract: {EXIT_CONTRACT} | condition: {exit_condition}{extra} | exit code: {exit_code}")
+            print("=" * 80)
+            if metadata.elapsed_seconds is not None:
+                print(f"Elapsed Time: {metadata.elapsed_seconds:.2f} seconds")
+        else:
+            print(f"{len(F)} finding(s).")
+
+    sys.exit(exit_code)
+
+
+EXIT_CONTRACT = "2026.11.02.4"
+HASH_SCHEME = "verdict-v3"  # Which keys report_hash is taken over
+
+
+def decide_exit(findings, probe_status, scan_mode, fail_on, zero_testable, halted=False):
+    # Single source of truth for the exit contract: the report records what this returns,
+    # and the process exits with it, so a report cannot disagree with its own exit code.
+    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+    thr = {"critical": 0, "high": 1, "medium": 2}[fail_on]
+    review = {"A4", "A5", "A6", "B2"}
+    if scan_mode == "LIVE_ENDPOINT_ASSESSMENT" and (probe_status.get("attempted", 0) == 0 or zero_testable):
+        return 5, "zero_testable_probes"
+    for finding in findings:
+        severity = finding.get("severity", "LOW")
+        level = order.get(severity, 99)
+        rule = finding.get("rule", finding.get("ref", ""))
+        if level <= thr and rule not in review:
+            return 1, "finding_at_or_above_" + fail_on
+    if scan_mode == "LIVE_ENDPOINT_ASSESSMENT" and halted:
+        return 5, "halted_discovery_incomplete"
+    if scan_mode == "LIVE_ENDPOINT_ASSESSMENT" and probe_status.get("not_observed", 0) > 0:
+        return 5, "not_observed_present"
+    return 0, "below_threshold"
+
+
+if __name__ == "__main__":
+    main()
+
+# OAuth 2.1 Compliance Checks (v1.1)
+OAUTH_2_1_CHECKS = {
+    "implicit_flow_used": [r'response_type.*implicit', r'response_type.*token', r'flow.*implicit'],
+    "pkce_plain_allowed": [r'code_challenge_method.*plain', r'method.*=.*plain', r'plain.*PKCE'],
+    "pkce_not_required": [r'code_challenge.*optional', r'pkce.*not.*required'],
+    "issuer_not_validated": [r'issuer.*validation.*skip', r'skipIssuerValidation.*true', r'validateIssuer.*false'],
+    "weak_state_validation": [r'state.*length.*<.*16', r'state.*entropy.*weak'],
+    "response_type_confusion": [r'response_type.*multiple', r'accepts.*code.*token'],
+    "dop_not_enforced": [r'dpop.*optional', r'dpop.*not.*required'],
+}
+
+

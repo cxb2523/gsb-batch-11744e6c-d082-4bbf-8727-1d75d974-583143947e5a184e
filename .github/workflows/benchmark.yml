@@ -1,0 +1,138 @@
+name: Detector Benchmark
+
+permissions:
+  contents: write
+  pull-requests: write
+
+on:
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Syntax check
+        run: python3 -m py_compile mcp_authscan.py
+
+      - name: Run detector benchmark (pinned corpus)
+        run: |
+          python3 tests/benchmark.py \
+            --json benchmark-report.json \
+            --keep
+        continue-on-error: true
+
+      - name: Generate score badges
+        run: |
+          python3 tests/badge_generator.py \
+            --report benchmark-report.json \
+            --output badges
+        if: always()
+
+      - name: Parse metrics for PR comment
+        id: metrics
+        run: |
+          python3 << 'EOF'
+          import json, sys
+          try:
+              with open('benchmark-report.json') as f:
+                  report = json.load(f)
+              precision = report.get('precision', 0)
+              recall = report.get('recall', 0)
+              f1 = report.get('f1', 0)
+              tp = report.get('confusion', {}).get('TP', 0)
+              fp = report.get('confusion', {}).get('FP', 0)
+              fn = report.get('confusion', {}).get('FN', 0)
+              tn = report.get('confusion', {}).get('TN', 0)
+              sha = report.get('report_sha256', 'N/A')[:16]
+
+              print(f"precision={precision:.4f}")
+              print(f"recall={recall:.4f}")
+              print(f"f1={f1:.4f}")
+              print(f"tp={tp}")
+              print(f"fp={fp}")
+              print(f"fn={fn}")
+              print(f"tn={tn}")
+              print(f"sha={sha}")
+          except Exception as e:
+              print(f"ERROR: {e}", file=sys.stderr)
+              sys.exit(1)
+          EOF >> $GITHUB_OUTPUT
+        if: always()
+
+      - name: Commit badges to main
+        if: github.ref == 'refs/heads/main' && (success() || failure())
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add badges/ benchmark-report.json || true
+          if ! git diff --quiet --cached; then
+            git commit -m "chore: update benchmark badges [skip ci]"
+            git push
+          fi
+
+      - name: Comment on PR with benchmark results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+
+            let report = {};
+            try {
+              report = JSON.parse(fs.readFileSync('benchmark-report.json', 'utf8'));
+            } catch (e) {
+              console.log("Skipping PR comment (no report)");
+              return;
+            }
+
+            const precision = (report.precision || 0).toFixed(4);
+            const recall = (report.recall || 0).toFixed(4);
+            const f1 = (report.f1 || 0).toFixed(4);
+            const tp = report.confusion?.TP || 0;
+            const fp = report.confusion?.FP || 0;
+            const fn = report.confusion?.FN || 0;
+            const tn = report.confusion?.TN || 0;
+            const sha = (report.report_sha256 || '').substring(0, 16);
+
+            const precisionStatus = precision == "1.0000" ? "✅" : "⚠️";
+            const recallStatus = recall == "1.0000" ? "✅" : "⚠️";
+            const f1Status = f1 == "1.0000" ? "✅" : "⚠️";
+
+            const comment = "## 🔬 Detector Benchmark Report\n\n" +
+              "### Metrics\n" +
+              "| Metric | Score | Status |\n" +
+              "|--------|-------|--------|\n" +
+              "| Precision | " + precision + " | " + precisionStatus + " |\n" +
+              "| Recall | " + recall + " | " + recallStatus + " |\n" +
+              "| F1 | " + f1 + " | " + f1Status + " |\n\n" +
+              "### Confusion Matrix\n" +
+              "- True Positives (TP): " + tp + "\n" +
+              "- False Positives (FP): " + fp + "\n" +
+              "- False Negatives (FN): " + fn + "\n" +
+              "- True Negatives (TN): " + tn + "\n\n" +
+              "### Chain of Custody\n" +
+              "Report SHA256: `" + sha + "...`\n\n" +
+              "[View Full Report](benchmark-report.json) · [Methodology](METHODOLOGY.md)";
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-report
+          path: |
+            benchmark-report.json
+            badges/

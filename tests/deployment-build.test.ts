@@ -1,0 +1,240 @@
+import assert from 'node:assert/strict';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+const root = fileURLToPath(new URL('../', import.meta.url));
+const script = path.join(root, 'scripts/deployment-build.sh');
+const gunicornLauncher = '#!/fixture/nix/python3\n# runtime launcher fixture\n';
+
+async function buildFixture(failAt = '', prefixName = '.pythonlibs') {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'vata-build-'));
+  const trace = path.join(temp, 'trace.jsonl');
+  const prefix = path.join(temp, prefixName);
+  const stub = `#!${process.execPath}
+const fs = require('node:fs');
+const path = require('node:path');
+const tool = path.basename(process.argv[1]);
+const args = process.argv.slice(2);
+const step = tool === 'npm' ? 'npm-' + args[0]
+  : tool === 'uv' ? 'uv-install' : 'python-prefix';
+fs.appendFileSync(process.env.FIXTURE_TRACE, JSON.stringify({
+  step, args, cwd: process.cwd(), pipUser: process.env.PIP_USER || null,
+  generatorExists: fs.existsSync(path.join(process.env.FIXTURE_PREFIX, 'bin/cffi-gen-src')),
+  flaskCliExists: fs.existsSync(path.join(process.env.FIXTURE_PREFIX, 'bin/flask')),
+}) + '\\n');
+if (step === process.env.FIXTURE_FAIL_AT) process.exit(17);
+if (step === 'python-prefix') console.log(process.env.FIXTURE_PREFIX);
+`;
+  try {
+    await mkdir(path.join(prefix, 'bin'), { recursive: true });
+    await mkdir(path.join(prefix, 'lib/python3.11/site-packages/cffi'), { recursive: true });
+    await mkdir(path.join(prefix, 'lib/python3.11/site-packages/flask'), { recursive: true });
+    await mkdir(path.join(prefix, 'lib/python3.11/site-packages/gunicorn'), { recursive: true });
+    await writeFile(path.join(prefix, 'bin/cffi-gen-src'), 'generator fixture');
+    await writeFile(path.join(prefix, 'bin/flask'), '#!/fixture/nix/python3\n# unused Flask CLI\n');
+    await writeFile(path.join(prefix, 'bin/gunicorn'), gunicornLauncher);
+    await writeFile(path.join(prefix, 'bin/httpx'), '#!/fixture/nix/python3\n# another generated launcher\n');
+    await writeFile(path.join(prefix, 'lib/python3.11/site-packages/cffi/__init__.py'), '# runtime library fixture');
+    await writeFile(path.join(prefix, 'lib/python3.11/site-packages/flask/__init__.py'), '# runtime library fixture');
+    await writeFile(path.join(prefix, 'lib/python3.11/site-packages/gunicorn/__init__.py'), '# runtime library fixture');
+    for (const tool of ['npm', 'python3', 'uv']) {
+      await writeFile(path.join(temp, tool), stub, { mode: 0o755 });
+    }
+    const result = spawnSync('bash', [script], {
+      cwd: temp,
+      encoding: 'utf8',
+      env: {
+        PATH: `${temp}:${process.env.PATH}`,
+        HOME: temp,
+        PYTHONNOUSERSITE: 'true',
+        PIP_USER: '1',
+        FIXTURE_TRACE: trace,
+        FIXTURE_PREFIX: prefix,
+        FIXTURE_FAIL_AT: failAt,
+      },
+    });
+    const calls = (await readFile(trace, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    const exists = (file: string) => access(file).then(() => true, () => false);
+    return {
+      result, calls, prefix, python: path.join(temp, 'python3'),
+      generatorExists: await exists(path.join(prefix, 'bin/cffi-gen-src')),
+      flaskCliExists: await exists(path.join(prefix, 'bin/flask')),
+      gunicornExists: await exists(path.join(prefix, 'bin/gunicorn')),
+      binExists: await exists(path.join(prefix, 'bin')),
+      pythonExists: await exists(path.join(temp, 'python3')),
+      gunicornLibraryExists: await exists(path.join(prefix, 'lib/python3.11/site-packages/gunicorn/__init__.py')),
+      cffiExists: await exists(path.join(prefix, 'lib/python3.11/site-packages/cffi/__init__.py')),
+      flaskExists: await exists(path.join(prefix, 'lib/python3.11/site-packages/flask/__init__.py')),
+    };
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+}
+
+test('hosting uses an explicit build without changing the durable runtime command', async () => {
+  const config = await readFile(path.join(root, '.replit'), 'utf8');
+  assert.match(config, /\[packager\.features\]\s+enabledForHosting = false/);
+  assert.match(config, /build = \["bash", "scripts\/deployment-build\.sh"\]/);
+  assert.match(config, /deploymentTarget = "(?:cloudrun|autoscale)"/);
+  assert.match(config, /run = \["env", "VATA_SQLITE_DURABILITY=postgres", "DB_FILE=\/tmp\/vata-findings\.sqlite", "npm", "run", "start"\]/);
+  const modules = config.match(/^modules = (.+)$/m)?.[1] ?? '';
+  assert.match(modules, /"python-base-3\.11"/);
+  assert.doesNotMatch(modules, /"python-\d/);
+  assert.match(config, /packages = \[[^\n]*"uv"/);
+});
+
+test('production gateway port matches the published HTTP forwarding target', () => {
+  const result = spawnSync('python3', ['-c', [
+    'import json, tomllib',
+    'from pathlib import Path',
+    'config = tomllib.loads(Path(".replit").read_text())',
+    'print(json.dumps({',
+    '  "configured": config["userenv"]["production"]["VATA_PORT"],',
+    '  "forwarded": [p["localPort"] for p in config.get("ports", []) if p.get("externalPort") == 80],',
+    '}))',
+  ].join('\n')], { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 0, 'The publishing configuration must be valid TOML');
+  const { configured, forwarded } = JSON.parse(result.stdout);
+  assert.equal(forwarded.length, 1, 'Publishing must have exactly one external HTTP target');
+  assert.equal(Number(configured), forwarded[0],
+    'Production VATA_PORT must match the port Publishing health-checks');
+  assert.notEqual(forwarded[0], 5001, 'The private scanner must not be the public HTTP target');
+});
+
+test('shared Python configuration retains the managed library directory', async () => {
+  const config = await readFile(path.join(root, '.replit'), 'utf8');
+  const shared = config.match(/\[userenv\.shared\]([\s\S]*?)(?=\n\[|$)/)?.[1] ?? '';
+  assert.match(shared, /^PYTHONUSERBASE\s*=\s*"\.pythonlibs"$/m);
+  assert.match(shared, /^PIP_PREFIX\s*=\s*"\.pythonlibs"$/m);
+  assert.match(shared, /^PIP_USER\s*=\s*"0"$/m);
+  assert.match(shared, /^UV_PROJECT_ENVIRONMENT\s*=\s*"\.pythonlibs"$/m);
+  assert.match(shared, /^UV_PYTHON_DOWNLOADS\s*=\s*"never"$/m);
+  assert.match(shared, /^UV_PYTHON_PREFERENCE\s*=\s*"only-system"$/m);
+});
+
+test('development hot reload shares the public HTTP listener instead of opening another port', async () => {
+  const source = await readFile(path.join(root, 'server/index.ts'), 'utf8');
+  assert.match(source, /const httpServer = createHttpServer\(app\)/);
+  assert.match(source, /startApplication\(app, httpServer\)/);
+  assert.match(source, /hmr:\s*\{\s*server:\s*httpServer\s*\}/);
+});
+
+test('Python runtime dependencies are explicit, without the legacy hosting pip manifest', async () => {
+  await assert.rejects(readFile(path.join(root, 'requirements.txt')), { code: 'ENOENT' });
+  await assert.rejects(readFile(path.join(root, 'pyproject.toml')), { code: 'ENOENT' });
+  await assert.rejects(readFile(path.join(root, 'uv.lock')), { code: 'ENOENT' });
+  const requirements = await readFile(path.join(root, 'requirements-runtime.txt'), 'utf8');
+  assert.match(requirements, /^flask>=3\.1\.3,<4$/m);
+  assert.match(requirements, /^gunicorn$/m);
+});
+
+test('web root stays separate from the nested CLI package and retains runtime requirements', async () => {
+  const ignore = await readFile(path.join(root, '.replitignore'), 'utf8');
+  const rules = ignore.split('\n').map(line => line.trim())
+    .filter(line => line && !line.startsWith('#'));
+  assert.ok(rules.includes('/pyproject.toml'));
+  assert.ok(rules.includes('/uv.lock'));
+  assert.ok(!rules.includes('/requirements-runtime.txt'));
+  assert.ok(!rules.includes('requirements-runtime.txt'));
+  const project = await readFile(path.join(root, 'mcp_authscan', 'pyproject.toml'), 'utf8');
+  assert.match(project, /\[project\]/, 'CLI packaging must remain available in the repository');
+  assert.match(project, /package-dir = \{mcp_authscan = "\."\}/);
+});
+
+test('post-merge verification remains offline and read-only without importing pip', async () => {
+  const hook = await readFile(path.join(root, 'scripts/post-merge.sh'), 'utf8');
+  assert.doesNotMatch(hook, /python3 -m pip/);
+  assert.match(hook, /uv pip install --dry-run --no-index --no-cache --prefix/);
+});
+
+test('publishing omits generated launchers, not importable runtime libraries', async () => {
+  const ignore = await readFile(path.join(root, '.replitignore'), 'utf8');
+  const rules = ignore.split('\n').map(line => line.trim())
+    .filter(line => line && !line.startsWith('#'));
+  assert.ok(rules.includes('/.pythonlibs/bin/'));
+  for (const broadRule of [
+    '.pythonlibs', '.pythonlibs/', '/.pythonlibs', '/.pythonlibs/', '**/.pythonlibs/**',
+    '/.pythonlibs/**',
+    '/.pythonlibs/lib/', '/.pythonlibs/lib/**',
+  ]) {
+    assert.ok(!rules.includes(broadRule), `Runtime packages must not be excluded by ${broadRule}`);
+  }
+});
+
+test('canonical scanner compiles and retains the discovery security parameter', () => {
+  const result = spawnSync('python3', ['-c', [
+    'import ast, pathlib',
+    'path = pathlib.Path("mcp_authscan/scan_main.py")',
+    'source = path.read_text()',
+    'compile(source, str(path), "exec")',
+    'tree = ast.parse(source)',
+    'functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "discover_oauth_endpoints"]',
+    'assert len(functions) == 1',
+    'assert [arg.arg for arg in functions[0].args.args] == ["base_url", "allow_private"]',
+  ].join('\n')], {
+    cwd: root,
+    encoding: 'utf8',
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, LANG: 'C.UTF-8' },
+  });
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('build installs Node and Python into the managed prefix before compiling', async () => {
+  const {
+    result, calls, prefix, python, generatorExists, flaskCliExists,
+    gunicornExists, binExists, pythonExists, gunicornLibraryExists, cffiExists, flaskExists,
+  } = await buildFixture();
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(calls.map(call => call.step), ['npm-ci', 'python-prefix', 'uv-install', 'npm-run']);
+  assert.deepEqual(calls[0].args, ['ci', '--include=dev']);
+  assert.deepEqual(calls[2].args,
+    ['pip', 'install', '--reinstall', '--prefix', prefix, '--python', python, '--requirement', 'requirements-runtime.txt']);
+  assert.equal(calls[2].pipUser, '1', 'UV prefix installation must not depend on changing pip user mode');
+  assert.deepEqual(calls[3].args, ['run', 'build']);
+  assert.equal(calls[3].generatorExists, true, 'Cleanup must follow successful compilation');
+  assert.equal(calls[3].flaskCliExists, true, 'Flask launcher cleanup must follow compilation');
+  assert.equal(generatorExists, false, 'The unused generator is removed');
+  assert.equal(flaskCliExists, false, 'The unused Flask launcher is removed');
+  assert.equal(gunicornExists, false, 'The generated Gunicorn launcher is no longer required');
+  assert.equal(binExists, false, 'Remove the entire launcher class, not a growing file list');
+  assert.equal(pythonExists, true, 'The interpreter outside the prefix must remain');
+  assert.equal(gunicornLibraryExists, true, 'The Gunicorn module must remain installed');
+  assert.equal(cffiExists, true, 'CFFI itself must remain importable');
+  assert.equal(flaskExists, true, 'Flask itself must remain importable');
+  for (const call of calls) {
+    assert.equal(call.cwd, path.resolve(root));
+    assert.ok(!call.args.includes('--break-system-packages'));
+    assert.ok(!call.args.includes('--user'));
+  }
+});
+
+test('build refuses recursive cleanup outside the managed Python prefix', async () => {
+  const { result, calls, binExists } = await buildFixture('', 'unsafe-prefix');
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Refusing launcher cleanup/);
+  assert.ok(!calls.some(call => call.step === 'uv-install'));
+  assert.equal(binExists, true, 'Unsafe-prefix launchers must not be deleted');
+});
+
+for (const failAt of ['npm-ci', 'python-prefix', 'uv-install']) {
+  test(`failed ${failAt} prevents later build steps`, async () => {
+    const { result, calls, generatorExists, flaskCliExists } = await buildFixture(failAt);
+    assert.equal(result.status, 17);
+    assert.equal(calls.at(-1).step, failAt);
+    assert.ok(!calls.some(call => call.step === 'npm-run'));
+    assert.equal(generatorExists, true, 'Failed builds must not run post-build cleanup');
+    assert.equal(flaskCliExists, true, 'Failed builds must retain the Flask launcher');
+  });
+}
+
+test('compilation failure skips unused-launcher cleanup', async () => {
+  const { result, calls, generatorExists, flaskCliExists } = await buildFixture('npm-run');
+  assert.equal(result.status, 17);
+  assert.equal(calls.at(-1).step, 'npm-run');
+  assert.equal(generatorExists, true);
+  assert.equal(flaskCliExists, true);
+});

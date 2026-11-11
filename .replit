@@ -1,0 +1,99 @@
+modules = ["web", "nodejs-20", "go-1.21", "bash", "python-base-3.11", "postgresql-16"]
+
+[nix]
+channel = "stable-25_05"
+packages = ["freetype", "glibcLocales", "uv"]
+
+[agent]
+expertMode = true
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "production-startup"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "independent-recovery"
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "npm run dev"
+waitForPort = 5000
+
+[[workflows.workflow]]
+name = "production-startup"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "npm run test:startup"
+
+[workflows.workflow.metadata]
+isValidation = true
+
+[[workflows.workflow]]
+name = "independent-recovery"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "npm run test:independent-recovery"
+
+[workflows.workflow.metadata]
+isValidation = true
+
+[[ports]]
+localPort = 5000
+externalPort = 5000
+
+[[ports]]
+localPort = 24678
+externalPort = 80
+
+[deployment]
+deploymentTarget = "autoscale"
+run = ["env", "VATA_SQLITE_DURABILITY=postgres", "DB_FILE=/tmp/vata-findings.sqlite", "npm", "run", "start"]
+build = ["bash", "scripts/deployment-build.sh"]
+
+[packager.features]
+enabledForHosting = false
+
+[userenv]
+
+[userenv.production]
+VATA_PORT = "24678"
+PUBLIC_APP_URL = "https://mcp-authscan.replit.app"
+VATA_BILLING_MODE = "disabled"
+VATA_PREPARE_LIVE_BILLING = "0"
+VATA_FINDINGS_NAMESPACE = "production-findings"
+
+[userenv.shared]
+PYTHONUSERBASE = ".pythonlibs"
+PIP_PREFIX = ".pythonlibs"
+PIP_USER = "0"
+UV_PROJECT_ENVIRONMENT = ".pythonlibs"
+UV_PYTHON_DOWNLOADS = "never"
+UV_PYTHON_PREFERENCE = "only-system"
+
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 180000

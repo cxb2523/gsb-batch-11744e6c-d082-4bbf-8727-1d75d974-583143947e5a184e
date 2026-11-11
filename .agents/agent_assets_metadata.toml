@@ -1,0 +1,44 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "_jHFs17U38jwgsddeThKA"
+uri = "file://vata_findings_backup.json"
+type = "unspecified"
+title = "Workspace findings backup"
+description = "Verified JSON export of 39 findings from the workspace vata.db. This does not include the separate published app’s database."
+logical_id = "9c6bbfb0-e5b4-44d5-bd1e-bd76a27fde49"
+content_hash = "sha256:eb08a59aa442b50c9ddc24838b91185661dafb7fdd0f76d0046b159b6724112a"
+size = 15762
+mtime_ms = 1792018869024
+storage_uri = "gcs://replit-rams-assets-picard/rams/assets/repl:184b23cb-4223-44dd-9991-815029eef61d/9c6bbfb0-e5b4-44d5-bd1e-bd76a27fde49/bf434cb6-4e3c-4867-bb4a-5bf9c9c2086b"
+storage_version_token = "1792018877302671"
+content_type = "application/octet-stream"
+
+[[outputs]]
+id = "jSr7KsoTZZUljnXzzmTSg"
+uri = "file://generated-artifacts/production-findings-seed-guide.html"
+type = "html"
+title = "NEW — Single-statement production import"
+description = "Replaces the old BEGIN/COMMIT script. Copy import SQL, replace all text in the Production SQL editor, then click Run. Expect SEEDED and snapshot_count 1 for the fresh namespace."
+logical_id = "c1c825f1-3e7c-4e66-9cb9-5e14d1859904"
+content_hash = "sha256:10783f5544658952965d72869a1a553c51963382364ce7b34bfbe13872476f6d"
+size = 45137
+mtime_ms = 1792160213656
+storage_uri = "gcs://replit-rams-assets-picard/rams/assets/repl:184b23cb-4223-44dd-9991-815029eef61d/c1c825f1-3e7c-4e66-9cb9-5e14d1859904/e6d64084-48f8-49e5-9d09-f90803d0add3"
+storage_version_token = "1792160281155962"
+content_type = "text/html"
+
+[[outputs]]
+id = "Wvj9j3GOV-iVKQ3LBv2DR"
+uri = "file://generated-artifacts/open-seed-guide-help.png"
+type = "image"
+title = "Click the highlighted VATA guide"
+description = "The yellow outline marks the HTML guide in your right-hand Library. Open that document first; it contains Copy import SQL."
+logical_id = "a8c35b1e-00ff-42e0-800b-0e61d6fe85df"
+content_hash = "sha256:3a387ebcef4ff09f4ccf019af3009831d7682eea431c3a2c95d590d865be1639"
+size = 115822
+mtime_ms = 1792159510496
+storage_uri = "gcs://replit-rams-assets-picard/rams/assets/repl:184b23cb-4223-44dd-9991-815029eef61d/a8c35b1e-00ff-42e0-800b-0e61d6fe85df/441aa978-bd11-4121-9741-e258125857f1"
+storage_version_token = "1792159515280751"
+content_type = "image/png"

@@ -1,0 +1,26 @@
+- [Imported Python setup](imported-python-setup.md) — Nix pre-install conflicts; separate the interpreter from package installation and verify cold startup, not cached imports.
+- [Preview HTTP routing](preview-http-routing.md) — local health can be 200 while the main Preview domain routes to the websocket listener and returns 426.
+- [Configuration and toolchains](configuration-toolchain-validity.md) — invalid Replit configuration can temporarily remove toolchain commands from the shell environment.
+- [Published startup evidence](published-startup-evidence.md) — compare production forwarding and bind logs; matched production and Preview ports may deliberately differ.
+- [Finding data environments](finding-data-environments.md) — a stale preview SQLite file does not prove published scan findings are missing.
+- [Findings durability approval](findings-durability-approval.md) — keep PostgreSQL durability; owner allows a fresh initial snapshot, not a local-only fallback.
+- [Independent recovery approval](independent-recovery-approval.md) — encrypted off-project retention policy and synthetic rehearsal approved; live exports and storage/key custody still need approval.
+- [Findings alert policy](findings-alert-policy.md) — owner approved server logs only for backup-health notifications, not external delivery.
+- [GitHub push authentication](github-push-auth.md) — healthy OAuth metadata can coexist with rejected Git credentials; verify the push and use secure reauthorization.
+- [Public push safety](public-push-safety-policy.md) — preserve local history; check every outgoing commit and never exempt entire test folders from credential checks.
+- [GitHub changes](github-changes.md) — user asks not to block GitHub changes in this project.
+- [CORS finding policy](cors-policy.md) — reflection requires unauthenticated sensitive-data access; 401/403 are protected; wildcard alone is not a vulnerability.
+- [Workspace capacity](subscription-tier-rules.md) — five seats include owner and pending invites; UTC usage; user-selected Reserved VM for unattended scheduling.
+- [Billing ownership](billing-ownership.md) — verified accounts must not inherit old name-only organizations automatically.
+- [Stripe billing scope](stripe-connector-generations.md) — owner requested complete Stripe removal; prior billing approvals are superseded.
+- [Stripe proxy compatibility](stripe-proxy-compatibility.md) — current connector is proxy-authenticated; full backfill must not enumerate historical accounts' customers.
+- [Webhook reconciliation](stripe-webhook-reconciliation.md) — refetch canonical subscription state; scope signing secrets and registration to the exact callback.
+- [Compliance report claims](compliance-report-policy.md) — describe the VATA severity score as an indicator, never as a SOC 2 certification or audit opinion.
+- [Auth readiness](auth-readiness.md) — brief snapshots can precede Clerk rendering; verify form readiness before diagnosing an authentication failure.
+- [Interrupted validation](interrupted-validation.md) — completion results after a user interruption can describe an earlier code snapshot; compare timestamps before changing code.
+- [Recovery validation resources](recovery-validation-resources.md) — avoid concurrent scaled recovery runs; temporary disk quotas can fail writes even when df reports free space.
+- [Dependency runtime compatibility](dependency-runtime-compatibility.md) — preserve Node/CommonJS compatibility and portable lockfile URLs when patching dependencies.
+- [Dependency audit evidence](dependency-audit-evidence.md) — distinguish patched packages, independent audit results, failed platform scans, and published releases.
+- [Production SQL console](production-sql-console.md) — use a single atomic operator import; never let an empty bootstrap outrank normal snapshots.
+- [SQLite writer handoff](sqlite-writer-deployment-handoff.md) — frontend may precede writer readiness; keep APIs closed until ownership; never bypass the lock.
+- [Scanner release verification](scanner-release-verification.md) — repository tests do not replace exit-code fixtures; scoring gates must agree before deployment.

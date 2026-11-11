@@ -1,0 +1,2 @@
+-r requirements-runtime.txt
+python-dotenv>=1.2.4,<2

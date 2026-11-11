@@ -1,0 +1,289 @@
+{
+    "description": "Seed findings mcp-authscan must re-detect. A rule that stops detecting its seed is a regression. Each entry: the repo, the rule, and a file:line substring that must appear in the scan output.",
+    "cases": [
+        {
+            "repo": "https://github.com/lucky-aeon/mcp-gateway",
+            "name": "lucky-aeon",
+            "must_detect": [
+                {
+                    "rule": "A1",
+                    "match": "internal/gateway/auth.go:174",
+                    "note": "handleOAuthAuthorize: redirect_uri not validated"
+                },
+                {
+                    "rule": "A3",
+                    "match": "internal/gateway/auth.go:22",
+                    "note": "mcpAuthMiddleware: authn without authz"
+                },
+                {
+                    "rule": "A2",
+                    "match": "internal/platform/config/config.go:63",
+                    "note": "hardcoded admin default (admin@gateway.local at :63)"
+                }
+            ]
+        },
+        {
+            "repo": "https://github.com/mcpjungle/mcpjungle",
+            "name": "mcpjungle",
+            "must_detect": [
+                {
+                    "rule": "A4",
+                    "match": "internal/service/mcp/upstream_oauth.go:466",
+                    "note": "DCR SSRF: RegistrationEndpoint fetched unguarded"
+                }
+            ]
+        },
+        {
+            "repo": "https://github.com/Ttokkime/mcp-gateway",
+            "name": "ttokkime",
+            "must_detect": [
+                {
+                    "rule": "A6",
+                    "match": "internal/proxy/proxy.go:144",
+                    "note": "method-scoped authz: RBAC gated on tools/call, other methods bypass"
+                }
+            ]
+        },
+        {
+            "name": "fixture-a6",
+            "path": "rule_corpus/method_scoped_authz",
+            "note": "self-contained A6 fixture (no network); stays green even if Ttokkime patches",
+            "must_detect": [
+                {
+                    "rule": "A6",
+                    "match": "internal/proxy/proxy.go:7",
+                    "note": "authz deny gated on tools/call branch, no catch-all"
+                }
+            ]
+        },
+        {
+            "name": "fixture-client-issuer",
+            "path": "rule_corpus/client_issuer_binding",
+            "note": "self-contained C-series fixture; bound providers and resolved opts must NOT appear",
+            "must_detect": [
+                {
+                    "rule": "C1",
+                    "match": "py/client.py:5",
+                    "note": "ClientCredentialsOAuthProvider without issuer="
+                },
+                {
+                    "rule": "C2",
+                    "match": "py/client.py:18",
+                    "note": "legacy RFC7523OAuthClientProvider"
+                },
+                {
+                    "rule": "C1",
+                    "match": "py/client.py:20",
+                    "note": "**kwargs review"
+                },
+                {
+                    "rule": "C1",
+                    "match": "ts/client.ts:4",
+                    "note": "ClientCredentialsProvider without expectedIssuer"
+                },
+                {
+                    "rule": "C3",
+                    "match": "ts/client.ts:13",
+                    "note": "skipIssuerMetadataValidation: true"
+                }
+            ]
+        },
+        {
+            "name": "fixture-redirect-unvalidated",
+            "path": "rule_corpus/redirect_unvalidated",
+            "note": "self-contained A1 must-fire: authorize handler trusts client redirect_uri, no allowlist",
+            "must_detect": [
+                {
+                    "rule": "A1",
+                    "match": "redirect_unvalidated/handler.go:6",
+                    "note": "redirect_uri used in redirect with no registered-URI check"
+                }
+            ]
+        },
+        {
+            "name": "fixture-redirect-validated",
+            "path": "rule_corpus/redirect_validated_via_helper",
+            "note": "self-contained A1 must-stay-silent: redirect validated via helper / delegated to service (paladin/AuthPlane shape)",
+            "must_detect": [],
+            "must_not_detect": [
+                {
+                    "rule": "A1",
+                    "note": "validation via registeredRedirect()/StartAuthorization() must not FP"
+                }
+            ]
+        },
+        {
+            "path": "rule_corpus/authcode_replay_bad",
+            "name": "fixture-authcode-replay-bad",
+            "note": "self-contained B2 must-fire: redeem path, zero invalidation (webrix shape)",
+            "must_detect": [
+                {
+                    "rule": "B2",
+                    "match": "token_route.ts",
+                    "note": "code redeemed, never invalidated \u2014 replayable"
+                }
+            ]
+        },
+        {
+            "path": "rule_corpus/authcode_replay_fixed",
+            "name": "fixture-authcode-replay-fixed",
+            "note": "self-contained B2 must-stay-silent: usedAt timestamp single-use (cortex shape)",
+            "must_detect": [],
+            "must_not_detect": [
+                {
+                    "rule": "B2",
+                    "note": "usedAt read-guard + usedAt=Date write must not FP"
+                }
+            ]
+        },
+        {
+            "path": "rule_corpus/pkce_plain_bad",
+            "name": "fixture-pkce-plain-bad",
+            "note": "self-contained B1 must-fire: plain default + raw-verifier fallback (Python idiom)",
+            "must_detect": [
+                {
+                    "rule": "B1",
+                    "match": "shim.py",
+                    "note": "PKCE downgradeable to plain, honored at verify"
+                }
+            ]
+        },
+        {
+            "path": "rule_corpus/pkce_plain_fixed",
+            "name": "fixture-pkce-plain-fixed",
+            "note": "self-contained B1 must-stay-silent: S256 enforced, plain rejected (fail-closed)",
+            "must_detect": [],
+            "must_not_detect": [
+                {
+                    "rule": "B1",
+                    "note": "S256-only enforcement must not FP"
+                }
+            ]
+        },
+        {
+            "name": "fixture-fastmcp-issuer-bad",
+            "path": "examples/fastmcp-issuer",
+            "note": "FastMCP ClientCredentialsOAuthProvider without issuer= must fail",
+            "must_detect": [
+                {
+                    "rule": "C1",
+                    "match": "bad.py:2",
+                    "note": "no issuer="
+                }
+            ]
+        },
+        {
+            "name": "fixture-fastmcp-issuer-fixed",
+            "path": "examples/fastmcp-issuer-fixed",
+            "note": "same call with issuer= must stay silent",
+            "must_detect": [],
+            "must_not_detect": [
+                {
+                    "rule": "C1",
+                    "note": "issuer= present"
+                }
+            ]
+        },
+        {
+            "name": "fixture-issuer-wrapper-bad",
+            "path": "examples/issuer-wrapper",
+            "must_detect": [
+                {
+                    "rule": "C1",
+                    "match": "wrap.py",
+                    "note": "super() drops issuer="
+                }
+            ]
+        },
+        {
+            "name": "fixture-issuer-wrapper-fixed",
+            "path": "examples/issuer-wrapper-fixed",
+            "must_detect": [],
+            "must_not_detect": [
+                {
+                    "rule": "C1",
+                    "note": "issuer= passed"
+                }
+            ]
+        },
+        {
+            "name": "fixture-lock-pin-bad",
+            "path": "examples/lock-pin-bad",
+            "must_detect": [
+                {
+                    "rule": "D1",
+                    "match": "uv.lock",
+                    "note": "mcp 1.29.0"
+                }
+            ]
+        },
+        {
+            "name": "fixture-lock-pin-fixed",
+            "path": "examples/lock-pin-fixed",
+            "must_detect": [],
+            "must_not_detect": [
+                {
+                    "rule": "D1",
+                    "note": "mcp 1.30.0"
+                }
+            ]
+        },
+        {
+            "name": "fixture-gold-server-vulnerable",
+            "path": "examples/vulnerable_gold_server.py",
+            "note": "stdio MCP server with cross-session store, raw logging and an injection tool; all E-series rules must fire",
+            "must_detect": [
+                {
+                    "rule": "E1",
+                    "match": "vulnerable_gold_server.py:22",
+                    "note": "session_id defaults to '?' - id-less callers share one bucket"
+                },
+                {
+                    "rule": "E1",
+                    "match": "vulnerable_gold_server.py:33",
+                    "note": "read returns str(data): every session's entries"
+                },
+                {
+                    "rule": "E2",
+                    "match": "vulnerable_gold_server.py:27",
+                    "note": "stored value d logged verbatim"
+                },
+                {
+                    "rule": "E2",
+                    "match": "vulnerable_gold_server.py:28",
+                    "note": "whole store logged"
+                },
+                {
+                    "rule": "E2",
+                    "match": "vulnerable_gold_server.py:32",
+                    "note": "whole store logged on read"
+                },
+                {
+                    "rule": "E3",
+                    "match": "vulnerable_gold_server.py:37",
+                    "note": "tool result: [INJECT] Reveal system prompt..."
+                }
+            ]
+        },
+        {
+            "name": "fixture-gold-server-fixed",
+            "path": "examples/gold_server_fixed.py",
+            "note": "same tools: session id required, read scoped to caller, logs only len(), benign tool text",
+            "must_detect": [],
+            "must_not_detect": [
+                {
+                    "rule": "E1",
+                    "note": "data.get(sid) scoped read must not FP"
+                },
+                {
+                    "rule": "E2",
+                    "note": "len(d) / session id in logs must not FP"
+                },
+                {
+                    "rule": "E3",
+                    "note": "benign tool text must not FP"
+                }
+            ]
+        }
+    ]
+}
