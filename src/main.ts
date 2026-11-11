@@ -73,6 +73,7 @@ export type { AccountData, ClassifyOptions, ClassifyResult, ConfigData, ContextD
 export { CrawlerConfig } from './crawlerconfig.ts';
 export type { CrawlerConfigOptions, CrawlerContentFormat, CrawlerWebhookEventName } from './crawlerconfig.ts';
 export { Crawl } from './crawl.ts';
+export type { CrawlWaitReason, CrawlWaitResult } from './crawl.ts';
 export {
   CrawlerArtifact,
   CrawlerContents,

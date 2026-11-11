@@ -17,6 +17,30 @@ import type {
   CrawlerUrls,
 } from './crawlerresult.ts';
 
+/** Terminal reason reported by {@link Crawl.waitResumable}. */
+export type CrawlWaitReason = 'completed' | 'cancelled' | 'max_polls' | 'max_wait';
+
+/**
+ * Outcome of a {@link Crawl.waitResumable} call.
+ *
+ * Unlike {@link Crawl.wait}, reaching the poll/wait budget is not an error —
+ * it is reported here so the caller can persist progress and resume later by
+ * calling `waitResumable` again on the same instance.
+ */
+export interface CrawlWaitResult {
+  /** True only when the crawl reached a successful terminal state. */
+  completed: boolean;
+  /**
+   * Total number of status polls performed by this instance, cumulative
+   * across all `waitResumable` calls (the counter is never reset).
+   */
+  polls: number;
+  /** Last status observed during this call, or undefined if no poll ran. */
+  lastStatus?: CrawlerStatus;
+  /** Why the call returned. */
+  reason: CrawlWaitReason;
+}
+
 /**
  * High-level fluent wrapper around a single crawler job lifecycle.
  *
@@ -51,7 +75,9 @@ import type {
 export class Crawl {
   private _uuid?: string;
   private _status?: CrawlerStatus;
-  private readonly _artifactCache: Map<CrawlerArtifactType, CrawlerArtifact> = new Map();
+  private _pollCount = 0;
+  private readonly _artifactCache: Map<CrawlerArtifactType, Promise<CrawlerArtifact>> = new Map();
+  private readonly _artifactInFlight: Map<CrawlerArtifactType, Promise<CrawlerArtifact>> = new Map();
 
   /**
    * @param client Configured {@link ScrapflyClient} that performs the HTTP calls.
@@ -173,6 +199,102 @@ export class Crawl {
             `Timed out waiting for crawl ${this._uuid} after ${maxWait}s`,
             { code: 'TIMEOUT', status },
           );
+        }
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, pollInterval * 1000));
+    }
+  }
+
+  /**
+   * Poll until a terminal state like {@link Crawl.wait}, but with a resumable,
+   * budgeted contract: reaching `maxPolls` or `maxWait` returns a
+   * {@link CrawlWaitResult} instead of throwing, and calling `waitResumable`
+   * again on the same instance continues where the previous call stopped —
+   * the poll counter is cumulative and never reset.
+   *
+   * Failure semantics match `wait()`: a failed crawl throws
+   * `ScrapflyCrawlerError` with code `FAILED`, and a cancelled crawl throws
+   * code `CANCELLED` unless `allowCancelled` is true (then it returns with
+   * reason `'cancelled'`). Calling before `start()` throws code
+   * `NOT_STARTED`.
+   *
+   * @param opts.pollInterval — seconds between polls (default 5)
+   * @param opts.maxWait — maximum seconds to wait in this call (default: no limit)
+   * @param opts.verbose — log progress on every poll
+   * @param opts.allowCancelled — return reason `'cancelled'` instead of
+   *   throwing when the crawl was cancelled
+   * @param opts.maxPolls — maximum total polls for this instance (positive
+   *   integer, cumulative across calls); when reached, returns with reason
+   *   `'max_polls'`
+   * @param opts.onPoll — invoked after every poll with the latest status and
+   *   the cumulative poll count
+   */
+  async waitResumable(opts?: {
+    pollInterval?: number;
+    maxWait?: number;
+    verbose?: boolean;
+    allowCancelled?: boolean;
+    maxPolls?: number;
+    onPoll?: (status: CrawlerStatus, polls: number) => void;
+  }): Promise<CrawlWaitResult> {
+    this.requireUuid();
+    const pollInterval = opts?.pollInterval ?? 5;
+    const maxWait = opts?.maxWait;
+    const verbose = opts?.verbose ?? false;
+    const allowCancelled = opts?.allowCancelled ?? false;
+    const maxPolls = opts?.maxPolls;
+    const onPoll = opts?.onPoll;
+    if (maxPolls !== undefined && (!Number.isInteger(maxPolls) || maxPolls < 1)) {
+      throw new errors.ScrapflyCrawlerError('maxPolls must be a positive integer', {
+        code: 'INVALID_OPTIONS',
+      });
+    }
+    const start = Date.now();
+    let lastStatus: CrawlerStatus | undefined;
+
+    while (true) {
+      if (maxPolls !== undefined && this._pollCount >= maxPolls) {
+        return { completed: false, polls: this._pollCount, lastStatus, reason: 'max_polls' };
+      }
+
+      const status = await this.status(true);
+      this._pollCount += 1;
+      lastStatus = status;
+      if (verbose) {
+        log.info(
+          `crawl ${this._uuid} status=${status.status} visited=${status.state.urls_visited}/${status.state.urls_extracted}`,
+        );
+      }
+      onPoll?.(status, this._pollCount);
+
+      if (status.is_finished || status.status === 'CANCELLED') {
+        if (status.isFailed) {
+          throw new errors.ScrapflyCrawlerError(
+            `Crawl ${this._uuid} failed: ${status.state.stop_reason ?? 'unknown reason'}`,
+            { code: 'FAILED', stop_reason: status.state.stop_reason, status },
+          );
+        }
+        if (status.isCancelled) {
+          if (!allowCancelled) {
+            throw new errors.ScrapflyCrawlerError(
+              `Crawl ${this._uuid} was cancelled (reason: ${status.state.stop_reason ?? 'unknown'})`,
+              { code: 'CANCELLED', stop_reason: status.state.stop_reason, status },
+            );
+          }
+          if (verbose) {
+            log.info(`crawl ${this._uuid} was cancelled (allowCancelled=true)`);
+          }
+          return { completed: false, polls: this._pollCount, lastStatus, reason: 'cancelled' };
+        }
+        // status.isComplete
+        return { completed: true, polls: this._pollCount, lastStatus, reason: 'completed' };
+      }
+
+      if (maxWait !== undefined) {
+        const elapsedSeconds = (Date.now() - start) / 1000;
+        if (elapsedSeconds + pollInterval > maxWait) {
+          return { completed: false, polls: this._pollCount, lastStatus, reason: 'max_wait' };
         }
       }
 
@@ -336,26 +458,58 @@ export class Crawl {
   }
 
   /**
-   * Download the WARC artifact (cached after first call).
+   * Download an artifact, caching the in-flight/resolved promise so
+   * concurrent callers share a single `crawlArtifact` request.
+   *
+   * With `refresh: true` the cached entry is discarded and replaced by a
+   * fresh download — unless one is already in flight, in which case the
+   * caller joins it. Failed downloads are evicted so a later call can retry.
    */
-  async warc(): Promise<CrawlerArtifact> {
+  private artifact(type: CrawlerArtifactType, refresh: boolean): Promise<CrawlerArtifact> {
     const uuid = this.requireUuid();
-    const cached = this._artifactCache.get('warc');
-    if (cached) return cached;
-    const artifact = await this.client.crawlArtifact(uuid, 'warc');
-    this._artifactCache.set('warc', artifact);
-    return artifact;
+    if (!refresh) {
+      const cached = this._artifactCache.get(type);
+      if (cached) return cached;
+    }
+    const inFlight = this._artifactInFlight.get(type);
+    if (inFlight) return inFlight;
+    const pending = this.client.crawlArtifact(uuid, type);
+    this._artifactInFlight.set(type, pending);
+    this._artifactCache.set(type, pending);
+    const settle = () => {
+      // Only evict entries that still point at this exact promise — a
+      // refresh may already have replaced them.
+      if (this._artifactInFlight.get(type) === pending) {
+        this._artifactInFlight.delete(type);
+      }
+    };
+    pending.then(settle, () => {
+      settle();
+      // Don't cache failures: a later call should retry the download.
+      if (this._artifactCache.get(type) === pending) {
+        this._artifactCache.delete(type);
+      }
+    });
+    return pending;
+  }
+
+  /**
+   * Download the WARC artifact (cached after first call).
+   *
+   * Concurrent calls share a single download. Pass `{ refresh: true }` to
+   * discard the cached artifact and replace it with a fresh download.
+   */
+  warc(opts?: { refresh?: boolean }): Promise<CrawlerArtifact> {
+    return this.artifact('warc', opts?.refresh ?? false);
   }
 
   /**
    * Download the HAR artifact (cached after first call).
+   *
+   * Concurrent calls share a single download. Pass `{ refresh: true }` to
+   * discard the cached artifact and replace it with a fresh download.
    */
-  async har(): Promise<CrawlerArtifact> {
-    const uuid = this.requireUuid();
-    const cached = this._artifactCache.get('har');
-    if (cached) return cached;
-    const artifact = await this.client.crawlArtifact(uuid, 'har');
-    this._artifactCache.set('har', artifact);
-    return artifact;
+  har(opts?: { refresh?: boolean }): Promise<CrawlerArtifact> {
+    return this.artifact('har', opts?.refresh ?? false);
   }
 }
