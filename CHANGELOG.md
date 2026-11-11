@@ -1,0 +1,242 @@
+# Changelog
+
+All notable changes are documented here. Format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.7.7] — 2026-10-19
+
+### Fixed
+- **Home shelves no longer render as headers over empty strips**
+  (`hearth/effects.py`): the entrance fade parked a `QGraphicsOpacityEffect`
+  on every visited stack page and never took it back off. Qt graphics effects
+  do not compose down the ancestor chain, so any effect-carrying child below
+  the page — every shelf card's ground shadow, the now-playing row's
+  breathing glow — was blanked in the composite. Top tracks and On Repeat
+  showed their titles, the reserved strip space and the Glow Mix button, but
+  not one card. `fade_in` now rents its effect: the ramp lands, one deferred
+  event-loop turn later the effect is handed back (guarded by a generation
+  counter against rapid view switching, and by `_alive` against teardown).
+- **Quick picks is a blend, not a last-write-wins race** (`hearth/app.py`,
+  `hearth/config.py`): the six seeded guest-API searches all wrote the same
+  home shelf, so whichever query finished last simply erased the five before
+  it — the row could land as one lonely card. Results now accumulate per
+  query (`_merge_quick_picks`), render as one deduped blend in
+  `config.QUICK_PICKS` order, capped to `config.QUICK_PICKS_SHELF_LIMIT`
+  (12); an empty or junk result contributes nothing and never erases the
+  queries that already landed, and each new home sweep starts clean.
+
+### Added
+- Regression suite for both fixes: fade-rental lifecycle tests (release,
+  re-rent, newer-fade guard, deleted-host guard, and a composite-pixel
+  probe asserting shadowed cards render under a finished fade), home-view
+  render regressions over the full app stack, and Quick picks blend tests
+  (accumulation, dedupe + config order, empty-result tolerance, shelf cap,
+  sweep reset).
+
+## [0.7.6] — 2026-10-17
+
+### Fixed
+- **Playback no longer stops in the middle of a song** (`hearth/player.py`,
+  `hearth/config.py`): YouTube increasingly truncates throttled streams, and
+  QMediaPlayer then reports `EndOfMedia` while the song is barely halfway
+  through — which the core treated as a natural finish and rolled to the next
+  track (or fell silent). Any `EndOfMedia` that lands before
+  `config.STREAM_TRUNCATION_RATIO` (0.92) of the track's known duration is now
+  healed exactly like a mid-song stream death: a freshly resolved URL rejoins
+  the song at the cut point, under the existing bounded rejoin budget.
+  Tracks with unknown duration and live radio are never judged premature, and
+  a stream that never produced audio still ends honestly (no healing loops on
+  restored sessions).
+- **Failed stream resolution retries instead of leaving dead air**
+  (`hearth/app.py`, `hearth/config.py`): when a `LoadJob` failed — first play
+  or mid-song rejoin — the player used to just sit there with a status line.
+  Both paths now share `_launch_load()`, which retries the resolve up to
+  `config.RESOLVE_MAX_RETRIES` (2) times with a linear backoff, stands down
+  the moment the user picks another song, and clears the ledger once audio
+  actually starts.
+- **Search works even when the catalogue leg is bot-checked**
+  (`hearth/jobs.py`, `hearth/catalog.py`): the main search box consulted only
+  the YT Music guest catalogue — one failed leg and the page showed zero
+  results, looking completely broken. `SearchJob` now runs
+  `search_everywhere` (songs → videos → the yt-dlp web index), the same
+  insurance the World Explorer always had. A pasted link the catalogue cannot
+  name is now fetched straight from yt-dlp (`web_track_for_id`), so rare
+  uploads pasted by URL finally resolve.
+- **Stream resolution is network-hardened** (`hearth/stream.py`): playback
+  resolution gets a bounded second attempt with a fresh extractor, a 15s
+  socket timeout, and yt-dlp-level retries, so one dropped handshake no
+  longer kills the play request. The yt-dlp floor was raised to 2025.9.23 —
+  stale bundled extractors are the top cause of YouTube playback failures.
+- **`_map_song` no longer crashes on a null thumbnail**
+  (`hearth/catalog.py`): some `get_song` responses carry `thumbnail: null`,
+  which blew up the `.get("thumbnails")` chain on the pasted-link path.
+
+### Added
+- **Windows lockscreen integration is wired up** (`hearth/smtc.py`,
+  `hearth/app.py`): the MPRIS row's twin is finally connected. The pure
+  mappers (`metadata_map`, `timeline_map`, `button_command`) and the
+  `SmtcService` lifecycle were already in place, but the service was
+  never instantiated from `app.py` — on Windows, the lockscreen, the
+  volume flyout, and the hardware media keys had no idea Hearth was
+  playing. A new `create_windows_bridge()` factory builds a real
+  `SystemMediaTransportControls` instance via `winsdk`, routes
+  `ButtonPressed` events back through `button_command` into the same
+  playback core the tray uses, and degrades to a silent no-op on any
+  non-Windows / non-winsdk box (so Linux/macOS tests stay clean). A
+  new `config.SMTC_ENABLED` flag mirrors `config.MPRIS_ENABLED`. The
+  `data_dir()` docstring now also documents the Windows and macOS
+  paths (it was Linux-only), and the `--ribbon` flag is detected with
+  an exact argv match instead of a fragile substring scan.
+- **`launch.bat` surfaces silent `pythonw.exe` failures**: the GUI
+  launcher has no console and no stderr, so a failed import (missing
+  dependency, broken venv, AV interference, PyQt6 DLL hell) used to look
+  like "the app did nothing". Stderr is now redirected to a
+  `%APPDATA%\hearth\Hearth\startup.err` log; if the boot crashes, the
+  traceback is printed to the console and `launch_debug.bat` is
+  suggested. On a successful boot the empty err log is cleaned up so a
+  later crash doesn't surface stale output.
+- **`install.bat` no longer silently swallows pip self-upgrade
+  failures**: on locked-down corporate Windows boxes with proxy / cert
+  setups, the `pip install --upgrade pip` step can fail even when the
+  requirements install (which uses the bundled pip) would have worked.
+  The failure is now logged and the install continues instead of being
+  masked; the requirements install itself is the hard fail.
+- **`LYRICS_FONT_FAMILIES` is now cross-platform**: previously the
+  lyrics font dropdown was Windows-skewed (`Segoe UI`, `Consolas`); on
+  Linux every entry silently fell through to Qt's default. The list
+  now spans Windows / macOS / Linux and includes serif, mono, and
+  fallback families.
+- **Wave 3 — the living room (motion + muscle)**: the 3D room answers the
+  hand and the listener gets new power. *Motion*: a pure lift ladder
+  (`hearth/motion.py`) drives hover-lift and press-plant on shelf/discover
+  cards and the transport flats, staggered "grounding" entrances for shelf
+  cards, a rise-in command palette, a breathing shadow on the mini player,
+  a breathing accent glow on the playing row in the queue, pressed slider
+  faces, and findable keyboard-focus rims — all switchable off with
+  `config.MOTION_ENABLED` (reduced motion keeps every resting shadow).
+  *Muscle*: queue dock shows the remaining time plus Reverse / Dedup / Now
+  (jump to playing) / Shuffle-upcoming; two new palettes (Ember Dusk,
+  Lantern high-contrast); a text-size dial (Ctrl+K "Bigger/Smaller text",
+  85–130%, restart-safe and compounding-proof); four new global hotkeys
+  (mute, volume up/down, repeat cycle); Ctrl+1..9 jumps straight to views;
+  the History page grows a client-side filter box; the Stats dashboard
+  gains a live "day streak" tile (`rewind.current_streak`); the app reopens
+  on the last view you used and the mini player remembers its corner.
+  The glass test no longer leaks its style into other tests.
+  982 tests green, up from 864.
+- **The 3D pass — Hearth in Relief** (`docs/UI-DEPTH.md`): Spotify is a flat
+  poster; Hearth locks into depth. One light from above — a radial spotlight
+  floor the whole room sits on — and every surface at a height: carved cards
+  and buttons with bright top lips and dark under-lips, pressed-in search
+  fields and slider grooves, a glossy accent ramp that sinks when pressed,
+  3D sphere slider handles, and a player bar that now floats as a rounded
+  card with a real drop shadow. The mini player, command palette (now a
+  translucent rounded shell), floating panel, and toasts all hover with real
+  or painted ground shadows; home shelf cards lift off the floor. Every tone
+  is derived from the active palette at compile time (no new color fields);
+  strength dials live in `config.py` (`DEPTH_RADIUS`, `DEPTH_SHADOWS`) and
+  every pack (glass, veil, neon) inherits the depth for free. 864 tests green.
+- This changelog.
+- **UI redesign, act II — the last emoji leave the building**: menus,
+  status-bar messages, the World Explorer's 74 genre chips, the Rewind
+  story, the tray icon, toasts, the party inbox, diagnostics, the update
+  whisper, and even the phone-remote web page now speak the same clean
+  design language — plain text, vector flame marks, and inline SVG
+  transport buttons (play/pause swaps itself live). The tray and taskbar
+  icon is painted from the same in-memory vector flame as the app
+  (palette-tinted), the Rewind share card colors its headline by position
+  instead of emoji sniffing, and world genre chips read as honest text.
+- **UI redesign — the slop purge**: every emoji icon in the visible chrome
+  (sidebar, player bar, headers, chips, dialogs, ribbon, mini player,
+  cover placeholder) is replaced by a 44-icon in-memory vector set
+  (`hearth/icons.py`, QSvgRenderer, no assets, retina-crisp, palette-tinted).
+  The stylesheet is rebuilt flat and modern: honest surfaces instead of
+  2020s gradients, softer hairlines, tighter radii, a real wordmark with a
+  painted vector flame, accent-tinted active nav pills, slimmer sliders,
+  and a calmer play-button glow. Icons re-tint themselves when the theme
+  or accent changes.
+- **Wave-2 wiring — the engines became buttons** (854 tests green):
+  - **🪟 Pocket hearth (floating mini player)**: Ctrl+K → "Mini player"
+    opens a frameless, always-on-top pocket transport you can drag
+    anywhere — cover dot, marquee title (ping-pong walk, rests at the
+    seams), artist + clock, transport, slim seek, and ⤢ / double-click
+    to hand the stage back to the main room. The pure model
+    (`hearth/minimode.py`: `Marquee`, `fmt_clock`, `MiniPlayerModel`)
+    is headless-tested with no Qt; the widget is built lazily and only
+    mirrors what the model says. Playback mirrors into the model from
+    boot, so the pocket never opens stale.
+  - **📝 Lyrics chip** on the search page: a remembered line becomes the
+    song. Cache hits play directly; LRCLIB hits earn one catalog search
+    each via `resolve_lyric_hits` (pure, injected, never raises).
+    `LyricSearchJob` runs both legs off the UI thread.
+  - **✨ Enhance button** on every playlist: `EnhanceJob` sprinkles
+    radio-shaped picks via `catalog.radio` and refreshes the view.
+  - **🟢 From Spotify** button in Your Library: the `ImportDialog` takes
+    a pasted JSON export / Exportify CSV / embed page (name + format
+    override), `ImportJob` runs `switchboard.import_spotify` on the
+    worker pool, and the rebuilt playlist opens itself.
+  - **🎉 Party suggestions reach the host**: the remote Bridge gained
+    `suggest`/`pending_suggestions` (the `/api/suggest` route was live
+    but unanswered), a 4 s poller nudges the status bar, and the
+    `PartyInboxDialog` (Ctrl+K → "Party suggestions") queues or skips
+    every guest pick. Host playback stays authoritative.
+  - **🎚️ Sound Forge bench**: `hearth/sound_shape.py` (10-band EQ table,
+    presets, karaoke mid/side DSP, preamp math — all clamped, pure,
+    tested) plus the `SoundForgeDialog` panel. The **preamp is real
+    today**: `PlaybackCore.set_preamp` folds it into the master volume
+    and the crossfade ramp; band gains and the karaoke cut wait for a
+    PCM tap (Qt Multimedia exposes none). Settings persist in the new
+    `sound_settings` table and restore at startup.
+- **Room 10 — The Ember Feed (engines)**: `hearth/feeds.py` — the weekly
+  Ember Feed (cooling rotation + deep cuts + rotation B-sides), the
+  Daylist (hour-of-day mixes from history), release radar
+  (`follows`/`radar_releases` tables, `sweep_artist()`), and marked
+  queue suggestions. Local-first; the only network lives in injected
+  fetchers the job pool controls.
+- **Room 12 — The Pantry (engine)**: `hearth/stream_cache.py` — a
+  size-capped disk LRU of resolved streams (mtime-ordered, touch-on-hit,
+  safe-while-playing broom). A replay shelf, not a download store.
+- **Room 13 — The Broadcast Tower (engines)**: `hearth/podcasts.py` —
+  keyless RSS parsing (iTunes namespace aware), OPML import/export,
+  open iTunes discovery (search + charts + feed lookup), and
+  `podcast_*` storage with per-episode position/played memory that
+  survives refreshes.
+- **Room 15 — The Wise Fire (engines)**: `hearth/prompts.py` —
+  natural-language prompt playlists via a mood-word → YTM-query map
+  (no LLM in the loop, zero-network fallback always exists), with
+  round-robin, dedupe, and per-query failure isolation in assembly.
+- 60 new headless tests covering the four engine rooms (706 total).
+- **Room 6.4 groundwork — lyrics-line search**: a capped
+  `lyrics_cache` table in the store plus scoring and search in
+  `hearth/lyrics.py` — the offline leg (`search_cache`) works with the
+  network unplugged, the keyless LRCLIB leg (`search_online`) sweeps
+  for lines nobody has played yet, and both return ranked `LyricHit`s
+  without ever raising.
+- **Room 8.2 groundwork — party suggestions**: `hearth/remote.py`
+  grows a bounded, dedupe-bumping `SuggestionInbox`, a token-gated
+  `/api/suggest` route, a paste-anything `parse_video_id`, and a
+  "Suggest a song for the host" card on the remote page. Host playback
+  stays authoritative — guests can only whisper into the inbox.
+- **Room 8.3 groundwork — Windows SMTC shim**: `hearth/smtc.py` — pure
+  `metadata_map` / `timeline_map` / `button_command` mappers and a
+  fake-bus `SmtcService`, mirroring the MPRIS guarded-import
+  discipline (silent no-op wherever winsdk is absent).
+- **The Welcome Mat — Spotify playlist importer**: `hearth/switchboard.py`
+  — parses Spotify JSON exports, Exportify CSVs, and embed-page HTML;
+  cleans video-noise, queries under the lead artist, collapses
+  duplicate videos, and files an honest `ImportReport` into a real
+  playlist. No login, no keys, no crawler.
+- **Playlist Enhance**: `hearth/enhance.py` — the one-tap sprinkle
+  with per-pick seed attribution ("radio from …") and store
+  integration.
+- 75 new headless tests (781 total).
+
+## [0.1.0] — earlier
+
+See `git log` for the history before this changelog was introduced.
+
+[unreleased]: https://github.com/e2sy/hearth/compare/v0.7.7...HEAD
+[0.7.7]: https://github.com/e2sy/hearth/compare/v0.7.6...v0.7.7
+[0.7.6]: https://github.com/e2sy/hearth/compare/v0.7.5...v0.7.6
+[0.1.0]: https://github.com/e2sy/hearth/releases/tag/v0.1.0
