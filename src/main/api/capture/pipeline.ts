@@ -187,6 +187,16 @@ export function sniffImageExt(buf: Buffer): string | null {
   return null
 }
 
+/** Leading-markup sniff — catches HTML login / anti-bot pages even when the
+ *  server lies and labels them with an image/* Content-Type. */
+function looksLikeMarkup(buf: Buffer): boolean {
+  const head = buf
+    .subarray(0, 256)
+    .toString('latin1')
+    .replace(/^\uFEFF?\s+/, '')
+  return /^<!doctype\s|^<html[\s>]|^<\?xml[\s?]/i.test(head)
+}
+
 /** Fetch one remote image (no Referer unless the caller sets one) into
  *  .assets/YYYY/MM/uuid.ext; returns the workspace-relative path. Null on
  *  failure, oversize (streamed with a hard cap — a hostile response must
@@ -211,7 +221,7 @@ export async function downloadImageToAssets(
       if (done) break
       total += value.byteLength
       if (total > MAX_IMAGE_BYTES) {
-        void reader.cancel()
+        await reader.cancel()
         return null
       }
       chunks.push(value)
@@ -222,6 +232,9 @@ export async function downloadImageToAssets(
     const contentType = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase()
     const sniffed = sniffImageExt(buf)
     if (!contentType.startsWith('image/') && !sniffed) return null
+    // A 200 login / anti-bot page with a forged image/* Content-Type is
+    // still not an image. SVG is exempt — it legitimately IS markup.
+    if (contentType !== 'image/svg+xml' && looksLikeMarkup(buf)) return null
     const ext =
       (contentType.startsWith('image/') && mime.extension(contentType)) || sniffed || 'png'
 
