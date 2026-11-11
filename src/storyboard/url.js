@@ -6,6 +6,8 @@
  * —— 改这里的规则等于改"什么算同一条视频"，不该埋在取流代码中间。
  */
 
+import { checkFetchableUrl } from './url-guard.js';
+
 /** 是不是 http(s) 链接。其它一切（含 file://、裸路径）都按本地文件处理。 */
 export function isHttpUrl(value) {
   if (typeof value !== 'string') return false;
@@ -18,32 +20,22 @@ export function isHttpUrl(value) {
   }
 }
 
-const PRIVATE_HOST = [
-  /^localhost$/i,
-  /^127\./,
-  /^0\./,
-  /^10\./,
-  /^192\.168\./,
-  /^172\.(1[6-9]|2\d|3[01])\./,
-  /^169\.254\./,
-  /^\[?::1\]?$/,
-  /^\[?f[cd][0-9a-f]{2}:/i,
-];
-
 /**
  * 允许的链接：只放 http(s)，且**拒绝内网地址**。
  * 理由不是洁癖 —— yt-dlp 会把链接交给 ffmpeg，一个 169.254.169.254 就能把云元数据读出来。
+ *
+ * 判定委托给 url-guard.js：先把主机解析成真实地址（含 2130706433、0x7f.1、::ffff:10.0.0.1
+ * 这类绕过字符串正则的写法）再分类。这里只负责把判定结果翻译成兼容的 Error。
  */
 export function assertFetchableUrl(raw) {
-  const value = String(raw).trim();
-  if (!isHttpUrl(value)) {
-    throw new Error('only http(s) links are fetched; for a local file pass the path directly');
+  const verdict = checkFetchableUrl(raw);
+  if (!verdict.ok) {
+    if (verdict.category === 'not-http' || verdict.category === 'invalid-url') {
+      throw new Error('only http(s) links are fetched; for a local file pass the path directly');
+    }
+    throw new Error(`refusing to fetch a private/loopback host: ${verdict.host} (${verdict.category}: ${verdict.reason})`);
   }
-  const { hostname } = new URL(value);
-  if (PRIVATE_HOST.some((re) => re.test(hostname))) {
-    throw new Error(`refusing to fetch a private/loopback host: ${hostname}`);
-  }
-  return value;
+  return verdict.url;
 }
 
 /**
