@@ -1,0 +1,14 @@
+{
+  "id": "03_timestamp_accuracy",
+  "derived": {
+    "twice": "tests/fixtures/ja_short.wav",
+    "gap": 1.5
+  },
+  "request": {
+    "language": "ja",
+    "word_timestamps": true
+  },
+  "metric": "timestamps",
+  "onset_tolerance": 1.5,
+  "note": "Same Japanese utterance twice with a 1.5 s gap, built at run time from the committed fixture. Whisper attaches leading silence to the first segment, so onsets are checked with a 1.5 s tolerance; the second onset is the first copy's duration + gap + its 1.0 s lead."
+}

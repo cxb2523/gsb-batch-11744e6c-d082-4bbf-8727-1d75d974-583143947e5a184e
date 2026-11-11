@@ -1,0 +1,92 @@
+# Testing
+
+```bash
+pip install -e ".[faster-whisper]"          # engine needed for integration tests and evals
+python -m unittest -v tests/test_unit.py tests/test_security.py tests/test_paths.py tests/test_conformance.py tests/test_haas.py tests/test_version_source.py tests/test_speechcpp.py tests/test_whisperx.py
+python -m unittest -v tests/test_integration.py
+python evals/run.py
+```
+
+## Layers
+
+| layer | file | needs | what it proves |
+|-------|------|-------|----------------|
+| unit | `tests/test_unit.py` | ffmpeg/ffprobe for the service tests (silent WAV made with `wave`) | request validation; Transcript/Segment/Word schema; timestamp, ordering, containment, confidence, language rules; malformed results; engine contract; EngineRegistry (register/get/list/inspect/find_by_*), execution modes, capability and offline filtering, ModelStatus states, contract JSON against `engine_spec.schema.json`; cache key determinism and invalidation (input, engine id, engine version, execution mode, model, model version, language, parameters), cache separation across engines, corrupt entries; timeout; budget; offline (local model allowed, missing model refused, remote engine refused); provenance `execution_mode`; dry-run; JSON/SRT/VTT output; credential / command / path leakage; SpeechEvent output; speaker merge (ADR-037: non-null `speaker_id` against the validator and the JSON Schema, word votes, ties and gaps stay null, overlap regions reported, source mismatch / preset ids / bad turns refused, tool + `run -` + CLI, `speaker_turns` on transcribe and batch never changes the cache) |
+| unit (contract) | `tests/test_unit.py::ContractDriftTests`, `SelectionMatrixTests`, `JsonProtocolTests` | ffmpeg not needed (JSON protocol runs the CLI) | contract ↔ implementation drift (tools dispatched and exposed on the CLI, EngineSpec == live engine == registry, capabilities derived from methods, schema versions in code/contract/files); availability matrix (engine available/unavailable, model available/missing/download-required, offline, remote, word timestamps, language detection, engine/model mismatch, no ranking); every `--json` command and `run -` emit one JSON document on success and error |
+| paths | `tests/test_paths.py` | ffmpeg for the service-level cases; symlink/FIFO cases run where the OS provides them and skip with a stated reason elsewhere | containment semantics for posix and nt paths (prefix collision, drive/UNC escape, case folding); allowed roots (relative/absolute inside, outside, traversal in every form, symlink in/out/broken, root given via symlink, directory, FIFO, `/dev/null`, drive/UNC strings); workspace run-dir exclusivity and symlinked `tmp/` refusal; cache keys never path-like; unknown environment variables ignored; service/dry-run enforcement; relative vs absolute share identity; `run -` parity; doctor rows; CLI JSON on violation |
+| conformance | `tests/test_conformance.py` | ffmpeg for check 4 | the eight `kajisho5/AI-video-production-OS` `docs/SKILL_SPEC.md` §8 checks, run through this Skill's own `run -` / `doctor --json` / `skill --json`: contract published with `skill_id`, `contract_version`, well-formed `provides`; forbidden keys rejected at top level and nested; no unsafe shell-out (AST) plus a metacharacter probe treated as data; input confinement to allowed roots incl. symlink escape, tmp/cache inside the workspace; no clobbering of an input; lifecycle per capability; machine-readable doctor; dependency version ranges |
+| security | `tests/test_security.py` | nothing | static scan of the package: no shell, eval, exec, dynamic imports, network or agent/provider imports; every subprocess call is a list argv; engine modules never import subprocess, and only `engines/speechcpp.py` runs a program, through `media.run_program`, never as `serve`/`worker`/`pull`/`update`; only the implemented engines (`faster_whisper`, `haas_ja`, `speechcpp`) registered, local, no network; environment-variable allow-list, no executable override, literal worker argv; no credential-looking strings; forbidden request keys |
+| haas_ja (unit) | `tests/test_haas.py` | ffmpeg for the service cases; no torch, NeMo, GPU or model | the optional Haas-ja-v1.0 engine (ADR-033) against a fake `haas_asr` module shaped after the upstream sources: availability reasons (not Linux, Python < 3.11, not installed, installed but failing to import, no CUDA) with `haas_asr` never imported when the platform/Python checks fail; model cache states and loading from the cached `.nemo` file; NeMo token timestamps → timed word groups and segments (zero-duration TDT tokens, punctuation, byte fallback, pause split, fallback to NeMo segments without words, no timestamps = failure); long-form chunk offsets; vocabulary pass-through and text projection; request vocabulary validation; per-engine default model; selector; provenance and cache identity through the service; refusals; CLI `--vocabulary` |
+| speechcpp (unit) | `tests/test_speechcpp.py` | ffmpeg for the service and worker cases; no speech.cpp, no model | the optional speech.cpp engine (ADR-035) against `tests/fake_speech.py`, a fake `speech` with speech.cpp 0.10.0's subcommands, flags, JSON shapes, exit codes and model folder, which refuses a model given by name and logs every argv: availability (not on PATH, too old, not speech.cpp, the fixed contract entry), model status from `speech models --json` (fetched, missing, detector missing, weight types, unknown), licences, regions → segments and words (timed models), region segments with null words (Qwen3-ASR, `untimed`), the argv (absolute `.gguf` paths, fixed VAD flags, region files by name), no credentials in `speech`'s environment, language refusal, `model_limit`, structured failures, timeout killing the process group, doctor rows (binary, version, backend, models), service and worker paths with the fake found on PATH |
+| speechcpp (real) | `tests/test_speechcpp.py::RealSpeechCppTests` | the real `speech` on PATH with `parakeet-tdt_ctc-0.6b-ja:q4_k`, `qwen3-asr-0.6b:q4_k` and `silero-vad` fetched (the `engines` CI job); skipped elsewhere with the reason | the CLI has the subcommands and flags the engine uses; the Japanese fixture through the real engine in the worker: CER ≤ 0.3, valid transcript, word timestamps from the timed model, null words from Qwen3-ASR; doctor's binary, backend and detector rows |
+| whisperx (unit) | `tests/test_whisperx.py` | ffmpeg for the service cases; no whisperX, torch, faster-whisper or model (numpy only for one WAV case, skipped without it) | the optional whisperX engine (ADR-038) against a fake `whisperx` module shaped after v3.8.6 and a faked faster-whisper cache: availability (Python < 3.10 never imports whisperX, not installed), spec, the licence-checked alignment models, Whisper/alignment model states and doctor rows, the `load_model` / `load_align_model` / `align` arguments (explicit alignment repo, single temperature, `local_files_only` / `model_cache_only` offline), word merging for untimed words (en with spaces, ja without), words null without `--word-timestamps`, offline refusals (alignment model, punkt_tab), language refusal, load vs runtime failures, WAV reading, a static check that it never diarizes or calls `load_audio`, provenance and cache through the service |
+| version | `tests/test_version_source.py` | ffmpeg for the provenance case | every reported version equals `pyproject.toml`'s, read with the release workflow's own reader (ADR-034): `__version__`, the contract (`contract --json`, `skill --json`), `--version`, `doctor --json`, a transcript's `provenance.skill_version`; an installed copy (no `pyproject.toml` above it) reads the dist-info next to it even when a stale one comes first on `sys.path` |
+| integration | `tests/test_integration.py` | ffmpeg + faster-whisper + the `base` model (auto-downloaded, ~145 MB) | real recognition of the Japanese and English fixtures, video with audio, audio-only, word timestamps, language detection, cache hit with the worker launch patched to fail (proves no engine process starts), determinism of two uncached runs, SRT/JSON export, a real worker timeout, budget, offline end-to-end (local model runs, non-local model refused, `engines --offline`, `doctor --offline`), `run -` transport, CLI smoke |
+| evals | `evals/run.py`, `evals/cases/*.json` | same as integration | recognition quality with explicit thresholds (see below) |
+
+The unit tests use `tests/fake_engine.py`, a deterministic engine that exists only in the test suite
+and is not registered in the package. It can pose as a local or a remote engine (`execution_mode`,
+`requires_network`) and as having local, downloadable or missing models, which is how the contract's
+remote and offline paths are tested without implementing any remote engine. Integration tests and evals are never mocked; if the engine is
+missing they are skipped with a message, and CI installs it so they run there.
+
+## Fixtures
+
+`tests/fixtures/`: `ja_short.wav` (9.6 s), `en_short.wav` (7.8 s), `lecture_short.mp4` (18.5 s, test
+pattern video + both parts with a 1 s gap). `derived.py` builds run-time fixtures from these with ffmpeg (the same
+utterance twice with a gap) for ordering and onset checks; the mixed-language video is used for video handling and
+language detection only, because whether faster-whisper `base` keeps the second language after detecting the first
+is a borderline decision that has flipped between sessions (STATE.md). Generated by `make_fixtures.sh` from open-jtalk
+(nitech-jp-atr503-m001 voice, CC BY 3.0) and espeak-ng; reference texts and timing facts in
+`fixtures.json`. Total under 1 MB. Models are never committed.
+
+## Eval criteria
+
+| case | criterion |
+|------|-----------|
+| 01 Japanese transcription | CER ≤ 0.25 after NFKC folding and removing punctuation/whitespace; word timestamps present. Measured 0.119 with `base` (homophone errors 講演→公園, 音響→音教). |
+| 02 English transcription | WER ≤ 0.20; language `en` detected. Measured 0.0. |
+| 03 timestamp accuracy | derived fixture (the Japanese utterance twice, 1.5 s gap, built at run time by `tests/fixtures/derived.py`): first segment within ±1.5 s of the 1.0 s onset, second utterance within ±1.5 s of its computed onset, last end ≤ duration, words contained and ordered. |
+| 04 segment ordering | same derived fixture: ≥ 2 segments, ascending starts, no overlaps, sequential ids. |
+| 05 SRT correctness | cue count = segment count, cue times within 1 ms, text identical, indices sequential. |
+| 06 cache correctness | second run is a hit with an identical document; a changed parameter misses and yields a different key. |
+| 07 local engine discovery | registry lists exactly `faster_whisper`; it is `local`, `requires_network: false`, has `local_execution`, supports ja/en; the remote query is empty. |
+| 08 offline availability | with the model on disk an `offline` run succeeds (execution_mode local, not served from the online cache); offline + a non-local model is `MODEL_UNAVAILABLE`/`MODEL_MISSING`; offline candidates = `faster_whisper`; a remote-only requirement has no candidate. |
+| 09 engine identity in provenance | transcript records engine, installed version, execution mode, model and revision; the cache key is recomputable from provenance. |
+| 10 cache separation by engine | keys differ for engine id, engine version, execution mode, model, model version. |
+| 11 contract consistency | `skill --json` engines equal the live registry, match `engine_spec.schema.json`, and carry no paths or credential keys. |
+
+| 12 engine registry contract consistency | each contract EngineSpec equals `spec(include_models)`, `inspect()`, class attributes and capability methods. |
+| 13 model status consistency | `status`/`availability`/`source`/`version`/`download_required` agree for every model, online and offline. |
+| 14 offline no download | offline, a non-local model is `MODEL_MISSING` (never DOWNLOAD_REQUIRED); the service refuses; the Hugging Face cache directory is unchanged. |
+| 15 transcript timestamp integrity | finite numbers; `0 ≤ start < end ≤ duration+0.5`; words inside segments and ordered; segments ordered, non-overlapping. |
+| 16 transcript provenance completeness | all provenance fields incl. `skill`, `tool`, `created_at`; `parameters_hash` recomputable; asset fingerprint present. |
+| 17 cache corruption recovery | corrupt and tampered entries are never served (warning + recompute); the repaired cache hits again. |
+| 18 engine/model identity separation | transcript id, cache key, fingerprint, asset id, engine identity are distinct; id changes per computation, key does not. |
+| 19 selector no ranking | selection JSON has only candidates/rejected/requirements, no score/rank/best; selector source has no sort/score. |
+| 20 JSON protocol stability | `skill/contract/doctor/engines --json` and `run -` print exactly one JSON document, on success and on invalid input. |
+
+| 21 allowed root inside | relative and absolute inputs inside a root are transcribed by the real engine and share one cache entry; outside is refused. |
+| 22 traversal rejected | five `..` forms refused with reason `traversal`; unrestricted mode still accepts `..`. |
+| 23 prefix collision | `media_evil` is not authorised by root `media`. |
+| 24 symlink escape | link to outside refused; link to inside resolves to its target. |
+| 25 workspace escape | run dirs are exclusive and inside the workspace; a symlinked `tmp/` is refused. |
+| 26 Windows path boundary | ntpath containment table (case folding, forward slashes, drive/UNC escapes, UNC prefix collision) and host rejection of drive/UNC strings. |
+| 27 cache boundary | path-like keys refused; entries by key under the workspace; same content at two paths → one entry. |
+| 28 doctor path policy | mode, roots, and distinct cache/tmp/model-cache roots; no credentials. |
+| 29 run stdin path policy | `run -` and the CLI refuse the same input with the same reason in one JSON document. |
+| 30 output root policy | with `allowed_output_roots`: inside succeeds, outside / traversal / symlinked directory refused; an input is never overwritten; without roots, unchanged. |
+
+Cases 07–30 evaluate the contract and the boundary, not recognition quality, and make no semantic judgement.
+
+Exact-match is not a criterion anywhere: ASR output has errors, and the evals state how much is
+acceptable. Raise the bar by running with `--model small` or larger.
+
+## CI
+
+`.github/workflows/tests.yml` runs on every pull request, every push to `main` and on manual dispatch (ADR-036):
+unit + security + paths + conformance + haas_ja/speechcpp fakes + version on Ubuntu/Windows/macOS × Python
+3.9/3.11 with ffmpeg, plus the release-tooling tests (`python -m unittest discover -s scripts/release/tests`) on
+the Linux cells; a newer push to the same ref cancels the older run. `.github/workflows/heavy-tests.yml` is manual
+only, to save Actions minutes: `integration` (integration + evals on Ubuntu with faster-whisper and a cached `base`
+model) and `engines` (the real speech.cpp). No job is skipped or marked as passing without running.

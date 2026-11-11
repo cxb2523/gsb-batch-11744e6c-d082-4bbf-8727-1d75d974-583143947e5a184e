@@ -1,0 +1,44 @@
+# Actions-minutes policy (owner decision, ADR-036): every pull request and every push to main runs this
+# `unit` matrix only (Ubuntu/Windows/macOS x Python 3.9/3.11; no model download, no network beyond pip).
+# The heavy jobs live in heavy-tests.yml and stay manual (`workflow_dispatch`): `integration` downloads
+# faster-whisper `base` and `engines` pulls speech.cpp and its models. A newer push to the same ref cancels
+# the older run.
+name: tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.9", "3.11"]
+    # ubuntu-latest is Ubuntu 26.04, which has no Python 3.9 build; keep 3.9 on the newest image that does
+    runs-on: ${{ matrix.python == '3.9' && startsWith(matrix.os, 'ubuntu') && 'ubuntu-24.04' || matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with: {python-version: "${{ matrix.python }}"}
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+      - run: pip install -e .
+      - run: python -m unittest -v tests/test_unit.py tests/test_security.py tests/test_paths.py tests/test_conformance.py tests/test_haas.py tests/test_version_source.py tests/test_speechcpp.py tests/test_whisperx.py
+      - name: Release-tooling scripts (the release decision, ADR-036)
+        if: runner.os == 'Linux'
+        run: python -m unittest discover -v -s scripts/release/tests

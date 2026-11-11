@@ -1,0 +1,226 @@
+# Full release automation in a single job, triggered on every push to main.
+#
+# Deliberately NOT split into "bump/tag" + "tag-triggered publish" workflows: a tag or commit
+# pushed with the default GITHUB_TOKEN does not trigger other workflow runs (GitHub's built-in
+# anti-recursion rule -- see "Triggering a workflow from a workflow" in GitHub's Actions docs), so a
+# second workflow gated on `on: push: tags:` would simply never fire. Everything -- version
+# resolution, file bump, CHANGELOG.md, git tag, GitHub Release, package publish -- happens here, in
+# one run, using only the SHA/tag this run itself creates.
+#
+# Version resolution: if pyproject.toml's current version already differs from the latest `vX.Y.Z`
+# tag, a human already bumped it manually in the PR that produced this push -- that value is
+# respected as-is and no auto-bump happens (scripts/release/version_state.py). Only when the current
+# version still equals the latest tag does this workflow compute the next version itself, from the
+# labels release-drafter's autolabeler (.github/workflows/pr-labeler.yml) applied to PRs merged since
+# that tag; an unlabeled PR defaults to a patch bump (.github/release-drafter.yml).
+#
+# Non-releasing changes (ADR-036): in auto mode, a push releases only if a file changed since the latest
+# tag is outside .github/, docs/, tests/, scripts/release/ and Markdown (SKILL.md excepted -- agents read
+# it as the Skill). CI-, docs-, test- or chore-only merges therefore cut no release and leave the version
+# that video-production-agent pins untouched; the next merge with a releasing change releases them
+# together. scripts/release/release_scope.py decides from `git diff --name-only <tag> HEAD`, not from PR
+# titles or labels. Manual mode (an explicit pyproject.toml bump) and `[skip release]` are unchanged.
+#
+# CHANGELOG.md is generated from `git log` output read via scripts/release/changelog.py
+# (subprocess.run with an argv list, never shell=True), not from PR titles interpolated into a
+# `${{ }}` expression inside a `run:` block -- that pattern lets a malicious PR title/commit subject
+# inject shell code into the runner, which is exactly what this design avoids.
+#
+# Publishing to PyPI is skipped (tag + GitHub Release still happen) when no PYPI_API_TOKEN secret is
+# configured, since this repository currently distributes via `pip install git+...` only.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  # write: the step before release-drafter removes release-level labels a bot put on Dependabot pull requests
+  pull-requests: write
+
+jobs:
+  release:
+    # Defense-in-depth against ever reprocessing our own release-bump commit (this workflow already
+    # can't be re-triggered by a GITHUB_TOKEN push in the first place -- see header comment -- this
+    # guard only matters if the push token/actor setup ever changes).
+    if: "!contains(github.event.head_commit.message, '[skip release]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Verify release-tooling scripts (isolated unit tests, not this repo's state)
+        run: python3 -m unittest discover -s scripts/release/tests
+
+      - name: Determine version-bump mode
+        id: state
+        run: |
+          python3 scripts/release/version_state.py --pyproject pyproject.toml --repo . | tee state.json
+          python3 scripts/release/ci_write_state_outputs.py
+
+      - name: Check for releasable changes since the latest tag (auto mode only)
+        id: scope
+        if: steps.state.outputs.mode == 'auto'
+        env:
+          LATEST_TAG_VERSION: ${{ steps.state.outputs.latest_tag_version }}
+        run: python3 scripts/release/release_scope.py --repo . --since "v$LATEST_TAG_VERSION" --github-output "$GITHUB_OUTPUT"
+
+      # Dependabot labels a pull request `major` when the dependency it bumps moved a major version, which says
+      # nothing about this product's version. A release-level label on a Dependabot pull request counts only when a
+      # person applied it; a failure here fails the release instead of resolving from unchecked labels.
+      - name: Drop release-level labels a bot put on Dependabot pull requests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/release/dependabot_release_labels.py
+
+      - name: Resolve next version from merged-PR labels (auto mode only)
+        id: resolve
+        if: steps.state.outputs.mode == 'auto' && steps.scope.outputs.releasable == 'true'
+        uses: release-drafter/release-drafter@978bb0b30c5ee8cdd332ced253758157150d43f0 # v7.10.0
+        with:
+          config-name: release-drafter.yml
+          # v7's `dry-run: true` computes `resolved_version` from the merged PRs' labels and creates no
+          # release. (v6 had no dry-run input, so until v7 this step let release-drafter create a draft
+          # release and a later step deleted it; v6's `disable-releaser: true` skipped the version
+          # computation altogether. v7 has neither `disable-releaser` nor `disable-autolabeler`: the main
+          # action never labels, pr-labeler.yml uses the separate autolabeler action.)
+          dry-run: true
+          # release-drafter needs *a* tag to diff from; if there is no latest_tag_version yet this
+          # is the repo's very first release and release-drafter naturally treats it as "everything".
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide final release version
+        id: version
+        env:
+          MODE: ${{ steps.state.outputs.mode }}
+          CURRENT_VERSION: ${{ steps.state.outputs.current_version }}
+          LATEST_TAG_VERSION: ${{ steps.state.outputs.latest_tag_version }}
+          # release-drafter's actual output key is `resolved_version` (underscore) -- its action.yml
+          # lists outputs as id/name/tag_name/body/html_url/upload_url/major_version/minor_version/
+          # patch_version/resolved_version, no hyphenated `resolved-version`. Referencing the wrong key
+          # here was the real reason this always came back empty (both before and after the dry-run fix).
+          RESOLVED_VERSION: ${{ steps.resolve.outputs.resolved_version }}
+          # release_scope.py's verdict; empty in manual mode, where the step does not run, and read as true
+          RELEASABLE: ${{ steps.scope.outputs.releasable }}
+        run: python3 scripts/release/ci_decide_version.py
+
+      - name: Check the target tag does not already exist
+        id: tagcheck
+        if: steps.version.outputs.already_released != 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Nothing new to release
+        if: steps.version.outputs.already_released == 'true' || steps.tagcheck.outputs.exists == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          RELEASABLE: ${{ steps.scope.outputs.releasable }}
+        run: |
+          if [ "$RELEASABLE" = "false" ]; then
+            echo "::notice::Only non-releasing paths changed since $TAG (ADR-036); nothing to release on this push."
+          else
+            echo "::notice::$TAG already exists; nothing to release on this push."
+          fi
+
+      - name: Bump pyproject.toml
+        if: steps.version.outputs.already_released != 'true' && steps.tagcheck.outputs.exists != 'true' && steps.version.outputs.bump_file == 'true'
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.new_version }}
+        run: python3 scripts/release/bump_version.py --pyproject pyproject.toml --new-version "$NEW_VERSION"
+
+      - name: Generate CHANGELOG.md
+        if: steps.version.outputs.already_released != 'true' && steps.tagcheck.outputs.exists != 'true'
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.new_version }}
+          LATEST_TAG_VERSION: ${{ steps.state.outputs.latest_tag_version }}
+        run: |
+          SINCE_ARGS=()
+          if [ -n "$LATEST_TAG_VERSION" ]; then
+            SINCE_ARGS=(--since "v$LATEST_TAG_VERSION")
+          fi
+          python3 scripts/release/changelog.py --repo . --version "$NEW_VERSION" \
+            "${SINCE_ARGS[@]}" --exclude-subject-prefix "chore(release):" --changelog CHANGELOG.md
+
+      - name: Commit release files
+        id: commit
+        if: steps.version.outputs.already_released != 'true' && steps.tagcheck.outputs.exists != 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "chore(release): $TAG [skip release]"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push release commit
+        if: steps.commit.outputs.changed == 'true'
+        run: git push origin HEAD:main
+
+      - name: Tag
+        if: steps.version.outputs.already_released != 'true' && steps.tagcheck.outputs.exists != 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "$TAG"
+
+      - name: Extract this release's CHANGELOG section for the GitHub Release body
+        if: steps.version.outputs.already_released != 'true' && steps.tagcheck.outputs.exists != 'true'
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.new_version }}
+        run: python3 scripts/release/ci_extract_changelog_section.py
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.already_released != 'true' && steps.tagcheck.outputs.exists != 'true'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body_path: release_body.md
+
+      - name: Check for a package-registry token
+        id: registry
+        if: steps.version.outputs.already_released != 'true' && steps.tagcheck.outputs.exists != 'true'
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -n "$PYPI_API_TOKEN" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::PYPI_API_TOKEN is not configured; tag and GitHub Release were created, publish step is skipped."
+          fi
+
+      - name: Build distribution
+        if: steps.registry.outputs.has_token == 'true'
+        run: |
+          python3 -m pip install --upgrade build
+          python3 -m build
+
+      - name: Publish to PyPI
+        if: steps.registry.outputs.has_token == 'true'
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}

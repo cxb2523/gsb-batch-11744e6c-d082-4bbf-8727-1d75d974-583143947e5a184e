@@ -1,0 +1,522 @@
+"""CLI: `transcription doctor | transcribe | segments | export | speakers | check | batch | cache | models | engines | contract | skill | run`.
+
+stdout carries either human-readable text or, with --json, exactly one JSON document. Errors are
+structured: with --json they are the JSON document on stdout; otherwise one `error:` line on stderr.
+Exit codes: 0 success, 1 failure, 2 invalid input / file not found.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from typing import Any, Dict, List, Optional
+
+from . import __version__
+from .doctor import format_doctor, run_doctor
+from .engines import EngineRequirements, default_registry, get_engine, select_engines
+from .errors import TranscriptionError
+from .export import FORMATS
+from .paths import OutputPolicy
+from .request import DEFAULT_ENGINE, default_workspace
+from .skill import run_request, run_tool, skill_contract
+
+
+def _print_json(obj: Any) -> None:
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
+
+
+def _fmt_time(t: float) -> str:
+    m, s = divmod(t, 60)
+    h, m = divmod(int(m), 60)
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+
+def _transcribe_params(args: argparse.Namespace) -> Dict[str, Any]:
+    p: Dict[str, Any] = {"input": args.input, "engine": args.engine, "word_timestamps": bool(args.word_timestamps),
+                         "temperature": args.temperature, "beam_size": args.beam_size, "cache": not args.no_cache, "dry_run": bool(args.dry_run),
+                         "offline": bool(args.offline), "vad_filter": bool(args.vad_filter)}
+    if args.model:
+        p["model"] = args.model
+    if args.language:
+        p["language"] = args.language
+    if args.vocabulary:
+        p["vocabulary"] = _load_vocabulary_file(args.vocabulary)
+    if args.audio_stream is not None:
+        p["audio_stream"] = args.audio_stream
+    if args.initial_prompt:
+        p["initial_prompt"] = args.initial_prompt
+    if args.asset_id:
+        p["asset_id"] = args.asset_id
+    if args.workspace:
+        p["workspace"] = args.workspace
+    if args.allowed_input:
+        p["allowed_input_roots"] = list(args.allowed_input)
+    if args.speaker_turns:
+        p["speaker_turns"] = args.speaker_turns
+    budget: Dict[str, Any] = {}
+    if args.timeout is not None:
+        budget["timeout"] = args.timeout
+    if args.max_audio_seconds is not None:
+        budget["max_audio_seconds"] = args.max_audio_seconds
+    if budget:
+        p["budget"] = budget
+    return p
+
+
+def _load_vocabulary_file(path: str) -> Any:
+    """`--vocabulary FILE`: a UTF-8 JSON object {"written form": ["reading", ...], ...}. Only read here; the
+    request parser validates the content like any other `vocabulary` value."""
+    if not os.path.isfile(path):
+        raise TranscriptionError("FILE_NOT_FOUND", f"vocabulary file not found: {path}")
+    if os.path.getsize(path) > 1024 * 1024:
+        raise TranscriptionError("INVALID_INPUT", "vocabulary file larger than 1 MiB")
+    with open(path, encoding="utf-8-sig") as fh:
+        try:
+            return json.load(fh)
+        except ValueError as exc:
+            raise TranscriptionError("INVALID_INPUT", f"vocabulary file is not valid JSON: {exc}")
+
+
+def cmd_transcribe(args: argparse.Namespace) -> int:
+    params = _transcribe_params(args)
+    res = run_tool("transcription/transcribe", params)
+    if args.dry_run:
+        if args.json:
+            _print_json(res)
+        else:
+            i, e, m, c = res["input"], res["engine"], res["model"], res["cache"]
+            print(f"[dry-run] {i['filename']}: {i['duration']:.2f}s, {'video+audio' if i['has_video'] else 'audio only'}, "
+                  f"{i['audio'].get('channels')}ch {i['audio'].get('sample_rate')}Hz, {i['audio_stream_count']} audio stream(s), "
+                  f"decoding stream {res['audio_stream']}")
+            print(f"  engine    {e['id']} {e['version']} ({e['execution_mode']}, network for recognition: {'yes' if e['requires_network'] else 'no'}, "
+                  f"{e['supported_languages']} languages, word timestamps: {e['word_timestamps']})")
+            print(f"  model     {m['model']}: {m['availability']} ({m['detail']})")
+            print(f"  language  {res['language']}   word timestamps: {res['word_timestamps']}   offline: {res['offline']}   network use: {res['network_use']}")
+            vocab = res["request"].get("vocabulary")
+            if vocab:
+                print(f"  vocabulary {len(vocab)} word(s)")
+            print(f"  budget    timeout {res['budget']['timeout']:g}s, max audio {res['budget']['max_audio_seconds']:g}s")
+            print(f"  cache     {c['status']} ({c['key'][:16]}...)   workspace {res['workspace']}")
+            pp = res["path_policy"]
+            print(f"  input policy {pp['mode']}" + (f": {', '.join(pp['allowed_roots'])}" if pp["allowed_roots"] else ""))
+            print(f"  would run ASR: {'yes' if res['would_run'] else 'no (cached)'}")
+        return 0
+    doc = res["transcript"]
+    out = OutputPolicy(args.allowed_output).resolve_output(args.output or _default_output(args.input), forbid=[args.input])
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, ensure_ascii=False, indent=2)
+    if args.json:
+        _print_json({"ok": True, "output": os.path.abspath(out), "cache_hit": res["cache_hit"], "warnings": res["warnings"], "transcript": doc})
+        return 0
+    n = len(doc["segments"])
+    print(f"{doc['source']['filename']}: {doc['duration']:.2f}s, language {doc['language']} ({doc['language_source']}), {n} segment(s), "
+          f"engine {doc['engine']} {doc['engine_version']} model {doc['provenance']['model']}{' [cache hit]' if res['cache_hit'] else ''}")
+    for seg in doc["segments"]:
+        print(f"  {_fmt_time(seg['start'])} --> {_fmt_time(seg['end'])}  {seg['text']}")
+    for w in list(res["warnings"]) + list(doc["warnings"]):
+        sys.stderr.write(f"warning: {w}\n")
+    print(f"wrote {out}")
+    return 0
+
+
+def _default_output(inp: str) -> str:
+    base, _ = os.path.splitext(inp)
+    return base + ".transcript.json"
+
+
+def cmd_segments(args: argparse.Namespace) -> int:
+    res = run_tool("transcription/segments", {"transcript": args.transcript, "merge_gap": args.merge_gap})
+    if args.output:
+        out = OutputPolicy(args.allowed_output).resolve_output(args.output, forbid=[args.transcript])
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(res, fh, ensure_ascii=False, indent=2)
+    if args.json:
+        _print_json(res)
+    else:
+        for ev in res["events"]:
+            print(f"  {_fmt_time(ev['start'])} --> {_fmt_time(ev['end'])}  {len(ev['transcript_segment_ids'])} segment(s)")
+        print(f"{len(res['events'])} speech event candidate(s)" + (f", wrote {args.output}" if args.output else ""))
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    params: Dict[str, Any] = {"transcript": args.transcript, "format": args.format, "output": args.output}
+    if args.allowed_output:
+        params["allowed_output_roots"] = list(args.allowed_output)
+    res = run_tool("transcription/export", params)
+    if args.json:
+        _print_json(dict(res, ok=True))
+    else:
+        print(f"wrote {res['output']} ({res['format']})")
+    return 0
+
+
+def cmd_speakers(args: argparse.Namespace) -> int:
+    res = run_tool("transcription/speakers", {"transcript": args.transcript, "turns": args.turns,
+                                              "allow_source_mismatch": bool(args.allow_source_mismatch), "replace": bool(args.replace)})
+    doc = res["transcript"]
+    out = OutputPolicy(args.allowed_output).resolve_output(args.output or _default_speakers_output(args.transcript),
+                                                           forbid=[args.transcript, args.turns])
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, ensure_ascii=False, indent=2)
+    if args.json:
+        _print_json({"ok": True, "output": os.path.abspath(out), "warnings": res["warnings"], "transcript": doc})
+        return 0
+    c = doc["speaker_assignment"]["counts"]
+    print(f"{c['assigned']} of {c['segments']} segment(s) got a speaker_id from {len(doc['speaker_assignment']['speakers'])} speaker(s)")
+    for seg in doc["segments"]:
+        print(f"  {_fmt_time(seg['start'])} --> {_fmt_time(seg['end'])}  [{seg['speaker_id'] or '-'}] {seg['text']}")
+    for w in res["warnings"]:
+        sys.stderr.write(f"warning: {w}\n")
+    print(f"wrote {out}")
+    return 0
+
+
+def _default_speakers_output(transcript: str) -> str:
+    base = transcript[:-len(".json")] if transcript.endswith(".json") else transcript
+    return base + ".speakers.json"
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    res = run_tool("transcription/check", {"transcript": args.transcript})
+    if args.json:
+        _print_json(res)
+    else:
+        print(f"{args.transcript}: {'valid' if res['ok'] else 'INVALID'}")
+        for e in res["errors"]:
+            print(f"  error: {e}")
+        for w in res["warnings"]:
+            print(f"  warning: {w}")
+    return 0 if res["ok"] else 1
+
+
+def cmd_engines(args: argparse.Namespace) -> int:
+    reg = default_registry()
+    if args.engine:
+        specs = [reg.inspect(args.engine, offline=args.offline)]
+    elif any(v is not None for v in (args.execution_mode, args.language, args.capability)) or args.offline or args.word_timestamps or args.vocabulary:
+        req = EngineRequirements(execution_mode=args.execution_mode, language=args.language, offline=args.offline, word_timestamps=args.word_timestamps,
+                                 vocabulary=args.vocabulary)
+        sel = select_engines(req, reg)
+        if args.capability:
+            sel.candidates = [c for c in sel.candidates if c.has(args.capability)]
+        if args.json:
+            _print_json(sel.to_dict())
+            return 0
+        for c in sel.candidates:
+            print(f"  candidate {c.id} {c.version} ({c.execution_mode}; {', '.join(c.capabilities)})")
+        for r in sel.rejected:
+            print(f"  rejected  {r.engine_id}: {', '.join(r.reasons)}")
+        print(f"{len(sel.candidates)} candidate(s) for {req.to_dict()}")
+        return 0
+    else:
+        specs = reg.list()
+    if args.json:
+        _print_json({"engines": [s.to_dict() for s in specs]})
+        return 0
+    for sp in specs:
+        state = "AVAILABLE" if sp.available else f"MISSING ({sp.unavailable_reason})"
+        print(f"{sp.id} {sp.version or '-'}: {state}")
+        print(f"  execution {sp.execution_mode}   network for recognition: {'yes' if sp.requires_network else 'no'}   deterministic: {sp.deterministic}")
+        print(f"  capabilities {', '.join(sp.capabilities)}")
+        if sp.available:
+            print(f"  languages {len(sp.supported_languages)}   models {', '.join(sp.supported_models)}   default {sp.default_model}")
+        for m in sp.models:
+            print(f"    {m['model']:18s} {m['availability']:24s} {m['detail']}")
+    return 0
+
+
+def cmd_batch(args: argparse.Namespace) -> int:
+    """`transcription batch MANIFEST.json`: many transcribe requests, one process. MANIFEST is
+    {"items": [<transcription/transcribe params>, ...]}; each item may carry an extra "output" key
+    (a CLI-only convenience, not part of the tool contract) naming where to write its transcript JSON
+    on success -- default <input>.transcript.json, same convention as `transcribe`. One item's failure
+    is reported alongside the others; it never stops the rest of the batch."""
+    with open(args.manifest, encoding="utf-8") as fh:
+        try:
+            manifest = json.load(fh)
+        except ValueError as exc:
+            raise TranscriptionError("INVALID_INPUT", f"manifest is not valid JSON: {exc}")
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("items"), list) or not manifest["items"]:
+        raise TranscriptionError("INVALID_INPUT", "manifest must be a JSON object with a non-empty 'items' list")
+    outputs: List[Optional[str]] = []
+    items: List[Dict[str, Any]] = []
+    for raw_item in manifest["items"]:
+        item = dict(raw_item) if isinstance(raw_item, dict) else raw_item
+        out = item.pop("output", None) if isinstance(item, dict) else None
+        outputs.append(out)
+        items.append(item)
+    res = run_tool("transcription/batch", {"items": items})
+    ok_count = 0
+    for item, out_path, entry in zip(items, outputs, res["results"]):
+        if entry["ok"] and not (isinstance(item, dict) and item.get("dry_run")):
+            doc = entry["result"]["transcript"]
+            dest = out_path or _default_output(item["input"])
+            written = OutputPolicy(args.allowed_output).resolve_output(dest, forbid=[item.get("input")])
+            with open(written, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh, ensure_ascii=False, indent=2)
+            entry["output"] = written
+        if entry["ok"]:
+            ok_count += 1
+    if args.json:
+        _print_json({"ok": ok_count == len(res["results"]), "results": res["results"]})
+    else:
+        for item, entry in zip(items, res["results"]):
+            label = item.get("input", "?") if isinstance(item, dict) else "?"
+            if entry["ok"]:
+                print(f"  ok    {label}" + (f" -> {entry['output']}" if "output" in entry else ""))
+            else:
+                print(f"  error {label}: [{entry['error']['code']}] {entry['error']['message']}")
+        print(f"{ok_count}/{len(res['results'])} succeeded")
+    return 0 if ok_count == len(res["results"]) else 1
+
+
+def cmd_cache(args: argparse.Namespace) -> int:
+    """`transcription cache size|list|clear`: inspect or prune the transcript cache directly, without
+    poking at the workspace directory by hand (useful on a field machine where the cache accumulates
+    across many jobs and disk space is limited)."""
+    from .cache import TranscriptCache
+    cache = TranscriptCache(args.workspace or default_workspace())
+    if args.cache_action == "size":
+        size = cache.size_bytes()
+        count = cache.count()
+        if args.json:
+            _print_json({"entries": count, "size_bytes": size})
+        else:
+            print(f"{count} entries, {size} bytes ({size / (1024 * 1024):.1f} MiB)")
+        return 0
+    if args.cache_action == "list":
+        entries = cache.list_entries()
+        if args.json:
+            _print_json({"entries": entries})
+        else:
+            for e in entries:
+                print(f"  {e['key']}  {e['size_bytes']:>10} bytes  created_at {e['created_at'] or 'unknown'}")
+            print(f"{len(entries)} entries")
+        return 0
+    removed = cache.clear()
+    if args.json:
+        _print_json({"removed": removed})
+    else:
+        print(f"removed {removed} cache entries")
+    return 0
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    """`transcription models list|pull|remove [MODEL]`: manage the engine's local model cache
+    directly, so a model can be pre-fetched deliberately before going --offline at a venue with no
+    network, instead of only ever being populated as a side effect of running a transcription."""
+    engine = get_engine(args.engine)
+    # a malformed command is INVALID_INPUT (exit 2) whether or not the engine is installed
+    if args.models_action != "list" and not args.model:
+        raise TranscriptionError("INVALID_INPUT", "a model name is required for 'pull' and 'remove'")
+    if not engine.available():
+        raise TranscriptionError("ENGINE_UNAVAILABLE", engine.unavailable_reason() or f"engine {args.engine} unavailable")
+    if args.models_action == "list":
+        rows = [engine.model_status(m).to_dict() for m in engine.supported_models]
+        if args.json:
+            _print_json({"models": rows})
+        else:
+            for r in rows:
+                print(f"  {r['model']:<18} {r['availability']:<24} {r['detail']}")
+        return 0
+    if args.models_action == "pull":
+        download = getattr(engine, "download_model", None)
+        if download is None:
+            raise TranscriptionError("ENGINE_UNAVAILABLE", f"engine {args.engine} does not support pre-fetching models")
+        status = download(args.model)
+        if args.json:
+            _print_json(status.to_dict())
+        else:
+            print(f"  {status.model:<18} {status.availability:<24} {status.detail}")
+        return 0
+    remove = getattr(engine, "remove_model", None)
+    if remove is None:
+        raise TranscriptionError("ENGINE_UNAVAILABLE", f"engine {args.engine} does not support removing models")
+    removed = remove(args.model)
+    if args.json:
+        _print_json({"model": args.model, "removed": removed})
+    else:
+        print(f"removed {args.model}" if removed else f"{args.model} was not cached")
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """`transcription run -` : one JSON request on stdin -> exactly one JSON document on stdout.
+    This is the process-boundary transport an external caller (an agent adapter) uses; invalid or
+    non-JSON input still yields a parseable error document, never a traceback."""
+    if args.request != "-":
+        raise TranscriptionError("INVALID_INPUT", "run takes '-' and reads one JSON request from stdin")
+    raw = sys.stdin.read()
+    try:
+        doc = json.loads(raw)
+    except ValueError as exc:
+        raise TranscriptionError("INVALID_INPUT", f"stdin is not valid JSON: {exc}")
+    _print_json(run_request(doc))
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    rep = run_doctor(args.workspace, offline=args.offline, allowed_input_roots=args.allowed_input, allowed_output_roots=args.allowed_output)
+    if args.json:
+        _print_json(rep)
+    else:
+        print(f"transcription-skill {__version__} doctor")
+        print(format_doctor(rep))
+    return 0 if rep["ok"] else 1
+
+
+def cmd_skill(args: argparse.Namespace) -> int:
+    c = skill_contract()
+    if args.json:
+        _print_json(c)
+    else:
+        print(f"{c['id']} {c['version']}: {c['description']}")
+        print("capabilities: " + ", ".join(c["capabilities"]))
+        for t in c["tools"]:
+            print(f"  {t['name']}: {t['description']}")
+    return 0
+
+
+def cmd_contract(args: argparse.Namespace) -> int:
+    """`transcription contract [--json]`: the command name every ecosystem skill uses for its machine-readable
+    contract (`qc contract --json`, `ingest contract --json`, ...). Always the JSON document, byte-identical to
+    `skill --json`, which stays as an alias (ADR-031)."""
+    return cmd_skill(argparse.Namespace(json=True))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="transcription", description="Speech recognition skill: audio/video -> Transcript. Not an editor, not an agent.")
+    ap.add_argument("--version", action="version", version=f"transcription-skill {__version__}")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    t = sub.add_parser("transcribe", help="transcribe an audio/video file into a Transcript JSON")
+    t.add_argument("input")
+    t.add_argument("--language", help="ISO 639-1 code (ja, en, ...); default: auto-detect, recorded as unknown when uncertain")
+    t.add_argument("--engine", default="faster_whisper")
+    t.add_argument("--model", help="model name (default: the engine's default; faster_whisper: base, haas_ja: Haas-ja-v1.0, speechcpp: reazonspeech-v2, whisperx: large-v3)")
+    t.add_argument("--word-timestamps", action="store_true", help="also record per-word timestamps")
+    t.add_argument("--temperature", type=float, default=0.0)
+    t.add_argument("--beam-size", type=int, default=5)
+    t.add_argument("--audio-stream", type=int, help="0-based index of the audio stream to decode on a multi-track input (default: 0, the first)")
+    t.add_argument("--initial-prompt", help="vocabulary hint passed to the ASR decoder (names, terms); not an instruction")
+    t.add_argument("--vocabulary", metavar="FILE", help="custom vocabulary JSON {\"written form\": [\"reading\", ...]} for engines with "
+                   "custom_vocabulary (haas_ja); refused by other engines")
+    t.add_argument("--asset-id", help="asset identity to stamp on the transcript (default: derived from the file fingerprint)")
+    t.add_argument("--timeout", type=float, help="budget: seconds the engine may run (default 14400, same as --max-audio-seconds' default)")
+    t.add_argument("--max-audio-seconds", type=float, help="budget: refuse media longer than this (default 14400)")
+    t.add_argument("--no-cache", action="store_true", help="do not read or write the transcript cache")
+    t.add_argument("--offline", action="store_true", help="hard constraint: no network at any step (remote engines refused, missing models are MODEL_UNAVAILABLE)")
+    t.add_argument("--vad-filter", action="store_true", help="skip non-speech before decoding (faster-whisper's own voice-activity-detection filter); off by default")
+    t.add_argument("--workspace", help="cache/tmp directory (default $TRANSCRIPTION_WORKSPACE or ~/.cache/transcription-skill)")
+    t.add_argument("--allowed-input", action="append", metavar="DIR", help="only accept inputs that resolve inside DIR (repeatable); default: any readable file")
+    t.add_argument("--allowed-output", action="append", metavar="DIR", help="only write the transcript JSON inside DIR (repeatable); default: anywhere writable")
+    t.add_argument("--speaker-turns", metavar="FILE", help="diarization-skill turns JSON (diarization-skill/turns@1) of the same file: fill "
+                   "speaker_id after recognition (ADR-037); not part of the cache key")
+    t.add_argument("-o", "--output", help="transcript JSON path (default <input>.transcript.json)")
+    t.add_argument("--dry-run", action="store_true", help="show what would run (engine, model, language, budget, cache status) without running ASR")
+    t.add_argument("--json", action="store_true", help="print one JSON document on stdout")
+    t.set_defaults(func=cmd_transcribe)
+
+    s = sub.add_parser("segments", help="SpeechEvent-compatible candidates from a transcript")
+    s.add_argument("transcript")
+    s.add_argument("--merge-gap", type=float, default=0.0, help="merge consecutive segments separated by at most this many seconds (default 0: one event per segment)")
+    s.add_argument("-o", "--output", help="write the events JSON here")
+    s.add_argument("--allowed-output", action="append", metavar="DIR", help="only write inside DIR (repeatable)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_segments)
+
+    e = sub.add_parser("export", help="render a transcript as json / srt / vtt")
+    e.add_argument("transcript")
+    e.add_argument("--format", choices=FORMATS, default="srt")
+    e.add_argument("-o", "--output", required=True)
+    e.add_argument("--allowed-output", action="append", metavar="DIR", help="only write inside DIR (repeatable)")
+    e.add_argument("--json", action="store_true")
+    e.set_defaults(func=cmd_export)
+
+    sp = sub.add_parser("speakers", help="fill speaker_id in a transcript from diarization-skill speaker turns (no diarization here)")
+    sp.add_argument("transcript")
+    sp.add_argument("--turns", required=True, metavar="FILE", help="diarization-skill turns JSON (diarization-skill/turns@1)")
+    sp.add_argument("--allow-source-mismatch", action="store_true", help="merge even when the two documents come from different files "
+                    "(only if both share one timeline)")
+    sp.add_argument("--replace", action="store_true", help="recompute speaker_id values that are already set")
+    sp.add_argument("-o", "--output", help="output transcript JSON (default <transcript>.speakers.json)")
+    sp.add_argument("--allowed-output", action="append", metavar="DIR", help="only write inside DIR (repeatable)")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_speakers)
+
+    c = sub.add_parser("check", help="validate a transcript JSON against the contract")
+    c.add_argument("transcript")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_check)
+
+    d = sub.add_parser("doctor", help="check engines, models, ffmpeg, workspace and cache")
+    d.add_argument("--workspace")
+    d.add_argument("--offline", action="store_true", help="report readiness for offline use (models must already be local)")
+    d.add_argument("--allowed-input", action="append", metavar="DIR", help="show the input path policy that would apply with these roots")
+    d.add_argument("--allowed-output", action="append", metavar="DIR", help="show the output path policy that would apply with these roots")
+    d.add_argument("--json", action="store_true")
+    d.set_defaults(func=cmd_doctor)
+
+    g = sub.add_parser("engines", help="list registered engines (EngineSpec), or filter candidates by constraints")
+    g.add_argument("--engine", help="inspect one engine, including per-model availability")
+    g.add_argument("--execution-mode", choices=["local", "remote"])
+    g.add_argument("--language")
+    g.add_argument("--capability", help="require a capability (e.g. word_timestamps, local_execution)")
+    g.add_argument("--word-timestamps", action="store_true")
+    g.add_argument("--vocabulary", action="store_true", help="only engines that take a custom vocabulary")
+    g.add_argument("--offline", action="store_true", help="only engines usable with no network and a local model")
+    g.add_argument("--json", action="store_true")
+    g.set_defaults(func=cmd_engines)
+
+    bt = sub.add_parser("batch", help="run many transcribe requests from a manifest file in one process")
+    bt.add_argument("manifest", help="JSON file: {\"items\": [<transcribe params>, ...]}; each item may add an \"output\" path")
+    bt.add_argument("--allowed-output", action="append", metavar="DIR", help="only write transcript JSON files inside DIR (repeatable)")
+    bt.add_argument("--json", action="store_true")
+    bt.set_defaults(func=cmd_batch)
+
+    ch = sub.add_parser("cache", help="inspect or prune the transcript cache")
+    ch.add_argument("cache_action", choices=("size", "list", "clear"))
+    ch.add_argument("--workspace", help="cache/tmp directory (default $TRANSCRIPTION_WORKSPACE or ~/.cache/transcription-skill)")
+    ch.add_argument("--json", action="store_true")
+    ch.set_defaults(func=cmd_cache)
+
+    md = sub.add_parser("models", help="list, pre-fetch or remove an engine's local models")
+    md.add_argument("models_action", choices=("list", "pull", "remove"))
+    md.add_argument("model", nargs="?", help="model name (required for pull/remove)")
+    md.add_argument("--engine", default=DEFAULT_ENGINE)
+    md.add_argument("--json", action="store_true")
+    md.set_defaults(func=cmd_models)
+
+    r = sub.add_parser("run", help="read one JSON tool request ({\"tool\": ..., \"params\": {...}}) from stdin, print one JSON response")
+    r.add_argument("request", help="'-' (stdin)")
+    r.set_defaults(func=cmd_run, json=True)
+
+    ct = sub.add_parser("contract", help="print the skill / tool / engine contract as JSON (same document as `skill --json`)")
+    ct.add_argument("--json", action="store_true", help="accepted for the ecosystem's `contract --json` form; the output is always JSON")
+    ct.set_defaults(func=cmd_contract, json=True)
+
+    k = sub.add_parser("skill", help="print the skill / tool contract (`skill --json` is an alias of `contract`)")
+    k.add_argument("--json", action="store_true")
+    k.set_defaults(func=cmd_skill)
+    return ap
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except TranscriptionError as exc:
+        if getattr(args, "json", False):
+            _print_json(exc.to_dict())
+        else:
+            sys.stderr.write(f"error: [{exc.code}] {exc.message}\n")
+        return exc.exit_code
+    except KeyboardInterrupt:
+        sys.stderr.write("interrupted\n")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

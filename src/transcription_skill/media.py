@@ -1,0 +1,167 @@
+"""Media access: fingerprint, ffprobe, a single fixed audio-extraction recipe, and the bounded runner
+for an engine's own command-line program (speech.cpp's `speech`, ADR-035).
+
+Besides the service's worker boundary, this is the only module that runs external programs. Every
+invocation is a fixed argv list built from validated values; no user string is ever interpreted by a shell. The recipe (mono, 16 kHz,
+PCM 16-bit WAV) is what ASR engines consume; the skill does no other media processing. Which audio
+stream is decoded is always an explicit `-map 0:a:N` (default N=0, the first) so a multi-audio-track
+input never depends on ffmpeg's own "best stream" heuristic.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+from typing import Any, Dict, List, Optional, Tuple
+
+from .errors import TranscriptionError
+
+AUDIO_RECIPE = {"channels": 1, "sample_rate": 16000, "codec": "pcm_s16le", "container": "wav"}
+# SPEECH_MODEL_DIR / XDG_CACHE_HOME / LOCALAPPDATA locate speech.cpp's model folder (ADR-035); they are folders,
+# never an executable, and carry no credentials.
+CHILD_ENV_KEYS = ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "LANG", "LC_ALL", "PYTHONUTF8",
+                  "SPEECH_MODEL_DIR", "XDG_CACHE_HOME", "LOCALAPPDATA")
+
+
+def child_env() -> Dict[str, str]:
+    """Minimal environment for child processes: no API keys, no tokens travel into ffmpeg/engines."""
+    return {k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ}
+
+
+def find_tool(name: str) -> Optional[str]:
+    return shutil.which(name)
+
+
+def tool_version(name: str) -> Optional[str]:
+    path = find_tool(name)
+    if not path:
+        return None
+    try:
+        proc = subprocess.run([path, "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20, env=child_env())
+    except (OSError, subprocess.SubprocessError):
+        return None
+    first = (proc.stdout or proc.stderr).strip().splitlines()[:1]
+    return first[0] if first else None
+
+
+def run_program(argv: List[str], timeout: float, cwd: Optional[str] = None, env: Optional[Dict[str, str]] = None) -> Tuple[Optional[int], str, str]:
+    """Run an engine's program: `argv` is a list (never a shell string), stdin is closed, the child runs in its
+    own process group (its own session on POSIX), and on `timeout` the whole group is killed. Returns
+    (exit code, stdout, stderr), with None as the exit code when the timeout killed it. `env` defaults to
+    child_env(); text is decoded as UTF-8."""
+    kw: Dict[str, Any] = {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "cwd": cwd,
+                          "env": child_env() if env is None else env}
+    if os.name == "nt":
+        kw["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kw["start_new_session"] = True
+    proc = subprocess.Popen(argv, **kw)
+    try:
+        out, err = proc.communicate(timeout=max(0.001, timeout))
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        out, err = proc.communicate()
+        return None, (out or b"").decode("utf-8", errors="replace"), (err or b"").decode("utf-8", errors="replace")
+    return proc.returncode, (out or b"").decode("utf-8", errors="replace"), (err or b"").decode("utf-8", errors="replace")
+
+
+def _kill_group(proc: "subprocess.Popen[bytes]") -> None:
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def fingerprint_file(path: str, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(chunk), b""):
+            h.update(block)
+    return "sha256:" + h.hexdigest()
+
+
+def probe(path: str) -> Dict[str, Any]:
+    """ffprobe summary: duration, audio stream facts (of the first audio stream, plus how many exist),
+    presence of video. Raises UNSUPPORTED_MEDIA."""
+    ffprobe = find_tool("ffprobe")
+    if not ffprobe:
+        raise TranscriptionError("ENGINE_UNAVAILABLE", "ffprobe not found on PATH (install FFmpeg)")
+    argv = [ffprobe, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path]
+    proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120, env=child_env())
+    if proc.returncode != 0:
+        tail = "\n".join(proc.stderr.strip().splitlines()[-3:])
+        raise TranscriptionError("UNSUPPORTED_MEDIA", f"ffprobe cannot read {os.path.basename(path)}: {tail}")
+    try:
+        raw = json.loads(proc.stdout or "{}")
+    except ValueError:
+        raise TranscriptionError("UNSUPPORTED_MEDIA", "ffprobe returned invalid JSON")
+    fmt = raw.get("format") or {}
+    streams = raw.get("streams") or []
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    video = next((s for s in streams if s.get("codec_type") == "video" and (s.get("disposition") or {}).get("attached_pic", 0) == 0), None)
+    if not audio_streams:
+        raise TranscriptionError("UNSUPPORTED_MEDIA", f"{os.path.basename(path)} has no audio stream")
+    audio = audio_streams[0]
+    duration = _f(fmt.get("duration")) or _f(audio.get("duration"))
+    if not duration or duration <= 0:
+        raise TranscriptionError("UNSUPPORTED_MEDIA", f"{os.path.basename(path)}: duration unknown or zero")
+    return {
+        "duration": duration,
+        "container": fmt.get("format_name"),
+        "size_bytes": int(fmt.get("size") or os.path.getsize(path)),
+        "audio": {"codec": audio.get("codec_name"), "channels": _i(audio.get("channels")), "sample_rate": _i(audio.get("sample_rate"))},
+        "audio_stream_count": len(audio_streams),
+        "has_video": video is not None,
+    }
+
+
+def extraction_argv(ffmpeg: str, src: str, dst: str, audio_stream: int = 0) -> List[str]:
+    """Build the fixed extraction argv. `audio_stream` is always mapped explicitly (`-map 0:a:N`) so the
+    decoded stream is never left to ffmpeg's own implicit "best stream" heuristic on a multi-track input."""
+    r = AUDIO_RECIPE
+    return [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", src,
+            "-map", f"0:a:{audio_stream}", "-vn", "-sn", "-dn",
+            "-ac", str(r["channels"]), "-ar", str(r["sample_rate"]), "-c:a", r["codec"], "-f", r["container"], dst]
+
+
+def extract_audio(src: str, dst: str, audio_stream: int = 0, timeout: float = 600.0) -> Dict[str, Any]:
+    """Decode the input's audio stream at `audio_stream` (0-based; default 0, the first) to the fixed ASR
+    recipe at dst. Returns a description naming the actually-selected stream."""
+    ffmpeg = find_tool("ffmpeg")
+    if not ffmpeg:
+        raise TranscriptionError("ENGINE_UNAVAILABLE", "ffmpeg not found on PATH (install FFmpeg)")
+    if os.path.abspath(src) == os.path.abspath(dst):
+        raise TranscriptionError("INVALID_INPUT", "audio extraction target equals the input")
+    argv = extraction_argv(ffmpeg, src, dst, audio_stream)
+    try:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, env=child_env())
+    except subprocess.TimeoutExpired:
+        raise TranscriptionError("TRANSCRIPTION_FAILED", f"audio extraction exceeded {timeout:g}s")
+    if proc.returncode != 0 or not os.path.exists(dst):
+        tail = "\n".join(proc.stderr.strip().splitlines()[-3:])
+        raise TranscriptionError("TRANSCRIPTION_FAILED", f"audio extraction failed: {tail}")
+    return {"tool": "ffmpeg", "recipe": dict(AUDIO_RECIPE), "audio_stream_index": audio_stream, "stream": f"0:a:{audio_stream}"}
+
+
+def _f(v: Any) -> Optional[float]:
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _i(v: Any) -> Optional[int]:
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
