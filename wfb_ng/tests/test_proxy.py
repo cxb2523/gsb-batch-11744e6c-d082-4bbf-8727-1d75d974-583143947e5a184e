@@ -1,0 +1,192 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# Copyright (C) 2018-2026 Vasily Evseenko <svpcom@p2ptech.org>
+
+#
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation; version 3.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License along
+#   with this program; if not, write to the Free Software Foundation, Inc.,
+#   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+
+import time
+from errno import EPERM
+from twisted.python import log
+from twisted.trial import unittest
+from twisted.internet import reactor, defer
+from twisted.internet.protocol import DatagramProtocol
+from ..mavlink import MAVLink_heartbeat_message, MAVLink
+from ..proxy import ProxyProtocol, UDPProxyProtocol, MavlinkUDPProxyProtocol, MavlinkSerialProxyProtocol
+from ..mavlink_protocol import MavlinkARMProtocol
+from ..common import df_sleep
+
+class Echo(DatagramProtocol):
+    def datagramReceived(self, data, addr):
+        log.msg("got %r from %s" % (data, addr))
+        self.transport.write(data, addr)
+
+
+class SendPacket(DatagramProtocol):
+    def __init__(self, msg, addr, count=1):
+        self.df = defer.Deferred()
+        self.msg = msg
+        self.addr = addr
+        self.count = count
+        self.replies = []
+
+    def startProtocol(self):
+        log.msg('send %d of %r to %s' % (self.count, self.msg, self.addr))
+        for i in range(self.count):
+            self.transport.write(self.msg, self.addr)
+
+    def datagramReceived(self, data, addr):
+        log.msg("received back %r from %s" % (data, addr))
+        self.replies.append((data, addr))
+
+        if len(self.replies) == self.count:
+            self.df.callback(self.replies)
+
+
+class UDPProxyTestCase(unittest.TestCase):
+    def setUp(self):
+        self.arm_proto = MavlinkARMProtocol(call_on_arm='/bin/true',
+                                            call_on_disarm='/bin/true')
+
+        self.p1 = MavlinkUDPProxyProtocol(addr=None, mirror=None, agg_max_size=1445, agg_timeout=1, inject_rssi=True, mavlink_sys_id=3, mavlink_comp_id=242,
+                                          rx_hooks=[self.arm_proto.dataReceived], tx_hooks=[self.arm_proto.dataReceived])
+        self.p2 = UDPProxyProtocol(('127.0.0.1', 14553))
+        self.p1.peer = self.p2
+        self.p2.peer = self.p1
+        self.ep1 = reactor.listenUDP(14551, self.p1)
+        self.ep2 = reactor.listenUDP(0, self.p2)
+
+    def tearDown(self):
+        self.ep1.stopListening()
+        self.ep2.stopListening()
+        self.p1._cleanup()
+        self.p2._cleanup()
+
+    @defer.inlineCallbacks
+    def test_proxy(self):
+        addr = ('127.0.0.1', 14551)
+        p = SendPacket(b'\xfd\t\x00\x00\x00\x03\xf2m\x00\x00\x02\x00\x03\x00\x01\x01d\x00\x04\xa8\xad', addr, 10)
+        ep3 = reactor.listenUDP(9999, p)
+        ep4 = reactor.listenUDP(14553, Echo())
+        try:
+            ts = time.time()
+            _replies = yield p.df
+            _expected = [(b'\xfd\t\x00\x00\x00\x03\xf2m\x00\x00\x02\x00\x03\x00\x01\x01d\x00\x04\xa8\xad', addr)] * 10
+            self.assertGreater(time.time() - ts, 1.0)
+            self.assertEqual(_replies, _expected)
+        finally:
+            ep4.stopListening()
+            ep3.stopListening()
+
+    @defer.inlineCallbacks
+    def test_rssi_injection(self):
+        addr = ('127.0.0.1', 14551)
+        p = SendPacket(b'test', addr)
+
+        ep3 = reactor.listenUDP(9999, p)
+        yield df_sleep(0.1)
+
+        try:
+            self.p1.send_rssi(1, 2, 3, 4, 5)
+            ts = time.time()
+            _replies = yield p.df
+            _expected = [(b'\xfd\t\x00\x00\x00\x03\xf2m\x00\x00\x03\x00\x04\x00\x01\x01d\x02\x05\xe1\xb1', addr)]
+            self.assertLess(time.time() - ts, 1.0)
+            self.assertEqual(_replies, _expected)
+        finally:
+            ep3.stopListening()
+
+    @defer.inlineCallbacks
+    def __test_arm_protocol(self, force_mavlink1):
+        addr = ('127.0.0.1', 14551)
+        mav = MAVLink(None, srcSystem=1, srcComponent=1)
+        msg = MAVLink_heartbeat_message(1, 8, 128, 0, 0, 1).pack(mav, force_mavlink1=force_mavlink1)
+
+        p = SendPacket(msg, addr)
+
+        ep3 = reactor.listenUDP(9999, p)
+        ep4 = reactor.listenUDP(14553, Echo())
+        try:
+            ts = time.time()
+            yield p.df
+            self.assertEqual(self.arm_proto.armed, True)
+        finally:
+            ep3.stopListening()
+            ep4.stopListening()
+
+
+    def test_arm_protocol_mav1(self):
+        return self.__test_arm_protocol(True)
+
+    def test_arm_protocol_mav2(self):
+        return self.__test_arm_protocol(False)
+
+
+class SentPeer:
+    def __init__(self):
+        self.sent = []
+
+    def write(self, data):
+        self.sent.append(data)
+
+
+class AggregationTestCase(unittest.TestCase):
+    def setUp(self):
+        self.peer = SentPeer()
+        self.p = ProxyProtocol(agg_max_size=100, agg_timeout=0.05)
+        self.p.peer = self.peer
+
+    def tearDown(self):
+        self.p._cleanup()
+
+    @defer.inlineCallbacks
+    def test_empty_datagram_does_not_break_timeout_flush(self):
+        self.p.messageReceived(b'')
+        yield df_sleep(0.1)
+        self.p.messageReceived(b'data')
+        yield df_sleep(0.1)
+        self.assertEqual(self.peer.sent, [b'data'])
+
+    def test_overflow_flushes_queued_data_first(self):
+        self.p.messageReceived(b'a' * 60)
+        self.p.messageReceived(b'b' * 60)
+        self.p.flush_queue()
+        self.assertEqual(self.peer.sent, [b'a' * 60, b'b' * 60])
+
+    def test_failed_send_drops_batch(self):
+        def fail(data):
+            raise OSError(EPERM, 'Operation not permitted')
+
+        self.peer.write = fail
+        self.p.messageReceived(b'old')
+        self.assertRaises(OSError, self.p.flush_queue)
+
+        del self.peer.write
+        self.p.messageReceived(b'new')
+        self.p.flush_queue()
+        self.assertEqual(self.peer.sent, [b'new'])
+
+
+class MavlinkProxyStopTestCase(unittest.TestCase):
+    def test_a_stopped_proxy_leaves_no_flush_behind(self):
+        udp = MavlinkUDPProxyProtocol(addr=None, mirror=None, agg_max_size=1445, agg_timeout=1, inject_rssi=False,
+                                      mavlink_sys_id=3, mavlink_comp_id=242)
+        serial = MavlinkSerialProxyProtocol(agg_max_size=1445, agg_timeout=1, inject_rssi=False,
+                                            mavlink_sys_id=3, mavlink_comp_id=242)
+        for p, stop in ((udp, udp.stopProtocol), (serial, lambda: serial.connectionLost(None))):
+            p.messageReceived(b'x')
+            stop()
+            self.assertIsNone(p.agg_queue_timer)

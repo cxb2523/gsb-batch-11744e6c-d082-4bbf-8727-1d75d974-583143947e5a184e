@@ -1,0 +1,700 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# Copyright (C) 2021-2026 Vasily Evseenko <svpcom@p2ptech.org>
+
+#
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation; version 3.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License along
+#   with this program; if not, write to the Free Software Foundation, Inc.,
+#   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+
+import time
+import os
+import struct
+import errno
+import hashlib
+import random
+import itertools
+
+from twisted.python import log
+from twisted.trial import unittest
+from twisted.internet import reactor, defer, error
+from twisted.internet.protocol import DatagramProtocol
+
+from ..common import df_sleep
+from ..protocols import RXProtocol, TXProtocol
+from .. import call_and_check_rc
+
+
+def batched(iterable, n):
+    l = len(iterable)
+    for ndx in range(0, l, n):
+        yield iterable[ndx:min(ndx + n, l)]
+
+
+class UDP_TXRX(DatagramProtocol):
+    def __init__(self, tx_addr, tx_proto=None):
+        self.rxq = []
+        self.tx_addr = tx_addr
+        self.tx_proto = tx_proto
+
+    def datagramReceived(self, data, addr):
+        log.msg("got %r from %s" % (data, addr))
+        self.rxq.append(data)
+
+    def send_msg(self, data):
+        t = (self.tx_proto.transport if self.tx_proto else self.transport)
+        t.write(data, self.tx_addr)
+        log.msg("sent %r to %r" % (data, t,))
+
+
+def gen_req_id(f):
+    def _f(self, *args, **kwargs):
+        req_id = self.req_id % (1 << 32)
+        self.req_id = req_id + 1
+        return f(self, req_id, *args, **kwargs)
+    return _f
+
+
+class FakeAntennaProtocol(object):
+    rx_stats = None
+
+    def process_new_session(self, rx_id, session):
+        log.msg('%s new session %r' % (rx_id, session))
+
+
+    def update_rx_stats(self, rx_id, packet_stats, ant_stats, session):
+        log.msg('%s %r %r %r' % (rx_id, packet_stats, ant_stats, session))
+        self.rx_stats = packet_stats
+
+        for (((freq, mcs_index, bandwidth), ant_id),
+             (pkt_s,
+              rssi_min, rssi_avg, rssi_max,
+              snr_min, snr_avg, snr_max)) in ant_stats.items():
+
+            assert pkt_s >= 0
+            assert freq == 4321
+            assert mcs_index == 1
+            assert bandwidth == 20
+            assert rssi_min == rssi_avg == rssi_max == -42
+            assert snr_min == snr_avg == snr_max == 28
+
+            host, port, wlan_idx, ant_id = struct.unpack('!IHBB', ant_id.to_bytes(8, byteorder='big'))
+            assert host == 0x7f000001
+            assert port == 0
+            assert 0 <= wlan_idx < 2
+            assert 0 <= ant_id < 2
+
+    def update_tx_stats(self, tx_id, packet_stats, ant_latency):
+        log.msg('%s %r %r' % (tx_id, packet_stats, ant_latency))
+
+
+
+@defer.inlineCallbacks
+def wait_for(cond, timeout=5.0):
+    """until cond() holds, a slow host given the time it takes"""
+    t0 = time.time()
+    while not cond() and time.time() - t0 < timeout:
+        yield df_sleep(0.01)
+
+
+class TXCommandClient(DatagramProtocol):
+    noisy = False
+
+    CMD_SET_FEC = 1
+    CMD_SET_RADIO = 2
+    CMD_GET_FEC = 3
+    CMD_GET_RADIO = 4
+    CMD_SET_FEC_TIMEOUT = 5
+
+    resp_map = {
+        CMD_SET_FEC: lambda x: None,
+        CMD_SET_RADIO: lambda x: None,
+        CMD_SET_FEC_TIMEOUT: lambda x: None,
+        CMD_GET_FEC: lambda x: struct.unpack('!BB', x),
+        CMD_GET_RADIO: lambda x: struct.unpack('!B??BB?BB', x)
+    }
+
+    def __init__(self, tx_addr):
+        self.tx_addr = tx_addr
+        self.callbacks = {}
+        self.req_id = int(time.time())
+
+    def datagramReceived(self, data, addr):
+        if addr != self.tx_addr:
+            return
+
+        req_id, rc = struct.unpack('!II', data[:8])
+        df = self.callbacks.pop(req_id, None)
+
+        if df is None:
+            log.msg("Unknown response from %s %d" % (addr, req_id), isError=1)
+            return
+
+        if rc == 0:
+            df.callback(data[8:])
+        else:
+            df.errback(OSError("Error: %s" % (errno.errorcode.get(rc, str(rc)))))
+
+    def _do_cmd(self, req_id, msg):
+        df = defer.Deferred()
+        self.callbacks[req_id] = df
+        self.transport.write(msg, self.tx_addr)
+        return df
+
+    @gen_req_id
+    def set_fec(self, req_id, k, n):
+        def _got_response(data):
+            return None
+
+        return self._do_cmd(req_id, struct.pack('!IBBB', req_id, self.CMD_SET_FEC, k, n))\
+                   .addCallback(_got_response)
+
+    @gen_req_id
+    def set_fec_timeout(self, req_id, timeout_ms):
+        return self._do_cmd(req_id, struct.pack('!IBI', req_id, self.CMD_SET_FEC_TIMEOUT, timeout_ms))\
+                   .addCallback(lambda data: None)
+
+    @gen_req_id
+    def set_radio(self, req_id, stbc, ldpc, short_gi, bandwidth, mcs_index, vht_mode, vht_nss, subch=0):
+        def _got_response(data):
+            return None
+
+        return self._do_cmd(req_id, struct.pack('!IBB??BB?BB', req_id, self.CMD_SET_RADIO,
+                                                stbc, ldpc, short_gi, bandwidth, mcs_index, vht_mode, vht_nss, subch))\
+                   .addCallback(_got_response)
+
+    @gen_req_id
+    def get_fec(self, req_id):
+        def _got_response(data):
+            return dict(zip(('k', 'n'), self.resp_map[self.CMD_GET_FEC](data)))
+
+        return self._do_cmd(req_id, struct.pack('!IB', req_id, self.CMD_GET_FEC))\
+                   .addCallback(_got_response)
+
+    @gen_req_id
+    def get_radio(self, req_id):
+        def _got_response(data):
+            return dict(zip(('stbc', 'ldpc', 'short_gi', 'bandwidth', 'mcs_index', 'vht_mode', 'vht_nss', 'subch'),
+                            self.resp_map[self.CMD_GET_RADIO](data)))
+
+        return self._do_cmd(req_id, struct.pack('!IB', req_id, self.CMD_GET_RADIO))\
+                   .addCallback(_got_response)
+
+
+class TXRXTestCase(unittest.TestCase):
+    rx_opts = ()
+
+    def setup_keys(self, bindir):
+        return  call_and_check_rc(os.path.join(bindir, 'wfb_keygen'))
+
+    @defer.inlineCallbacks
+    def setUp(self):
+        bindir = os.path.join(os.path.dirname(__file__), '../..')
+        yield self.setup_keys(bindir)
+
+        self.rxp = UDP_TXRX(('127.0.0.1', 10001))
+        self.txp = UDP_TXRX(('127.0.0.1', 10003))
+        self.cmdp = TXCommandClient(('127.0.0.1', 7003))
+
+        self.rx_ep = reactor.listenUDP(10002, self.rxp)
+        self.tx_ep = reactor.listenUDP(10004, self.txp)
+        self.cmd_ep = reactor.listenUDP(0, self.cmdp)
+
+        link_id = int.from_bytes(os.urandom(3), 'big')
+        epoch = int(time.time())
+        cmd_rx = [os.path.join(bindir, 'wfb_rx'), '-K', 'drone.key', '-a', '10001', '-u', '10002',
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024)] + list(self.rx_opts) + ['wlan0']
+        cmd_tx = [os.path.join(bindir, 'wfb_tx'), '-K', 'gs.key', '-u', '10003', '-D', '10004', '-T', '30', '-F', '3000', '-C', '7003',
+                  # '-Q', '-P 1',  ## requires root priv
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+
+        self.ap = FakeAntennaProtocol()
+        self.rx_pp = RXProtocol(self.ap, cmd_rx, 'debug rx')
+        self.tx_pp = TXProtocol(self.ap, cmd_tx, 'debug tx')
+
+        self.rx_df = self.rx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        self.tx_df = self.tx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+
+        # Wait for tx/rx processes to initialize
+        yield self.wait_ready()
+
+    @defer.inlineCallbacks
+    def tearDown(self):
+        for pp in (self.rx_pp, self.tx_pp):
+            try:
+                pp.transport.signalProcess('KILL')
+            except error.ProcessExitedAlready:
+                pass
+
+        self.rx_ep.stopListening()
+        self.tx_ep.stopListening()
+        self.cmd_ep.stopListening()
+        # Wait for tx/rx processes to die
+        yield defer.DeferredList([self.rx_df, self.tx_df])
+
+    @defer.inlineCallbacks
+    def wait_ready(self, timeout=5.0):
+        # wfb_tx answers a command once its sockets are up
+        ready = []
+        t0 = time.time()
+        while not ready and time.time() - t0 < timeout:
+            try:
+                self.cmdp.get_fec().addCallback(ready.append)
+            except OSError:  # no unix socket of wfb_tx yet
+                pass
+            yield df_sleep(0.05)
+
+    @defer.inlineCallbacks
+    def test_data_before_session_is_rejected(self):
+        # wblock_hdr_t + AEAD(wpacket_hdr_t + b'hello') under the all-zero session key, nonce 0
+        zero_key_pkt = bytes.fromhex('010000000000000000'
+                                     '9f07e2d6303d54156b13bcdbdb22d533e1eddb611885edcb')
+        self.txp.send_msg(b'm1')
+        yield wait_for(lambda: len(self.txp.rxq) >= 1)
+        fwd_hdr = self.txp.rxq[0][:17]  # wrxfwd_t of the real session packet
+        self.rxp.send_msg(fwd_hdr + zero_key_pkt)
+        yield wait_for(lambda: self.ap.rx_stats is not None and self.ap.rx_stats['dec_err'][1] >= 1)
+        self.assertEqual(self.ap.rx_stats['data'][1], 0)
+        self.assertEqual(self.ap.rx_stats['dec_err'][1], 1)
+
+    @defer.inlineCallbacks
+    def test_the_fragments_lost_of_the_blocks_done_count_the_fec_ones_too(self):
+        # block 1 closes with its data alone, its FEC packets lost; block 2
+        # gets 5 fragments of 12, it does not close; block 3 closes them both:
+        # their counters go.  No FEC timeout: a slow host would close a
+        # block with empty packets between the messages
+        yield self.cmdp.set_fec_timeout(0)
+        for i in range(24):
+            self.txp.send_msg(b'm%d' % (i + 1,))
+        yield wait_for(lambda: len(self.txp.rxq) >= 37)
+        self.assertEqual(len(self.txp.rxq), 37) # 1 session + (8 data packets + 4 fec packets) * 3
+        for i in list(range(9)) + [13, 14, 15, 21, 22] + list(range(25, 37)):
+            self.rxp.send_msg(self.txp.rxq[i])
+        yield wait_for(lambda: self.ap.rx_stats is not None and self.ap.rx_stats['frags'][1] >= 24)
+        self.assertEqual([b'm%d' % (i + 1,) for i in list(range(11)) + list(range(16, 24))], self.rxp.rxq)
+        self.assertEqual((self.ap.rx_stats['frags'][1], self.ap.rx_stats['frags_lost'][1]), (24, 11))
+
+    @defer.inlineCallbacks
+    def test_the_fec_packets_of_a_closed_block_in_the_gaps_of_the_next_one_count(self):
+        # block 1 closes with its data alone, its FEC packets come between
+        # the data of block 2 (the data go first in the queue of the sender):
+        # it waits for its counters until block 2 closes
+        yield self.cmdp.set_fec_timeout(0)
+        for i in range(24):
+            self.txp.send_msg(b'm%d' % (i + 1,))
+        yield wait_for(lambda: len(self.txp.rxq) >= 37)
+        self.assertEqual(len(self.txp.rxq), 37)
+        order = list(range(9)) + list(range(13, 17)) + list(range(9, 13)) + list(range(17, 37))
+        for i in order:
+            self.rxp.send_msg(self.txp.rxq[i])
+        yield wait_for(lambda: self.ap.rx_stats is not None and self.ap.rx_stats['frags'][1] >= 24)
+        self.assertEqual([b'm%d' % (i + 1,) for i in range(24)], self.rxp.rxq)
+        self.assertEqual((self.ap.rx_stats['frags'][1], self.ap.rx_stats['frags_lost'][1]), (24, 0))
+
+    def test_keys(self):
+        keys = [open(k, 'rb').read() for k in ('gs.key', 'drone.key')]
+        self.assertEqual(len(keys), 2)
+        self.assertNotEqual(keys[0], keys[1])
+
+    @defer.inlineCallbacks
+    def test_txrx(self):
+        self.assertEqual(len(self.txp.rxq), 0)
+        yield self.cmdp.set_fec_timeout(0)
+        for i in range(16):
+            self.txp.send_msg(b'm%d' % (i + 1,))
+
+        yield wait_for(lambda: len(self.txp.rxq) >= 25)
+        self.assertEqual(len(self.txp.rxq), 25) # 1 session + (8 data packets + 4 fec packets) * 2
+
+        # Check FEC fail and recovery
+        # 1. Fail on block #1: lost 5 packets
+        # 2. Recover on block #2: lost 3 packets
+        for i, pkt in enumerate(self.txp.rxq):
+            if i not in (4, 9, 10, 11, 12, 11 + 4, 11 + 5, 11 + 6):
+                self.rxp.send_msg(pkt)
+
+        yield wait_for(lambda: len(self.rxp.rxq) >= 15)
+        self.assertEqual([b'm%d' % (i + 1,) for i in range(16) if i + 1 != 4], self.rxp.rxq)
+
+
+    @defer.inlineCallbacks
+    def test_aggregation(self):
+        self.assertEqual(len(self.txp.rxq), 0)
+
+        for i in range(256):
+            payload = os.urandom(random.randint(0, 1024))
+            self.txp.send_msg(b'%04d%s%s' % (i, payload, hashlib.sha1(payload).digest()))
+            # We have 3ms fec timeout after each fec packet so limit input packet speed
+            yield df_sleep(0.003)
+
+        yield wait_for(lambda: len(self.txp.rxq) >= 32 * 12 + 1)
+        self.assertGreaterEqual(len(self.txp.rxq), 32 * 12 + 1) # session(s) + 32 blocks
+
+        # Always send session packet first
+        session = self.txp.rxq.pop(0)
+        self.rxp.send_msg(session)
+
+        # first packet to open first block
+        self.rxp.send_msg(self.txp.rxq.pop(0))
+
+        for batch in batched(self.txp.rxq, 18): # 1.5 FEC blocks
+            # Reoder packets
+            batch = list(batch)
+            random.shuffle(batch)
+            for pkt in batch:
+                # Drop packet with 1/8 probability
+                if random.random() > 0.125:
+                    self.rxp.send_msg(pkt)
+                    yield df_sleep(0.003)
+
+        yield wait_for(lambda: len(self.rxp.rxq) > 200)
+        self.assertGreater(len(self.rxp.rxq), 200)
+        self.assertLessEqual(len(self.rxp.rxq), 256)
+        log.msg('Lost: %d/256' % (256 - len(self.rxp.rxq),))
+
+        prev = -1
+        for pkt in self.rxp.rxq:
+            idx = int(pkt[0:4])
+            payload = pkt[4:-20]
+            checksum = pkt[-20:]
+            self.assertEqual(hashlib.sha1(payload).digest(), checksum)
+            self.assertGreater(idx, prev)
+            prev = idx
+
+    @defer.inlineCallbacks
+    def test_fec_timeout(self):
+        self.assertEqual(len(self.txp.rxq), 0)
+        for i in range(6):
+            self.txp.send_msg(b'm%d' % (i + 1,))
+
+        yield wait_for(lambda: len(self.txp.rxq) >= 13)
+        self.assertEqual(len(self.txp.rxq), 13) # 1 session + 8 data packets + 4 fec packets
+
+        # Check FEC recovery
+        for i, pkt in enumerate(self.txp.rxq):
+            if i not in (2, 4):
+                self.rxp.send_msg(pkt)
+
+        yield wait_for(lambda: len(self.rxp.rxq) >= 6)
+        self.assertEqual([b'm%d' % (i + 1,) for i in range(6)], self.rxp.rxq)
+
+
+    @defer.inlineCallbacks
+    def test_cmd_fec(self):
+        self.assertEqual(len(self.txp.rxq), 0)
+        yield self.cmdp.set_fec_timeout(0)
+        for i in range(6):
+            self.txp.send_msg(b'm%d' % (i + 1,))
+
+        yield wait_for(lambda: len(self.txp.rxq) >= 7)
+        self.assertEqual(len(self.txp.rxq), 7) # 1 session + (6 data packets)
+
+        res = yield self.cmdp.get_fec()
+        self.assertEqual(res['k'], 8)
+        self.assertEqual(res['n'], 12)
+
+        yield self.cmdp.set_fec(1, 2) # should close FEC block, set FEC 1/2 and issue N-K+1 session packets
+
+        res = yield self.cmdp.get_fec()
+        self.assertEqual(res['k'], 1)
+        self.assertEqual(res['n'], 2)
+
+        yield wait_for(lambda: len(self.txp.rxq) >= 15)
+        self.assertEqual(len(self.txp.rxq), 15) # 1 session + (8 data packets + 4 fec packets) + 2 session
+        self.txp.send_msg(b'm%d' % (7,))
+        yield wait_for(lambda: len(self.txp.rxq) >= 17)
+
+        self.assertEqual(len(self.txp.rxq), 17) # 1 session + (8 data packets + 4 fec packets) + 2 session + (1 data packet + 1 fec packet)
+
+        # Check FEC recovery
+        for i, pkt in enumerate(self.txp.rxq):
+            if i not in (2, 4, 15):
+                self.rxp.send_msg(pkt)
+
+        yield wait_for(lambda: len(self.rxp.rxq) >= 7)
+        self.assertEqual([b'm%d' % (i + 1,) for i in range(7)], self.rxp.rxq)
+
+
+    @defer.inlineCallbacks
+    def test_the_data_of_a_block_unfinished_go_out_at_a_new_session(self):
+        # the block closed by the change of FEC lost two data packets and its
+        # FEC packets come after the key of the new session (a qdisc that
+        # sends the data before the FEC): they do not decrypt, the data of
+        # the block go out with the holes
+        yield self.cmdp.set_fec_timeout(0)
+        for i in range(6):
+            self.txp.send_msg(b'm%d' % (i + 1,))
+
+        # the command goes before the data waiting to be read
+        yield wait_for(lambda: len(self.txp.rxq) >= 7)
+        yield self.cmdp.set_fec(1, 2)
+        self.txp.send_msg(b'm%d' % (7,))
+        yield wait_for(lambda: len(self.txp.rxq) >= 17)
+        self.assertEqual(len(self.txp.rxq), 17) # 1 session + (8 data packets + 4 fec packets) + 2 session + (1 data packet + 1 fec packet)
+
+        for i in [0, 1, 3, 5, 6, 7, 8, 13, 14, 9, 10, 11, 12, 15, 16]:
+            self.rxp.send_msg(self.txp.rxq[i])
+
+        yield wait_for(lambda: len(self.rxp.rxq) >= 5)
+        self.assertEqual([b'm1', b'm3', b'm5', b'm6', b'm7'], self.rxp.rxq)
+
+    @defer.inlineCallbacks
+    def test_cmd_fec_invalid_args(self):
+        self.assertEqual(len(self.txp.rxq), 0)
+        yield self.cmdp.set_fec_timeout(0)
+        for i in range(6):
+            self.txp.send_msg(b'm%d' % (i + 1,))
+
+        yield wait_for(lambda: len(self.txp.rxq) >= 7)
+        self.assertEqual(len(self.txp.rxq), 7) # 1 session + (6 data packets)
+
+        try:
+            yield self.cmdp.set_fec(1, 0)
+            self.fail('Should fail')
+        except OSError as v:
+            self.assertEqual(str(v), 'Error: EINVAL')
+
+        self.assertEqual(len(self.txp.rxq), 7) # command should be ignored
+
+        # the FEC timeout closes the block, then none for the next packet
+        yield self.cmdp.set_fec_timeout(30)
+        yield wait_for(lambda: len(self.txp.rxq) >= 13)
+        yield self.cmdp.set_fec_timeout(0)
+        self.txp.send_msg(b'm%d' % (7,))
+        yield wait_for(lambda: len(self.txp.rxq) >= 14)
+
+        self.assertEqual(len(self.txp.rxq), 14) # 1 session + (8 data packets + 4 fec packets) + 1 data packet
+
+        # Check FEC recovery
+        for i, pkt in enumerate(self.txp.rxq):
+            if i not in (2, 4):
+                self.rxp.send_msg(pkt)
+
+        yield wait_for(lambda: len(self.rxp.rxq) >= 7)
+        self.assertEqual([b'm%d' % (i + 1,) for i in range(7)], self.rxp.rxq)
+
+    @defer.inlineCallbacks
+    def test_cmd_radio(self):
+        self.assertEqual(len(self.txp.rxq), 0)
+        yield self.cmdp.set_fec_timeout(0)
+        for i in range(6):
+            self.txp.send_msg(b'm%d' % (i + 1,))
+
+        yield wait_for(lambda: len(self.txp.rxq) >= 7)
+        self.assertEqual(len(self.txp.rxq), 7) # 1 session + (6 data packets)
+
+        res = yield self.cmdp.get_radio()
+        self.assertEqual(res['stbc'], 0)
+        self.assertEqual(res['ldpc'], False)
+        self.assertEqual(res['short_gi'], False)
+        self.assertEqual(res['bandwidth'], 0)
+        self.assertEqual(res['mcs_index'], 0)
+        self.assertEqual(res['vht_mode'], False)
+        self.assertEqual(res['vht_nss'], 0)
+        self.assertEqual(res['subch'], 0)
+
+        yield self.cmdp.set_radio(stbc=1, ldpc=True, short_gi=False, bandwidth=40, mcs_index=3, vht_mode=False, vht_nss=0, subch=3)
+
+        res = yield self.cmdp.get_radio()
+        self.assertEqual(res['stbc'], 1)
+        self.assertEqual(res['ldpc'], True)
+        self.assertEqual(res['short_gi'], False)
+        self.assertEqual(res['bandwidth'], 40)
+        self.assertEqual(res['mcs_index'], 3)
+        self.assertEqual(res['vht_mode'], False)
+        self.assertEqual(res['vht_nss'], 0)
+        self.assertEqual(res['subch'], 3)
+
+        self.txp.send_msg(b'm%d' % (7,))
+        yield wait_for(lambda: len(self.txp.rxq) >= 8)
+        # the FEC timeout closes the block
+        yield self.cmdp.set_fec_timeout(30)
+        yield wait_for(lambda: len(self.txp.rxq) >= 13)
+
+        self.assertEqual(len(self.txp.rxq), 13) # 1 session + (8 data packets + 4 fec packets)
+
+        # Check FEC recovery
+        for i, pkt in enumerate(self.txp.rxq):
+            if i not in (2, 4):
+                self.rxp.send_msg(pkt)
+
+        yield wait_for(lambda: len(self.rxp.rxq) >= 7)
+        self.assertEqual([b'm%d' % (i + 1,) for i in range(7)], self.rxp.rxq)
+
+    @defer.inlineCallbacks
+    def test_cmd_radio_invalid_args(self):
+        self.assertEqual(len(self.txp.rxq), 0)
+        yield self.cmdp.set_fec_timeout(0)
+        for i in range(6):
+            self.txp.send_msg(b'm%d' % (i + 1,))
+
+        yield wait_for(lambda: len(self.txp.rxq) >= 7)
+        self.assertEqual(len(self.txp.rxq), 7) # 1 session + (6 data packets)
+
+        try:
+            yield self.cmdp.set_radio(stbc=200, ldpc=True, short_gi=False, bandwidth=1, mcs_index=100, vht_mode=False, vht_nss=0)
+            self.fail('Should fail')
+        except OSError as v:
+            self.assertEqual(str(v), 'Error: EINVAL')
+
+        try:
+            # a quarter of 80 MHz does not fit into a 20 MHz channel
+            yield self.cmdp.set_radio(stbc=0, ldpc=False, short_gi=False, bandwidth=20, mcs_index=1, vht_mode=True, vht_nss=1, subch=8)
+            self.fail('Should fail')
+        except OSError as v:
+            self.assertEqual(str(v), 'Error: EINVAL')
+
+        self.txp.send_msg(b'm%d' % (7,))
+        yield wait_for(lambda: len(self.txp.rxq) >= 8)
+        # the FEC timeout closes the block
+        yield self.cmdp.set_fec_timeout(30)
+        yield wait_for(lambda: len(self.txp.rxq) >= 13)
+
+        self.assertEqual(len(self.txp.rxq), 13) # 1 session + (8 data packets + 4 fec packets)
+
+        # Check FEC recovery
+        for i, pkt in enumerate(self.txp.rxq):
+            if i not in (2, 4):
+                self.rxp.send_msg(pkt)
+
+        yield wait_for(lambda: len(self.rxp.rxq) >= 7)
+        self.assertEqual([b'm%d' % (i + 1,) for i in range(7)], self.rxp.rxq)
+
+
+class BlockTimeoutTestCase(TXRXTestCase):
+    rx_opts = ('-T', '300')
+
+    @defer.inlineCallbacks
+    def test_a_block_that_cannot_be_recovered_goes_out_after_the_timeout(self):
+        # block 1 loses its data packet 4 and all its FEC packets and no
+        # block comes after it: its data 5-8 go out with the gap after the
+        # timeout, not with the next block whenever that comes
+        yield self.cmdp.set_fec_timeout(0)
+        for i in range(8):
+            self.txp.send_msg(b'm%d' % (i + 1,))
+        yield wait_for(lambda: len(self.txp.rxq) >= 13)
+        for i in range(9):
+            if i != 4:
+                self.rxp.send_msg(self.txp.rxq[i])
+        yield wait_for(lambda: len(self.rxp.rxq) >= 7)
+        self.assertEqual([b'm%d' % i for i in (1, 2, 3, 5, 6, 7, 8)], self.rxp.rxq)
+
+    @defer.inlineCallbacks
+    def test_a_fragment_after_the_timeout_counts_received_its_data_do_not_go_out(self):
+        # the data packet 4 of block 1 comes after the timeout let the block
+        # go: as for a block closed, the air brought it (the frags of the
+        # block count when block 2 closes), its data are late and stay
+        yield self.cmdp.set_fec_timeout(0)
+        for i in range(16):
+            self.txp.send_msg(b'm%d' % (i + 1,))
+        yield wait_for(lambda: len(self.txp.rxq) >= 25)
+        for i in range(9):
+            if i != 4:
+                self.rxp.send_msg(self.txp.rxq[i])
+        yield wait_for(lambda: len(self.rxp.rxq) >= 7)
+        self.rxp.send_msg(self.txp.rxq[4])
+        for i in range(13, 25):
+            self.rxp.send_msg(self.txp.rxq[i])
+        yield wait_for(lambda: len(self.rxp.rxq) >= 15)
+        self.assertEqual([b'm%d' % i for i in (1, 2, 3, 5, 6, 7, 8)] + [b'm%d' % i for i in range(9, 17)],
+                         self.rxp.rxq)
+        yield wait_for(lambda: self.ap.rx_stats is not None and self.ap.rx_stats['frags'][1] >= 12)
+        self.assertEqual((self.ap.rx_stats['frags'][1], self.ap.rx_stats['frags_lost'][1]), (12, 4))
+
+
+class KeyDerivationTestCase(TXRXTestCase):
+    def setup_keys(self, bindir):
+        return call_and_check_rc(os.path.join(bindir, 'wfb_keygen'), 'secret password')
+
+    def test_keys(self):
+        keys = [open(k, 'rb').read() for k in ('gs.key', 'drone.key')]
+        self.assertEqual(len(keys), 2)
+        self.assertNotEqual(keys[0], keys[1])
+        self.assertEqual(hashlib.sha1(keys[0]).hexdigest(), 'cb8d52ca7602928f67daba6ba1f308f4cfc88aa7')
+        self.assertEqual(hashlib.sha1(keys[1]).hexdigest(), '7a6ffb44cebc53b4538d20bdcaba8d70c9cf4095')
+
+
+class KeygenTestCase(unittest.TestCase):
+    @defer.inlineCallbacks
+    def test_replaced_keys_are_private(self):
+        keys = ('gs.key', 'drone.key')
+        old_fds = []
+        for k in keys:
+            with open(k, 'wb') as fd:
+                fd.write(b'old')
+            os.chmod(k, 0o644)
+            old_fds.append(open(k, 'rb'))
+
+        yield call_and_check_rc(os.path.join(os.path.dirname(__file__), '../..', 'wfb_keygen'))
+
+        for k, fd in zip(keys, old_fds):
+            with fd:
+                self.assertEqual(fd.read(), b'old')
+            st = os.stat(k)
+            self.assertEqual((st.st_mode & 0o777, st.st_size), (0o600, 64))
+
+
+class UNIXTXRXTestCase(TXRXTestCase):
+    @defer.inlineCallbacks
+    def setUp(self):
+        bindir = os.path.join(os.path.dirname(__file__), '../..')
+        yield self.setup_keys(bindir)
+
+        self.rxp_txp = DatagramProtocol()
+        self.rx_tx_ep = reactor.listenUDP(0, self.rxp_txp)
+        self.rxp = UDP_TXRX(('127.0.0.1', 10001), self.rxp_txp)
+
+        self.txp_rxp = DatagramProtocol()
+        self.tx_rx_ep = reactor.listenUNIXDatagram(None, self.txp_rxp)
+        self.txp = UDP_TXRX('\0wfb-tx-test', self.txp_rxp)
+
+        self.cmdp = TXCommandClient(b'\0wfb-tx-cmd-test')
+
+        self.rx_ep = reactor.listenUNIXDatagram(b'\0wfb-rx-test', self.rxp)
+        self.tx_ep = reactor.listenUDP(10004, self.txp)
+        self.cmd_ep = reactor.listenUNIXDatagram(b'\0wfb-cmd-client-test', self.cmdp)
+
+        link_id = int.from_bytes(os.urandom(3), 'big')
+        epoch = int(time.time())
+        cmd_rx = [os.path.join(bindir, 'wfb_rx'), '-K', 'drone.key', '-a', '10001', '-U', 'wfb-rx-test',
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+        cmd_tx = [os.path.join(bindir, 'wfb_tx'), '-K', 'gs.key', '-U', 'wfb-tx-test', '-D', '10004', '-T', '30', '-F', '3000', '-c', 'wfb-tx-cmd-test',
+                  # '-Q', '-P 1',  ## requires root priv
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+
+        self.ap = FakeAntennaProtocol()
+        self.rx_pp = RXProtocol(self.ap, cmd_rx, 'debug rx')
+        self.tx_pp = TXProtocol(self.ap, cmd_tx, 'debug tx')
+
+        self.rx_df = self.rx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        self.tx_df = self.tx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+
+        # Wait for tx/rx processes to initialize
+        yield self.wait_ready()
+
+    @defer.inlineCallbacks
+    def tearDown(self):
+        for pp in (self.rx_pp, self.tx_pp):
+            try:
+                pp.transport.signalProcess('KILL')
+            except error.ProcessExitedAlready:
+                pass
+
+        self.rx_ep.stopListening()
+        self.tx_ep.stopListening()
+        self.rx_tx_ep.stopListening()
+        self.tx_rx_ep.stopListening()
+        self.cmd_ep.stopListening()
+        # Wait for tx/rx processes to die
+        yield defer.DeferredList([self.rx_df, self.tx_df])
