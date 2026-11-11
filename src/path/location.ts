@@ -1,9 +1,9 @@
-import type {Ray} from 'geome'
 import {mat2d, scalar, vec2} from 'linearly'
 
 import {Curve, Segment} from '../index'
 import type {PathLocation, TimePathLocation} from '../Location'
 import {searchInterval} from '../numeric'
+import type {Ray} from '../ray'
 import {normalizeIndex, normalizeOffset} from '../utils'
 import {
 	curveLengthPrefix,

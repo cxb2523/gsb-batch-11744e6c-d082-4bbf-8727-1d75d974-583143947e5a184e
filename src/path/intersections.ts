@@ -392,6 +392,75 @@ function collapseAlongContacts(
 }
 
 /**
+ * The details of intersecting two segments, exposing the overlap decision that
+ * {@link intersectSegments} makes internally before it returns. Used by the diagnostics module
+ * so a report never reimplements the solver it describes.
+ */
+export interface SegmentIntersectionAnalysis {
+	/** Whether the segment bounding boxes (widened by the tolerance) meet. */
+	boundsIntersect: boolean
+	/** Whether end-point correspondences show the segments share a stretch of curve. */
+	overlap: boolean
+	/** The intersections returned by {@link intersectSegments}. */
+	intersections: SegmentIntersection[]
+}
+
+/**
+ * Runs {@link intersectSegments} and additionally reports whether the pair passed the bounding
+ * box check and whether it was treated as overlapping curves.
+ */
+export function analyzeSegmentIntersections(
+	a: Segment,
+	b: Segment,
+	tolerance: number
+): SegmentIntersectionAnalysis {
+	const boundsIntersect = Rect.intersects(
+		Rect.offset(Segment.bounds(a), tolerance),
+		Segment.bounds(b)
+	)
+	if (!boundsIntersect) {
+		return {boundsIntersect: false, overlap: false, intersections: []}
+	}
+
+	if (a.command === 'L' && b.command === 'L') {
+		return {
+			boundsIntersect: true,
+			overlap: false,
+			intersections: LineSegment.intersections(
+				[a.start, a.point],
+				[b.start, b.point],
+				tolerance
+			),
+		}
+	}
+
+	const {candidates, overlap} = overlapIntersections(a, b, tolerance)
+	if (overlap) {
+		return {
+			boundsIntersect: true,
+			overlap: true,
+			intersections: candidates.filter(c => c.overlap),
+		}
+	}
+
+	const out: SegmentIntersection[] = [...candidates]
+	for (const x of subdivide(a, b, tolerance)) {
+		// Also when it is on the stretch of a contact starting at an end point
+		if (
+			out.some(
+				o =>
+					vec2.distance(o.point, x.point) <= tolerance ||
+					staysTogether(a, b, o, x, tolerance)
+			)
+		) {
+			continue
+		}
+		out.push(x)
+	}
+	return {boundsIntersect: true, overlap: false, intersections: out}
+}
+
+/**
  * All intersections between two segments within `tolerance` (absolute distance).
  */
 export function intersectSegments(

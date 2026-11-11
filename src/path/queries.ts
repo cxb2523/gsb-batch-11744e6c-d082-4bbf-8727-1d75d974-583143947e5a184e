@@ -214,7 +214,8 @@ export function hitTest(
 	return null
 }
 
-function defaultTolerance(...paths: Path[]): number {
+/** The tolerance used by {@link intersections} when none is given. */
+export function defaultTolerance(...paths: Path[]): number {
 	const sizes = paths.flatMap(path =>
 		segments(path).length > 0 ? Rect.size(bounds(path)) : []
 	)

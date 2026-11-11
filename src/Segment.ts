@@ -1,10 +1,11 @@
-import {Ray, Rect} from 'geome'
+import {Rect} from 'geome'
 import {mat2d, vec2} from 'linearly'
 
 import {segmentAttrsAt, withSegmentAttrs} from './attributes'
 import {Arc, CubicBezier, Line, type Path, type Segment, Vertex} from './index'
 import {SegmentLocation} from './Location'
 import type {AttributeDefs, Attributes} from './path/types'
+import {Ray} from './ray'
 
 /**
  * Returns the length of the segment.

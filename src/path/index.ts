@@ -170,6 +170,20 @@ export {
 	nearest,
 	selfIntersections,
 } from './queries'
+export {diagnoseHitTest, diagnoseIntersections} from './diagnose'
+export type {
+	DiagnoseHitTestOptions,
+	DiagnoseIntersectionsOptions,
+	DiagnoseDegradedReason,
+	DiagnosedIntersection,
+	HitTestDiagnosis,
+	HitTestStageCandidate,
+	HitTestStageReport,
+	IntersectionPairReport,
+	IntersectionsDiagnosis,
+} from './diagnose'
+export {analyzeSegmentIntersections} from './intersections'
+export type {SegmentIntersectionAnalysis} from './intersections'
 export type {
 	ContainsOptions,
 	FillRule,
