@@ -1,0 +1,1021 @@
+import {Circle, Rect} from 'geome'
+import {scalar, vec2} from 'linearly'
+
+import {type CurveL, type Path, type PathL} from '../index'
+import * as Iter from '../Iter'
+import {fromSegment, merge} from './compound'
+import {arcTo, close, moveTo, pen} from './drawAppend'
+import {join} from './modifiers'
+import type {Vertex} from './types'
+
+/**
+ * @category Options
+ */
+export interface CircleFromPointsOptions {
+	/**
+	 * If the given points are less than three and the circumcenter cannot be well-defined, the circle will be drawn in the direction of the sweep flag. (in Canvas API, it means clockwise).
+	 * @default true
+	 */
+	preferredSweep?: boolean
+}
+
+/**
+ * An options for {@link Path.arc}
+ * @category Options
+ */
+export type ArcOptions = {
+	/**
+	 * The maximum angle step in degrees
+	 * @default `360 - 1e-4`
+	 */
+	step?: number
+	/**
+	 * The alignment of the vertices
+	 * @default 'uniform'
+	 */
+	align?: 'uniform' | 'start' | 'center' | 'end'
+	/**
+	 * The total count of the segments in the arc. If this is specified, the `step` will be ignored and the arc will be deviced into the specified number of segments uniformly.
+	 */
+	count?: number
+}
+
+/**
+ * The options for {@link Path.formula}
+ * @category Options
+ */
+export interface FormulaOptions {
+	/**
+	 * The delta value for calculating the derivative of the formula
+	 * @default 1e-6
+	 */
+	delta?: number
+}
+
+export const empty: Path = Object.freeze({
+	curves: [],
+})
+
+/**
+ * Creates a rectangle path from the given two points.
+ * @param start The first point defining the rectangle
+ * @param end The second point defining the rectangle
+ * @returns The newly created path
+ * @category Primitives
+ * @example
+ * ```js:pave
+ * const p = Path.rectangle([10, 30], [90, 70])
+ * stroke(p)
+ * ```
+ */
+export function rectangle(start: vec2, end: vec2): Path {
+	return {
+		curves: [
+			{
+				vertices: [
+					{point: start, command: 'L'},
+					{point: [end[0], start[1]], command: 'L'},
+					{point: end, command: 'L'},
+					{point: [start[0], end[1]], command: 'L'},
+				],
+				closed: true,
+			},
+		],
+	}
+}
+
+/**
+ * Alias for {@link rectangle}
+ * @category Primitives
+ */
+export const rect = rectangle
+
+/**
+ * What a path can be given as: a path itself, or a shape that is read as its outline, a
+ * {@link Rect} as a rectangle from its min to its max, and a {@link Circle} as a circle.
+ * @category Types
+ */
+export type PathLike = Path | Rect | Circle
+
+/**
+ * The path of what is given where a path is wanted: a path as it is, and the outline of a
+ * {@link Rect} or a {@link Circle}. Every function of {@link Path} that takes a path reads it so.
+ * @param shape A path, a rect or a circle
+ * @returns The path
+ * @category Primitives
+ */
+export function of(shape: PathLike): Path {
+	if ('curves' in shape) return shape
+	if ('center' in shape) return circle(shape.center, shape.radius)
+	return rectangle(shape[0], shape[1])
+}
+
+/**
+ * Creates a rectangle path from the given center and size.
+ * @param center The center of the rectangle
+ * @param size The size of the rectangle
+ * @returns The newly created path
+ * @category Primitives
+ */
+export function rectFromCenter(center: vec2, size: vec2): Path {
+	const halfSize = vec2.scale(size, 0.5)
+	const start = vec2.sub(center, halfSize)
+	const end = vec2.add(center, halfSize)
+	return rectangle(start, end)
+}
+
+/**
+ * Creates a rounded rectangle. The arguments are almost the same as the CanvasRenderingContext2D's `roundRect` method.
+ * @see https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/roundRect
+ * @category Primitives
+ */
+export function roundRect(
+	start: vec2,
+	end: vec2,
+	radii:
+		| number
+		| [allCorner: number]
+		| [topLeftAndBottomRight: number, topRightAndBottomLeft: number]
+		| [topLeft: number, topRightAndBottomLeft: number, bottomRight: number]
+		| [
+				topLeft: number,
+				topRight: number,
+				bottomRight: number,
+				bottomLeft: number,
+		  ]
+): Path {
+	let tl: number
+	let tr: number
+	let br: number
+	let bl: number
+
+	// Assigns the radii
+	if (typeof radii === 'number') {
+		tl = tr = br = bl = radii
+	} else if (radii.length === 1) {
+		tl = tr = br = bl = radii[0]
+	} else if (radii.length === 2) {
+		;[tl, tr] = radii
+		;[br, bl] = radii
+	} else if (radii.length === 3) {
+		;[tl, tr, br] = radii
+		bl = tr
+	} else {
+		;[tl, tr, br, bl] = radii
+	}
+
+	// Clamps the radii to the half of the width and height
+	// NOTE: might be possible to exceed the half of the width and height
+	const [width, height] = vec2.sub(end, start)
+	const halfWidth = Math.abs(width) / 2
+	const halfHeight = Math.abs(height) / 2
+
+	tl = Math.min(Math.abs(tl), halfWidth, halfHeight)
+	tr = Math.min(Math.abs(tr), halfWidth, halfHeight)
+	br = Math.min(Math.abs(br), halfWidth, halfHeight)
+	bl = Math.min(Math.abs(bl), halfWidth, halfHeight)
+
+	const sweep = width * height > 0
+
+	const xSign = Math.sign(width)
+	const ySign = Math.sign(height)
+
+	// Creates the path
+	return pen()
+		.M([start[0], start[1] + tl * ySign])
+		.A([tl, tl], 0, false, sweep, [start[0] + tl * xSign, start[1]])
+		.H(end[0] - tr * xSign)
+		.A([tr, tr], 0, false, sweep, [end[0], start[1] + tr * ySign])
+		.V(end[1] - br * ySign)
+		.A([br, br], 0, false, sweep, [end[0] - br * xSign, end[1]])
+		.H(start[0] + bl * xSign)
+		.A([bl, bl], 0, false, sweep, [start[0], end[1] - bl * ySign])
+		.Z()
+		.get()
+}
+
+/**
+ * Creates a circle path from the given center and radius.
+ * @param center The center of the circle
+ * @param radius The radius of the circle
+ * @returns The newly created path
+ * @category Primitives
+ * @example
+ * ```js:pave
+ * const c = Path.circle([50, 50], 40)
+ * stroke(c)
+ * ```
+ */
+export function circle(center: vec2, radius: number): Path {
+	return ellipse(center, [radius, radius])
+}
+
+/**
+ * Creates a semicircle path from the given start and end points.
+ * @category Primitives
+ */
+export function semicircle(start: vec2, end: vec2, closed = true): Path {
+	const r = vec2.dist(start, end) / 2
+
+	const p = arcTo(moveTo(empty, start), [r, r], 0, false, true, end)
+
+	return closed ? close(p) : p
+}
+
+/**
+ * Creates an infinite line path from the given two points. Unlike {@link line}, the line will be drawn nearly infinitely in both directions.
+ * @param point0 The first point
+ * @param point1 The second point
+ * @param distance  The length of the infinite line for each direction
+ * @returns The infinite line path
+ * @category Primitives
+ */
+export function infiniteLine(point0: vec2, point1: vec2, distance = 1e8): Path {
+	const dir = vec2.normalize(vec2.sub(point1, point0))
+	const pointAtInfinity0 = vec2.scaleAndAdd(point0, dir, distance)
+	const pointAtInfinity1 = vec2.scaleAndAdd(point0, dir, -distance)
+	return line(pointAtInfinity0, pointAtInfinity1)
+}
+
+/**
+ * Creates a [half-line](https://en.wikipedia.org/wiki/Line_(geometry)#Ray), infinite line in one direction from a starting point and a point that the line passes through. It is not actually an inifinite, but one with a very large length.
+ * @param point The starting point
+ * @param through The point that the line passes through
+ * @param distance The length of the half-line
+ * @returns The half-line path
+ * @category Primitives
+ */
+export function halfLine(point: vec2, through: vec2, distance = 1e8): Path {
+	const dir = vec2.normalize(vec2.sub(through, point))
+	const pointAtInfinity = vec2.scaleAndAdd(point, dir, distance)
+	return line(point, pointAtInfinity)
+}
+
+export function circleFromPoints(
+	p1: vec2,
+	p2?: vec2 | null,
+	p3?: vec2 | null,
+	{preferredSweep = true}: CircleFromPointsOptions = {}
+): Path {
+	// Remove duplicate points
+	if (p2 && p3 && vec2.approx(p2, p3)) {
+		p3 = undefined
+	}
+	if (p3 && vec2.approx(p3, p1)) {
+		p3 = undefined
+	}
+	if (p2 && vec2.approx(p1, p2)) {
+		p2 = p3
+		p3 = undefined
+	}
+
+	// If there are only one point, create a circle with zero radius
+	if (!p2) {
+		p2 = p1
+	}
+
+	// If there are only two points, create a circle from the two points as the diameter
+	if (!p3) {
+		const radius = vec2.distance(p1, p2) / 2
+		const radii: vec2 = [radius, radius]
+		return {
+			curves: [
+				{
+					vertices: [
+						{
+							point: p1,
+							command: 'A',
+							args: [radii, 0, false, preferredSweep],
+						},
+						{
+							point: p2,
+							command: 'A',
+							args: [radii, 0, false, preferredSweep],
+						},
+					],
+					closed: true,
+				},
+			],
+		}
+	}
+
+	const circumcircle = Circle.circumcircle(p1, p2, p3)
+
+	if (!circumcircle) {
+		throw new Error('Circumcircle is not defined')
+	}
+
+	const {radius} = circumcircle
+	const radii: vec2 = [radius, radius]
+
+	const sweep = vec2.angle(vec2.sub(p2, p1), vec2.sub(p3, p1)) > 0
+
+	return {
+		curves: [
+			{
+				vertices: [
+					{
+						point: p1,
+						command: 'A',
+						args: [radii, 0, false, sweep],
+					},
+					{
+						point: p2,
+						command: 'A',
+						args: [radii, 0, false, sweep],
+					},
+					{
+						point: p3,
+						command: 'A',
+						args: [radii, 0, false, sweep],
+					},
+				],
+				closed: true,
+			},
+		],
+	}
+}
+
+/**
+ * Creates an ellipse path from the given center and radius.
+ * @param center The center of the ellipse
+ * @param radius The radii along its own axes (rx, ry), which are horizontal and vertical unless it is turned
+ * @param angle How far it is turned around the center in degrees, in which the angle increases clockwise on a Y-down canvas
+ * @returns The newly created path
+ * @category Primitives
+ * @example
+ * ```js:pave
+ * const e = Path.ellipse([50, 50], [20, 40])
+ * stroke(e)
+ * ```
+ */
+export function ellipse(center: vec2, radius: vec2, angle = 0): Path {
+	const axis = vec2.rotate([radius[0], 0], angle)
+
+	return {
+		curves: [
+			{
+				vertices: [
+					{
+						point: vec2.add(center, axis),
+						command: 'A',
+						args: [radius, angle, false, true],
+					},
+					{
+						point: vec2.sub(center, axis),
+						command: 'A',
+						args: [radius, angle, false, true],
+					},
+				],
+				closed: true,
+			},
+		],
+	}
+}
+
+/**
+ * Creates an ellipse from its two foci and a point that it passes through. Two foci alone would not do, as there are ellipses of every size around them: an ellipse is where the sum of the distances to its foci stays the same, and the point says what that sum is. When the foci are the same it is a circle, and when the point is on the line between them it is flat.
+ * @param focus1 The first focus
+ * @param focus2 The second focus
+ * @param through A point that the ellipse passes through
+ * @returns The newly created path
+ * @category Primitives
+ * @example
+ * ```js:pave
+ * const p = Path.ellipseFromFoci([30, 50], [70, 50], [50, 25])
+ * stroke(p)
+ * ```
+ */
+export function ellipseFromFoci(
+	focus1: vec2,
+	focus2: vec2,
+	through: vec2
+): Path {
+	const major =
+		(vec2.distance(through, focus1) + vec2.distance(through, focus2)) / 2
+	const focal = vec2.distance(focus1, focus2) / 2
+	const minor = Math.sqrt(Math.max(0, major * major - focal * focal))
+	const angle =
+		(Math.atan2(focus2[1] - focus1[1], focus2[0] - focus1[0]) * 180) / Math.PI
+
+	return ellipse(vec2.lerp(focus1, focus2, 0.5), [major, minor], angle)
+}
+
+/**
+ * Creates an arc path.
+ * @param center The center of the arc
+ * @param radius The radius of the arc
+ * @param startAngle The start angle in degrees (Y-down: 0° = +X, increasing clockwise)
+ * @param endAngle The end angle in degrees
+ * @returns The newly created path
+ * @category Primitives
+ * @example
+ * ```js:pave
+ * const a = Path.arc([50, 50], 40, 0, 90)
+ * stroke(a)
+ * ```
+ */
+export function arc(
+	center: vec2,
+	radius: number,
+	startAngle: number,
+	endAngle: number,
+	options: ArcOptions = {}
+): Path {
+	// Clamp the angle step not to be zero or negative, or exceed 360 degrees
+	const maxAngleStep = 360 - 1e-4
+	let step = options.step ?? maxAngleStep
+	step = scalar.clamp(Math.abs(step), 0.1, maxAngleStep)
+
+	const radii: vec2 = [radius, radius]
+	const sweep = endAngle > startAngle
+
+	// Add intermediate vertices
+	const angles = Iter.resample(startAngle, endAngle, {
+		align: 'uniform',
+		step,
+		...options,
+	})
+
+	const vertices: Vertex[] = [
+		{command: 'L', point: vec2.dir(startAngle, radius, center)},
+	]
+
+	for (const [prevAngle, throughAngle] of Iter.pairwise(angles)) {
+		const largeArc = Math.abs(throughAngle - prevAngle) > 180
+
+		vertices.push({
+			point: vec2.dir(throughAngle, radius, center),
+			command: 'A',
+			args: [radii, 0, largeArc, sweep],
+		})
+	}
+
+	return {curves: [{vertices, closed: false}]}
+}
+
+/**
+ * Creates an arc path from the given three points. If the points are collinear, it will create a straight line path.
+ * @param start The start point
+ * @param through The point that the arc passes through
+ * @param end The end point
+ * @returns The newly created path
+ * @category Primitives
+ */
+export function arcByPoints(start: vec2, through: vec2, end: vec2): Path {
+	const circumcircle = Circle.circumcircle(start, through, end)
+
+	if (!circumcircle) {
+		const vStart = vec2.sub(through, start)
+		const vEnd = vec2.sub(through, end)
+
+		if (vec2.dot(vStart, vEnd) <= 0) {
+			// o-----o-------o
+			// start through end
+			return line(start, end)
+		} else if (vec2.len(vStart) < vec2.len(vEnd)) {
+			// o-------o-----o
+			// through start end
+			const endTo = vec2.add(end, vec2.sub(start, through))
+			return merge([halfLine(start, through), halfLine(end, endTo)])
+		} else {
+			// o-----o-------o
+			// start end through
+			const startTo = vec2.add(start, vec2.sub(end, through))
+			return merge([halfLine(start, startTo), halfLine(end, through)])
+		}
+	}
+
+	const {center, radius} = circumcircle
+
+	const CS = vec2.sub(start, center)
+	const CT = vec2.sub(through, center)
+	const CE = vec2.sub(end, center)
+
+	const angleSCE = vec2.angle(CS, CE)
+	const angleSOC = vec2.angle(CS, CT)
+	const angleECT = vec2.angle(CE, CT)
+
+	let largeArc: boolean
+	let sweep: boolean
+
+	if (angleSCE < 0) {
+		if (angleSOC < 0 && angleECT > 0) {
+			largeArc = false
+			sweep = false
+		} else {
+			largeArc = true
+			sweep = true
+		}
+	} else {
+		if (angleSOC > 0 && angleECT < 0) {
+			largeArc = false
+			sweep = true
+		} else {
+			largeArc = true
+			sweep = false
+		}
+	}
+
+	return fromSegment({
+		start,
+		command: 'A',
+		args: [[radius, radius], 0, largeArc, sweep],
+		point: end,
+	})
+}
+
+/**
+ * Creates an arc path from start point, start tangent, and end point.
+ * @param start The start point
+ * @param startTangent The tangent at the start point
+ * @param end The end point
+ * @returns A newly created open arc path
+ * @category Primitives
+ */
+export function arcByPointsTangent(
+	start: vec2,
+	startTangent: vec2,
+	end: vec2
+): Path {
+	// https://gist.github.com/baku89/b6b92c352c14779c57ba9a61c426258b#file-arc-pen-L49-L59
+
+	const SE = vec2.sub(end, start)
+	const phi = vec2.angle(startTangent, SE) / 2
+
+	if (scalar.approx(phi, 0)) {
+		return line(start, end)
+	}
+
+	const cosPhi = scalar.cos(phi)
+
+	const lenSE = vec2.len(SE)
+	const dirSE = vec2.normalize(SE)
+
+	const mDist = lenSE / 2 / cosPhi
+	const mDir = vec2.normalize(vec2.add(startTangent, dirSE))
+
+	const mid = vec2.scaleAndAdd(start, mDir, mDist)
+
+	return arcByPoints(start, mid, end)
+}
+
+/**
+ * Creates an arc path from two points and an angle.
+ * @param start The start point
+ * @param end The end point
+ * @param angle The angle of arc in degrees. If the angle is positive, the arc will be drawn in the sweep direction (clockwise in Y-down coordinate system).
+ * @returns The newly created path
+ * @category Primitives
+ */
+export function arcByPointsAngle(start: vec2, end: vec2, angle: number): Path {
+	if (scalar.approx(angle, 0)) {
+		return line(start, end)
+	}
+	if (Math.abs(angle) >= 360) {
+		const dir = vec2.sub(end, start)
+		return merge([
+			halfLine(start, vec2.sub(start, dir)),
+			halfLine(end, vec2.add(end, dir)),
+		])
+	}
+	if (angle === 180) {
+		return semicircle(start, end, false)
+	}
+	if (angle === -180) {
+		return semicircle(end, start, false)
+	}
+
+	const sign = Math.sign(angle)
+	angle = Math.abs(angle)
+
+	const SE = vec2.sub(end, start)
+
+	const phi = 90 - angle / 2
+
+	const d = vec2.len(SE)
+	const r = d / (2 * scalar.cos(phi))
+
+	const center = vec2.scaleAndAdd(
+		start,
+		vec2.rotate(vec2.normalize(SE), phi * sign),
+		r
+	)
+
+	const CS = vec2.sub(start, center)
+	const CE = vec2.sub(end, center)
+
+	const angleStart = vec2.angle(CS)
+	let deltaAngle = vec2.angle(CS, CE)
+
+	if (phi < 0) {
+		deltaAngle += 360 * sign
+	}
+
+	const angleEnd = angleStart + deltaAngle
+
+	return arc(center, r, angleStart, angleEnd)
+}
+
+/**
+ * Creates a fan path.
+ * @param center The center of the fan
+ * @param innerRadius The inner radius of the fan
+ * @param outerRadius The outer radius of the fan
+ * @param startAngle The start angle in degrees (see {@link arc})
+ * @param endAngle The end angle in degrees
+ * @returns The newly created path
+ * @category Primitives
+ * @example
+ * ```js:pave
+ * const f = Path.fan([50, 50], 20, 40, 0, 90)
+ * stroke(f)
+ * ```
+ */
+export function fan(
+	center: vec2,
+	innerRadius: number,
+	outerRadius: number,
+	startAngle: number,
+	endAngle: number
+): Path {
+	const outerRim = arc(center, outerRadius, startAngle, endAngle)
+	const innerRim = arc(center, innerRadius, endAngle, startAngle)
+
+	return close(join([outerRim, innerRim]))
+}
+
+/**
+ * Creates a linear path from two points describing a line.
+ * @param start The line's starting point
+ * @param end The line's ending point
+ * @returns The newly created path
+ * @category Primitives
+ * @example
+ * ```js:pave
+ * const p = Path.line([10, 10], [90, 90])
+ * stroke(p)
+ * ```
+ */
+export function line(start: vec2, end: vec2): PathL {
+	return {
+		curves: [
+			{
+				vertices: [
+					{point: start, command: 'L'},
+					{point: end, command: 'L'},
+				],
+				closed: false,
+			},
+		],
+	}
+}
+
+/**
+ * Creates a “dot“ path, which consists of only a M command to the specified point followed by Z command. This will be rendered only if the lineCap of the drawing context is set to `'round'` or `'square'`.
+ * @param point The center point of the dot
+ * @returns The newly created paths
+ * @category Primitives
+ * @example
+ * ```js:pave
+ * const a = Path.dot([50, 50])
+ * stroke(a, 'skyblue', 10)
+ * ```
+ */
+export function dot(point: vec2): PathL {
+	return {
+		curves: [
+			{
+				vertices: [{point, command: 'L'}],
+				closed: true,
+			},
+		],
+	}
+}
+
+/**
+ * Creates a open polyline from the given points.
+ * @param points The points describing the polygon
+ * @returns The newly created path
+ * @category Primitives
+ * @example
+ * ```js:pave
+ * const p = Path.polyline([10, 10], [30, 80], [80, 50])
+ * stroke(p)
+ * ```
+ */
+function lineStrip(closed: boolean, points: vec2[]): PathL {
+	return {
+		curves: [
+			{
+				vertices: points.map(point => ({point, command: 'L'})),
+				closed,
+			},
+		],
+	}
+}
+
+export function polyline(...points: vec2[]): PathL {
+	return lineStrip(false, points)
+}
+
+/**
+ * Creates a closed polyline from the given points.
+ * @param points The points describing the polygon
+ * @returns The newly created path
+ * @category Primitives
+ * @example
+ * ```js:pave
+ * const p = Path.polygon([10, 10], [30, 80], [80, 50])
+ * stroke(p)
+ * ```
+ */
+export function polygon(...points: vec2[]): PathL {
+	return lineStrip(true, points)
+}
+
+/**
+ * Creates a regular polygon. The first vertex will be placed in the direction of `angle` from the center, on the +X axis by default.
+ * @param center The center of the polygon
+ * @param radius The radius of the circumcircle of the polygon
+ * @param sides The number o sides of the polygon
+ * @param angle The direction of the first vertex in degrees, in which 0° is +X and the angle increases clockwise on a Y-down canvas
+ * @returns The newly created path
+ * @category Primitives
+ * @example
+ * ```js:pave
+ * const p = Path.regularPolygon([50, 50], 40, 5)
+ * stroke(p)
+ * ```
+ */
+export function regularPolygon(
+	center: vec2,
+	radius: number,
+	sides: number,
+	angle = 0
+): PathL {
+	const angleStep = 360 / sides
+	const points: vec2[] = []
+
+	for (let i = 0; i < sides; i++) {
+		const p = vec2.add(center, vec2.rotate([radius, 0], angle + angleStep * i))
+		points.push(p)
+	}
+
+	return polygon(...points)
+}
+
+/**
+ * Alias for {@link regularPolygon}
+ * @category Primitives
+ */
+export const ngon = regularPolygon
+
+/**
+ * Creates a star, alternating between two radii. The first vertex will be placed in the direction of `angle` from the center, on the outer radius, on the +X axis by default.
+ * @param center The center of the star
+ * @param outerRadius The radius of the tips
+ * @param innerRadius The radius of the notches between the tips
+ * @param points The number of the tips, an integer of 2 or more
+ * @param angle The direction of the first tip in degrees, in which 0° is +X and the angle increases clockwise on a Y-down canvas
+ * @returns The newly created path
+ * @category Primitives
+ * @example
+ * ```js:pave
+ * const p = Path.star([50, 50], 40, 18, 5)
+ * stroke(p)
+ * ```
+ */
+export function star(
+	center: vec2,
+	outerRadius: number,
+	innerRadius: number,
+	points: number,
+	angle = 0
+): PathL {
+	if (!Number.isInteger(points) || points < 2) {
+		throw new Error('A star must have an integer of 2 or more points')
+	}
+
+	const angleStep = 180 / points
+	const vertices: vec2[] = []
+
+	for (let i = 0; i < points * 2; i++) {
+		const radius = i % 2 === 0 ? outerRadius : innerRadius
+		vertices.push(
+			vec2.add(center, vec2.rotate([radius, 0], angle + angleStep * i))
+		)
+	}
+
+	return polygon(...vertices)
+}
+
+/**
+ * Creates a capsule, also known as a stadium: the area within a distance from a line segment, with round ends. It is made of two lines and two arcs, so it keeps exact. When the two points are the same it is a circle.
+ * @param start The center of the round end at the start
+ * @param end The center of the round end at the end
+ * @param radius The radius of the round ends, which is the half of the width
+ * @returns The newly created path
+ * @category Primitives
+ * @example
+ * ```js:pave
+ * const p = Path.capsule([25, 70], [75, 30], 15)
+ * stroke(p)
+ * ```
+ */
+export function capsule(start: vec2, end: vec2, radius: number): Path {
+	if (!(radius >= 0)) {
+		throw new Error('The radius of a capsule must not be negative')
+	}
+	if (radius === 0) return line(start, end)
+
+	const distance = vec2.distance(start, end)
+	if (distance === 0) return circle(start, radius)
+
+	// Runs towards increasing angles like the other closed primitives, with `side` on the right
+	// of the travel from the start to the end
+	const dx = (end[0] - start[0]) / distance
+	const dy = (end[1] - start[1]) / distance
+	const side: vec2 = [dy * radius, -dx * radius]
+
+	const args = [[radius, radius], 0, false, true] as [
+		vec2,
+		number,
+		boolean,
+		boolean,
+	]
+
+	return {
+		curves: [
+			{
+				vertices: [
+					{point: vec2.add(start, side), command: 'A', args},
+					{point: vec2.add(end, side), command: 'L'},
+					{point: vec2.sub(end, side), command: 'A', args},
+					{point: vec2.sub(start, side), command: 'L'},
+				],
+				closed: true,
+			},
+		],
+	}
+}
+
+/**
+ * @category Primitives
+ */
+export function grid(rect: Rect, divs: vec2): PathL {
+	const [xdiv, ydiv] = divs
+	const [start, end] = rect
+
+	const curves: CurveL[] = []
+
+	for (let t = 0; t <= xdiv; t++) {
+		const x = scalar.lerp(start[0], end[0], t / xdiv)
+		curves.push({
+			vertices: [
+				{command: 'L', point: [x, start[1]]},
+				{command: 'L', point: [x, end[1]]},
+			],
+			closed: false,
+		})
+	}
+
+	for (let t = 0; t <= ydiv; t++) {
+		const y = scalar.lerp(start[1], end[1], t / ydiv)
+		curves.push({
+			vertices: [
+				{command: 'L', point: [start[0], y]},
+				{command: 'L', point: [end[0], y]},
+			],
+			closed: false,
+		})
+	}
+
+	return {curves}
+}
+
+/**
+ * Creates a path consisting of a single C command.
+ * @param start The start point
+ * @param control1  The first control point
+ * @param control2  The second control point
+ * @param point The end point
+ * @returns The newly created path
+ * @category Primitives
+ */
+export function cubicBezier(
+	start: vec2,
+	control1: vec2,
+	control2: vec2,
+	point: vec2
+): Path {
+	return {
+		curves: [
+			{
+				vertices: [
+					{point: start, command: 'L'},
+					{point, command: 'C', args: [control1, control2]},
+				],
+				closed: false,
+			},
+		],
+	}
+}
+
+/**
+ * Creates a quadratic Bézier curve path from the given points.
+ * @param start The start point
+ * @param control The control point
+ * @param point The end point
+ * @returns THe newly created path
+ * @category Primitives
+ */
+export function quadraticBezier(start: vec2, control: vec2, point: vec2): Path {
+	const c1 = vec2.lerp(start, control, 2 / 3)
+	const c2 = vec2.lerp(point, control, 2 / 3)
+	return cubicBezier(start, c1, c2, point)
+}
+
+/**
+ * Create a path consisting of cubic Bézier curves approximating the arbitrary higher-order Bézier curve.
+ * @param points The control points of the Bézier curve
+ * @returns The newly created path
+ * @category Primitives
+ */
+export function nBezier(points: vec2[]): Path {
+	if (points.length === 0) {
+		return empty
+	}
+	if (points.length === 1) {
+		return dot(points[0])
+	}
+	if (points.length === 2) {
+		return line(points[0], points[1])
+	}
+	if (points.length === 3) {
+		return quadraticBezier(points[0], points[1], points[2])
+	}
+	if (points.length === 4) {
+		return cubicBezier(points[0], points[1], points[2], points[3])
+	}
+
+	const vertices: vec2[] = []
+
+	const order = points.length - 1
+
+	const coeffs = Array(order + 1)
+		.fill(0)
+		.map((_, i) => combination(order, i))
+
+	for (const t of Iter.resample(0, 1, {count: order * 10})) {
+		let point = vec2.zero
+		for (const [i, p] of points.entries()) {
+			const weight = coeffs[i] * Math.pow(1 - t, order - i) * Math.pow(t, i)
+			point = vec2.scaleAndAdd(point, p, weight)
+		}
+		vertices.push(point)
+	}
+
+	return polyline(...vertices)
+
+	function combination(n: number, k: number) {
+		let result = 1
+		for (let i = 1; i <= k; i++) {
+			result *= (n - i + 1) / i
+		}
+		return result
+	}
+}
+export function formula(
+	f: (t: number) => vec2,
+	iter: Iterable<number>,
+	{delta = 1e-6}: FormulaOptions = {}
+): Path {
+	const ts = Array.isArray(iter) ? iter : [...iter]
+
+	const points = ts.map(f)
+
+	const vertices: Vertex[] = [{point: points[0], command: 'L'}]
+
+	for (const [i, [prevT, t]] of Iter.enumerate(Iter.pairwise(ts))) {
+		const prevPoint = points[i]
+		const point = points[i + 1]
+		const handleMultiplier = (t - prevT) / delta / 3
+
+		const control1 = vec2.scaleAndAdd(
+			prevPoint,
+			vec2.sub(f(prevT + delta), prevPoint),
+			handleMultiplier
+		)
+
+		const control2 = vec2.scaleAndAdd(
+			point,
+			vec2.sub(f(t - delta), point),
+			handleMultiplier
+		)
+
+		vertices.push({point, command: 'C', args: [control1, control2]})
+	}
+
+	return {curves: [{vertices, closed: false}]}
+}

@@ -1,0 +1,34 @@
+{
+	"$schema": "https://typedoc.org/schema.json",
+	"entryPoints": ["./src/index.ts"],
+	"out": "./docs/api",
+	"plugin": ["typedoc-plugin-markdown"],
+	"readme": "none",
+	"sort": ["alphabetical"],
+	"cleanOutputDir": true,
+	"includeVersion": true,
+	"categoryOrder": [
+		"Primitives",
+		"Properties",
+		"Modifiers",
+		"Boolean Operations",
+		"Converters",
+		"Draw Functions",
+		"Utilities",
+		"*"
+	],
+
+	"outputFileStrategy": "modules",
+
+	"parametersFormat": "table",
+	"interfacePropertiesFormat": "table",
+	"classPropertiesFormat": "table",
+	"enumMembersFormat": "table",
+	"propertyMembersFormat": "table",
+	"typeDeclarationFormat": "table",
+	"typeDeclarationVisibility": "compact",
+
+	"tableColumnSettings": {
+		"hideSources": true
+	}
+}

@@ -1,0 +1,33 @@
+{
+	"compilerOptions": {
+		"target": "ESNext",
+		"module": "ESNext",
+		"lib": ["ESNext", "DOM", "DOM.Iterable"],
+		"skipLibCheck": true,
+		"experimentalDecorators": true,
+		"baseUrl": ".",
+		"outDir": "./lib",
+		"declaration": true,
+		"declarationMap": true,
+		"skipDefaultLibCheck": true,
+		"allowJs": true,
+
+		/* Bundler mode */
+		"moduleResolution": "bundler",
+		"esModuleInterop": true,
+		"allowSyntheticDefaultImports": true,
+		"resolveJsonModule": true,
+		"isolatedModules": true,
+
+		/* Linting */
+		"strict": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"noFallthroughCasesInSwitch": true
+	},
+	"tsc-alias": {
+		"resolveFullPaths": true
+	},
+	"include": ["src"],
+	"exclude": ["node_modules"]
+}

@@ -1,0 +1,11 @@
+{
+	"extends": "../tsconfig.json",
+	"compilerOptions": {
+		"esModuleInterop": true,
+		"baseUrl": "./",
+		"paths": {
+			"pave": ["../src/index.ts"]
+		}
+	},
+	"include": ["./**/*.vue", "./**/*.ts"]
+}
