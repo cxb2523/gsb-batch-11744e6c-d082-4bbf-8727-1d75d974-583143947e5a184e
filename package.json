@@ -11,7 +11,7 @@
     "bridge": "node bridge/cli.ts",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "test": "node --test tests/v2_0_telemetry_codegen.test.ts tests/v2_1_dsp_fft.test.ts tests/v2_1_1_bugfixes.test.ts tests/workspace_persistence.test.ts tests/v2_3_hardware_timebase_dsp.test.ts tests/v3_0_bridge_mcp.test.ts tests/v3_1_canvas_gpu.test.ts tests/v3_2_ui_logic.test.ts",
+    "test": "node --test tests/v2_0_telemetry_codegen.test.ts tests/v2_1_dsp_fft.test.ts tests/v2_1_1_bugfixes.test.ts tests/workspace_persistence.test.ts tests/v2_3_hardware_timebase_dsp.test.ts tests/v3_0_bridge_mcp.test.ts tests/v3_1_canvas_gpu.test.ts tests/v3_2_ui_logic.test.ts tests/stream_audit.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {
