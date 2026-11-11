@@ -1,0 +1,15 @@
+{
+  "name": "voice-orb",
+  "description": "Voice orb by UV: a Claude skill that adds the audio-reactive voice orb to your React app and connects it to your audio.",
+  "owner": {
+    "name": "UV",
+    "url": "https://github.com/imuvrays1"
+  },
+  "plugins": [
+    {
+      "name": "voice-orb-by-uv",
+      "source": "./plugin",
+      "description": "Voice orb by UV: add an audio-reactive WebGL2 voice orb to a React or Next.js app and connect it to an <audio> element, the microphone or a voice SDK. MIT."
+    }
+  ]
+}

@@ -1,0 +1,77 @@
+/*!
+ * Voice orb by UV · https://github.com/imuvrays1/voice-orb
+ * Copyright (c) 2026 UV · MIT License (see LICENSE). Keep this notice in copies.
+ */
+
+/*
+ * The type scale. Components compose a style rather than restating size,
+ * weight, line height and tracking:
+ *
+ *   .title {
+ *     composes: appHeadline from "../components/typography.module.css";
+ *   }
+ *
+ * Colour is left to the caller, since the same style sits on light and dark
+ * grounds.
+ */
+
+/* Headings are set light and large in the display face: size carries the
+   hierarchy, not weight. */
+
+/* A page title. */
+.appHeadline {
+  font-family: var(--font-display), var(--font-sans), sans-serif;
+  font-size: clamp(36px, 5vw, 52px);
+  font-weight: 300;
+  line-height: 1.06;
+  letter-spacing: -0.025em;
+  text-wrap: balance;
+}
+
+/* Section titles. */
+.cardTitle {
+  font-family: var(--font-display), var(--font-sans), sans-serif;
+  font-size: clamp(26px, 3vw, 32px);
+  font-weight: 300;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  text-wrap: balance;
+}
+
+/* Titles inside cards: the reading face, a step heavier. */
+.cardTitleSm {
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 1.4;
+  letter-spacing: -0.01em;
+}
+
+/* Lead copy under a title. */
+.bodyLg {
+  font-size: 17px;
+  font-weight: 400;
+  line-height: 1.5;
+  text-wrap: pretty;
+}
+
+.bodySm {
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 1.5;
+  text-wrap: pretty;
+}
+
+/* Control labels and metadata. */
+.label {
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.3;
+}
+
+/* Credits and footnotes. */
+.footnote {
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+  text-wrap: pretty;
+}

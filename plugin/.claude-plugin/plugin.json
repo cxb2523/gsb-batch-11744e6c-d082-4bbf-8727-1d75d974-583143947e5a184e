@@ -1,0 +1,12 @@
+{
+  "name": "voice-orb-by-uv",
+  "version": "0.1.0",
+  "description": "Voice orb by UV: add an audio-reactive WebGL2 voice orb to a React or Next.js app and connect it to an <audio> element, the microphone or a voice SDK. MIT.",
+  "author": {
+    "name": "UV",
+    "url": "https://github.com/imuvrays1"
+  },
+  "homepage": "https://github.com/imuvrays1/voice-orb",
+  "repository": "https://github.com/imuvrays1/voice-orb",
+  "license": "MIT"
+}

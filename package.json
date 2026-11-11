@@ -1,0 +1,32 @@
+{
+  "name": "voice-orb",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Voice orb by UV: an audio-reactive WebGL2 orb for voice interfaces.",
+  "author": "UV (https://github.com/imuvrays1)",
+  "homepage": "https://imuvrays1.github.io/voice-orb/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/imuvrays1/voice-orb.git"
+  },
+  "bugs": "https://github.com/imuvrays1/voice-orb/issues",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "2.1.10",
+    "next": "16.1.1",
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "25.0.10",
+    "@types/react": "19.2.9",
+    "@types/react-dom": "19.2.3",
+    "typescript": "5.9.3"
+  },
+  "license": "MIT"
+}

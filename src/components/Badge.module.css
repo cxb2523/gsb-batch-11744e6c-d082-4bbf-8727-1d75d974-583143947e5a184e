@@ -1,0 +1,27 @@
+/*!
+ * Voice orb by UV · https://github.com/imuvrays1/voice-orb
+ * Copyright (c) 2026 UV · MIT License (see LICENSE). Keep this notice in copies.
+ */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--text-body);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--live);
+}

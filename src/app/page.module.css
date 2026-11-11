@@ -1,0 +1,1719 @@
+/*!
+ * Voice orb by UV · https://github.com/imuvrays1/voice-orb
+ * Copyright (c) 2026 UV · MIT License (see LICENSE). Keep this notice in copies.
+ */
+
+/*
+ * /, the voice orb's page.
+ *
+ * Every block sits in one framed column
+ * with faint vertical lines, sections are divided by full-width hairlines
+ * with small cross marks where the lines meet, and white cards with a
+ * half-pixel ring are kept for what deserves emphasis (the stage, the
+ * controls, the chosen card). Everything else is warm grey tone. Text reads
+ * left aligned. The Ground control swaps the whole page to near-black,
+ * since an orb has to hold up on both.
+ *
+ * Colours are globals.css tokens; the --lab-* names only say which token
+ * each ground uses.
+ */
+
+.page {
+  --lab-ground: var(--paper);
+  --lab-panel: var(--surface);
+  --lab-panel-alt: var(--surface-sunken);
+  --lab-line: var(--hairline);
+  --lab-strong: var(--text-strong);
+  --lab-body: var(--text-body);
+  --lab-muted: var(--text-muted);
+  --lab-chip: var(--surface);
+  --lab-card: var(--surface-sunken);
+  --lab-raised: var(--surface);
+  --lab-raised-shadow: var(--shadow-card);
+  --lab-track: var(--tint);
+  --lab-knob: var(--surface);
+  --lab-line-strong: var(--hairline-strong);
+  --lab-frame: var(--frame-line);
+  --lab-mark: var(--frame-mark);
+
+  min-height: 100vh;
+  background: var(--lab-ground);
+  color: var(--lab-body);
+  transition: background-color var(--motion-panel) var(--motion-ease);
+}
+
+/* The dark ground: cards a step lighter, raised cards a step lighter again. */
+.dark {
+  --lab-ground: #0d0d0f;
+  --lab-panel: #151517;
+  --lab-panel-alt: #1c1c1f;
+  --lab-line: rgba(255, 255, 255, 0.1);
+  --lab-strong: var(--text-inverse-strong);
+  --lab-body: var(--text-inverse-body);
+  --lab-muted: var(--text-inverse-muted);
+  --lab-chip: rgba(255, 255, 255, 0.14);
+  --lab-card: #161618;
+  --lab-raised: #1d1d20;
+  --lab-raised-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.12), 0 2px 8px rgba(0, 0, 0, 0.4);
+  --lab-track: rgba(255, 255, 255, 0.07);
+  --lab-knob: rgba(255, 255, 255, 0.16);
+  --lab-line-strong: rgba(255, 255, 255, 0.2);
+  --lab-frame: rgba(255, 255, 255, 0.07);
+  --lab-mark: rgba(255, 255, 255, 0.3);
+}
+
+/* ---------- the frame ---------- */
+
+/* Every block is a slice of one column: same width, same side lines, so
+   stacked they draw two continuous vertical rules down the page. */
+.head,
+.panel {
+  position: relative;
+  width: min(100% - 2 * var(--container-padding), var(--frame-max));
+  margin-inline: auto;
+  padding-inline: var(--frame-inset);
+  border-inline: 1px solid var(--lab-frame);
+}
+
+/* A section: a hairline across the whole viewport at its top, with a small
+   cross where it meets each side rule. */
+.panel {
+  padding-block: var(--space-20);
+  /* Jumps to a section clear the sticky nav. */
+  scroll-margin-top: 56px;
+}
+
+/* A short band for one card, like the Openfile banner. Two classes, so it
+   holds over the phone sizes of .panel further down. */
+.panel.panelSlim {
+  padding-block: var(--space-10);
+}
+
+.panel::before {
+  content: "";
+  position: absolute;
+  top: -1px;
+  left: -100vw;
+  right: -100vw;
+  height: 1px;
+  background: var(--lab-frame);
+  pointer-events: none;
+}
+
+.panel::after {
+  content: "";
+  position: absolute;
+  top: -5px;
+  left: -5px;
+  right: -5px;
+  height: 9px;
+  background:
+    linear-gradient(var(--lab-mark), var(--lab-mark)) left 4px top 0 / 1px 9px no-repeat,
+    linear-gradient(var(--lab-mark), var(--lab-mark)) left 0 top 4px / 9px 1px no-repeat,
+    linear-gradient(var(--lab-mark), var(--lab-mark)) right 4px top 0 / 1px 9px no-repeat,
+    linear-gradient(var(--lab-mark), var(--lab-mark)) right 0 top 4px / 9px 1px no-repeat;
+  pointer-events: none;
+}
+
+/* ---------- the header ---------- */
+
+.head {
+  padding-block: var(--space-20) var(--space-16);
+}
+
+.title {
+  composes: appHeadline from "../components/typography.module.css";
+  max-width: 720px;
+  margin-top: var(--space-6);
+  color: var(--lab-strong);
+}
+
+.intro {
+  composes: bodyLg from "../components/typography.module.css";
+  max-width: 560px;
+  margin-top: var(--space-4);
+  color: var(--lab-body);
+}
+
+.headActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-top: var(--space-8);
+}
+
+/* Who made it, small under the header's actions. */
+.byline {
+  margin-top: var(--space-5);
+  color: var(--lab-muted);
+  font-size: 13px;
+}
+
+.byline a {
+  color: var(--lab-strong);
+  text-underline-offset: 3px;
+}
+
+.byline a:active {
+  opacity: 0.6;
+}
+
+.notice {
+  composes: bodySm from "../components/typography.module.css";
+  display: inline-block;
+  margin-top: var(--space-4);
+  padding: 6px 12px;
+  border-radius: var(--radius-full);
+  background: var(--lab-card);
+  color: var(--lab-body);
+}
+
+/* ---------- section heads ---------- */
+
+/* Title on the left, the intro and any actions on the right, both resting
+   on one baseline. */
+.boardHead {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-4) var(--space-12);
+  margin-bottom: var(--space-10);
+}
+
+.boardLead {
+  min-width: 0;
+}
+
+.boardAside {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-4);
+  max-width: 420px;
+}
+
+/* A section's number and name, set small in the mono face above its title. */
+.kicker {
+  display: flex;
+  gap: 10px;
+  margin-bottom: var(--space-3);
+  color: var(--lab-muted);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.kickerNumber {
+  color: var(--lab-strong);
+}
+
+.boardTitle {
+  composes: cardTitle from "../components/typography.module.css";
+  color: var(--lab-strong);
+}
+
+.boardIntro {
+  composes: bodySm from "../components/typography.module.css";
+  max-width: 560px;
+  margin-top: var(--space-3);
+  font-size: 15px;
+  color: var(--lab-muted);
+}
+
+.boardAside .boardIntro {
+  margin-top: 0;
+}
+
+.boardActions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+/* ---------- the stage ---------- */
+
+/* The one white card that holds the orb, its caption and every control. */
+.stage {
+  overflow: hidden;
+  border-radius: var(--radius-2xl);
+  background: var(--lab-raised);
+  box-shadow: var(--lab-raised-shadow);
+  transition: background-color var(--motion-panel) var(--motion-ease);
+}
+
+.stageShow {
+  padding: var(--space-16) var(--space-8) var(--space-8);
+  background: radial-gradient(120% 90% at 50% 0%, var(--lab-raised) 40%, var(--lab-card) 100%);
+}
+
+.carousel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: clamp(16px, 5vw, 72px);
+}
+
+.side {
+  padding: 0;
+  border: 0;
+  background: none;
+  border-radius: 50%;
+  cursor: pointer;
+  opacity: 0.55;
+  transition:
+    opacity var(--motion-base) var(--motion-ease),
+    transform var(--motion-press) var(--ease-out);
+}
+
+.side:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 4px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .side:hover {
+    opacity: 0.9;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .side:active {
+    transform: scale(0.97);
+  }
+}
+
+.centre {
+  position: relative;
+  display: grid;
+  place-items: center;
+}
+
+/* Play's first beat: the whole orb eases in a little. The engine then
+   speeds the drift and fades the voice's pulse in (VoiceOrb.tsx). */
+.zoom {
+  cursor: pointer;
+  transition: transform 0.6s var(--ease-out);
+}
+
+.zoomed {
+  transform: scale(1.06);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .zoom {
+    transition: none;
+  }
+
+  .zoomed {
+    transform: none;
+  }
+}
+
+/* The play button over the orb: a white disc with the glyph. */
+.play {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.94);
+  color: var(--ink);
+  box-shadow: var(--shadow-lg);
+  cursor: pointer;
+  transition: transform var(--motion-press) var(--ease-out);
+}
+
+.play:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 3px;
+}
+
+@media (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
+  .play:hover {
+    transform: scale(1.05);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .play:active {
+    transform: scale(0.97);
+  }
+}
+
+/* While playing, the button steps back so the orb is what you watch; it
+   comes forward again on hover or focus. */
+.playActive {
+  opacity: 0;
+  transition:
+    opacity var(--motion-base) var(--motion-ease),
+    transform var(--motion-press) var(--ease-out);
+}
+
+.playActive:focus-visible {
+  opacity: 1;
+}
+
+/* Only a real hover: on a phone a tap leaves :hover stuck, which would pin
+   the button over the orb while it plays. */
+@media (hover: hover) and (pointer: fine) {
+  .centre:hover .playActive {
+    opacity: 1;
+  }
+}
+
+.caption {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-6);
+  margin-top: var(--space-6);
+}
+
+.captionText {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  max-width: 380px;
+  text-align: center;
+}
+
+.captionName {
+  composes: cardTitleSm from "../components/typography.module.css";
+  color: var(--lab-strong);
+}
+
+.captionScenario {
+  composes: bodySm from "../components/typography.module.css";
+  color: var(--lab-body);
+}
+
+.captionSource {
+  composes: footnote from "../components/typography.module.css";
+  margin-top: 2px;
+  font-style: normal;
+  color: var(--lab-muted);
+}
+
+.arrow {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--lab-knob);
+  box-shadow: var(--lab-raised-shadow);
+  color: var(--lab-strong);
+  cursor: pointer;
+  transition:
+    background-color var(--motion-base) var(--motion-ease),
+    transform var(--motion-press) var(--ease-out);
+}
+
+.arrow:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .arrow:hover {
+    background: var(--lab-card);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .arrow:active {
+    transform: scale(0.97);
+  }
+}
+
+/* The controls: two by two along the card's foot, each group on one line. */
+.controls {
+  display: grid;
+  grid-template-columns: repeat(2, max-content);
+  justify-content: center;
+  align-items: end;
+  gap: var(--space-5) var(--space-12);
+  padding: var(--space-6) var(--space-8);
+  border-top: 1px solid var(--lab-line);
+}
+
+.control {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.controlLabel {
+  composes: label from "../components/typography.module.css";
+  color: var(--lab-muted);
+}
+
+/* A State control with six options takes the controls' whole row. */
+.controlWide {
+  grid-column: 1 / -1;
+}
+
+/* ---------- the voice panel ---------- */
+
+/* Under the orb: where the sound comes from, then what is playing. */
+.voice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-6) var(--space-8);
+  border-top: 1px solid var(--lab-line);
+}
+
+.voiceHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3) var(--space-4);
+}
+
+.voiceBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.voiceNote {
+  composes: bodySm from "../components/typography.module.css";
+  color: var(--lab-muted);
+}
+
+.voiceError {
+  composes: bodySm from "../components/typography.module.css";
+}
+
+.voiceNote a,
+.trackBy a {
+  color: inherit;
+  text-underline-offset: 3px;
+}
+
+.voiceError,
+.voiceErrorInline {
+  color: var(--danger, #c2410c);
+}
+
+/* What is playing: an icon chip, a title and its source, and Play. */
+.track {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-3) var(--space-3) var(--space-3);
+  border-radius: var(--radius-lg);
+  background: var(--lab-card);
+}
+
+.trackIcon {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-md);
+  background: var(--lab-raised);
+  box-shadow: var(--lab-raised-shadow);
+  color: var(--lab-strong);
+}
+
+.trackIcon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.trackText {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.trackTitle {
+  overflow: hidden;
+  color: var(--lab-strong);
+  font-size: 15px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trackBy {
+  composes: bodySm from "../components/typography.module.css";
+  color: var(--lab-muted);
+}
+
+.textButton {
+  width: fit-content;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--lab-strong);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.textButton:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* The drop zone: a dashed well that says what it takes. */
+.drop {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-8) var(--space-6);
+  border: 1px dashed var(--lab-line-strong);
+  border-radius: var(--radius-lg);
+  text-align: center;
+}
+
+.dropTitle {
+  color: var(--lab-strong);
+  font-size: 15px;
+}
+
+.dropTitle span {
+  color: var(--lab-muted);
+}
+
+/* While a file is dragged over the stage, the whole card says so. */
+.stage {
+  position: relative;
+}
+
+.stageDrop {
+  box-shadow: 0 0 0 2px var(--focus), var(--lab-raised-shadow);
+}
+
+.dropOverlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  background: color-mix(in srgb, var(--lab-raised) 82%, transparent);
+  color: var(--lab-strong);
+  font-size: 18px;
+  pointer-events: none;
+}
+
+/* The link: a label, one field with its icon, and Load. */
+.linkForm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.linkLabel {
+  composes: label from "../components/typography.module.css";
+  color: var(--lab-muted);
+}
+
+.linkRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 4px 4px 4px 12px;
+  border-radius: var(--radius-full);
+  background: var(--lab-card);
+  box-shadow: inset 0 0 0 1px var(--lab-line);
+  transition: box-shadow var(--motion-fast) var(--motion-ease);
+}
+
+.linkRow:focus-within {
+  box-shadow: inset 0 0 0 1px var(--lab-line-strong), 0 0 0 3px color-mix(in srgb, var(--focus) 25%, transparent);
+}
+
+.linkIcon {
+  display: grid;
+  color: var(--lab-muted);
+}
+
+.linkIcon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.linkInput {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  border: 0;
+  background: none;
+  color: var(--lab-strong);
+  font: inherit;
+  font-size: 14px;
+  outline: none;
+}
+
+/* Under 16px, iOS zooms into the field on focus and stays zoomed. */
+@media (pointer: coarse) {
+  .linkInput {
+    font-size: 16px;
+  }
+}
+
+.linkInput::placeholder {
+  color: var(--lab-muted);
+  opacity: 0.8;
+}
+
+/* YouTube's player beside what it is and whether the orb hears it. */
+.youtube {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-5);
+}
+
+.youtubeFrame {
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: var(--radius-lg);
+  background: #000;
+}
+
+.youtubeFrame iframe {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.youtubeSide {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+/* Pill tabs: a quiet track, the chosen one a white pill lifted off it. */
+.segmented {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 3px;
+  /* Half a row's height: a pill on one row, a rounded box if it wraps. */
+  border-radius: 19px;
+  background: var(--lab-track);
+}
+
+.segment {
+  min-height: 32px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: transparent;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--lab-muted);
+  cursor: pointer;
+  transition:
+    background-color var(--motion-base) var(--motion-ease),
+    color var(--motion-base) var(--motion-ease);
+}
+
+.segment[aria-pressed="true"] {
+  background: var(--lab-knob);
+  color: var(--lab-strong);
+  box-shadow: var(--shadow-sm);
+}
+
+.segment:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .segment:hover {
+    color: var(--lab-strong);
+  }
+}
+
+/* ---------- tuning ---------- */
+
+/* Grouped sliders in a white card, a sticky preview beside them. */
+.tune {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  align-items: start;
+  gap: var(--space-6);
+}
+
+.sliders {
+  border-radius: var(--radius-xl);
+  background: var(--lab-raised);
+  box-shadow: var(--lab-raised-shadow);
+}
+
+.group {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: var(--space-8);
+  padding: var(--space-8);
+}
+
+.group + .group {
+  border-top: 1px solid var(--lab-line);
+}
+
+.groupName {
+  color: var(--lab-strong);
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.groupBody {
+  margin-top: 4px;
+  color: var(--lab-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.groupSliders {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-6) var(--space-8);
+}
+
+.slider {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.sliderHead {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 14px;
+  color: var(--lab-strong);
+}
+
+.sliderHead label {
+  cursor: pointer;
+}
+
+.sliderHead output {
+  margin-left: auto;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--lab-card);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--lab-body);
+}
+
+/* A hairline track and a solid dot, drawn the same in every browser. */
+.slider input {
+  --track: var(--lab-line-strong);
+  --thumb: var(--lab-strong);
+  width: 100%;
+  height: 20px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.slider input::-webkit-slider-runnable-track {
+  height: 2px;
+  border-radius: 1px;
+  background: var(--track);
+}
+
+.slider input::-moz-range-track {
+  height: 2px;
+  border-radius: 1px;
+  background: var(--track);
+}
+
+.slider input::-webkit-slider-thumb {
+  width: 14px;
+  height: 14px;
+  margin-top: -6px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--thumb);
+  -webkit-appearance: none;
+  appearance: none;
+  transition: transform var(--motion-press) var(--ease-out);
+}
+
+.slider input::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--thumb);
+}
+
+.slider input:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .slider input:active::-webkit-slider-thumb {
+    transform: scale(1.15);
+  }
+}
+
+/* A finger needs more to land on than a cursor: a taller hit area and a
+   bigger dot, with the same hairline track. */
+@media (pointer: coarse) {
+  .slider input {
+    height: 32px;
+  }
+
+  .slider input::-webkit-slider-thumb {
+    width: 20px;
+    height: 20px;
+    margin-top: -9px;
+  }
+
+  .slider input::-moz-range-thumb {
+    width: 20px;
+    height: 20px;
+  }
+}
+
+/* The preview: the stage's orb again, so a slider's effect is in view. */
+.preview {
+  position: sticky;
+  top: 80px;
+  border-radius: var(--radius-xl);
+  background: var(--lab-card);
+}
+
+.previewHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-5) var(--space-5) 0;
+}
+
+.previewTitle {
+  color: var(--lab-strong);
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.previewBody {
+  color: var(--lab-muted);
+  font-size: 13px;
+}
+
+.previewOrb {
+  display: grid;
+  place-items: center;
+  padding: var(--space-5) 0;
+}
+
+.levels {
+  margin: 0 var(--space-3) var(--space-3);
+  padding: var(--space-4) var(--space-5) var(--space-5);
+  border-radius: var(--radius-lg);
+  background: var(--lab-raised);
+  box-shadow: var(--lab-raised-shadow);
+}
+
+.levelsHead {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: var(--space-3);
+  color: var(--lab-strong);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* One row per band: name and its tip, the bar, the number. */
+.meters {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.meter {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) 36px;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 28px;
+  font-size: 13px;
+  color: var(--lab-body);
+}
+
+.meterName {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.meterTrack {
+  position: relative;
+  height: 4px;
+  overflow: hidden;
+  border-radius: var(--radius-full);
+  background: var(--lab-track);
+}
+
+.meterFill {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--lab-strong);
+  transform: scaleX(0);
+  transform-origin: left;
+}
+
+.meterCaller {
+  background: var(--live);
+}
+
+.meterValue {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--lab-muted);
+}
+
+/* ---------- boards ---------- */
+
+.grid {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.grid3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.grid4 {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.grid5 {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+/* A card: warm grey tone, text left aligned for reading; an orb at its top
+   sits centred in its own well. */
+.card {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  min-width: 0;
+  padding: var(--space-5);
+  border-radius: var(--radius-xl);
+  background: var(--lab-card);
+  text-align: left;
+  transition:
+    background-color var(--motion-base) var(--motion-ease),
+    box-shadow var(--motion-base) var(--motion-ease);
+}
+
+/* The chosen card is lifted to white, for emphasis. */
+.cardActive {
+  background: var(--lab-raised);
+  box-shadow: var(--lab-raised-shadow);
+}
+
+.cardMedia {
+  display: grid;
+  place-items: center;
+  margin: calc(-1 * var(--space-5)) calc(-1 * var(--space-5)) var(--space-3);
+  padding: var(--space-6) var(--space-5);
+  border-bottom: 1px solid var(--lab-line);
+}
+
+.cardActive .cardMedia {
+  border-bottom-color: var(--lab-line);
+}
+
+.cardPick {
+  padding: 0;
+  border: 0;
+  background: none;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.cardPick:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 4px;
+}
+
+.cardTitle {
+  composes: cardTitleSm from "../components/typography.module.css";
+  color: var(--lab-strong);
+}
+
+.cardTitleRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+/* The chosen card says so in words as well. */
+.chosen {
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  background: var(--lab-track);
+  color: var(--lab-strong);
+  font-size: 12px;
+}
+
+.cardWhen {
+  composes: bodySm from "../components/typography.module.css";
+  color: var(--lab-body);
+}
+
+.cardBody {
+  composes: bodySm from "../components/typography.module.css";
+  color: var(--lab-muted);
+}
+
+/* Label and value rows: when a state happens, what drives it. */
+.facts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+}
+
+.facts dt {
+  margin-bottom: 2px;
+  color: var(--lab-muted);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.facts dd {
+  color: var(--lab-body);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* Engine notes: an icon chip, a title, a short body. */
+.note {
+  gap: var(--space-2);
+  padding: var(--space-6);
+}
+
+.noteIcon {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  margin-bottom: var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--lab-raised);
+  box-shadow: var(--lab-raised-shadow);
+  color: var(--lab-strong);
+}
+
+.noteIcon svg {
+  width: 18px;
+  height: 18px;
+}
+
+/* The last note is a way onward, raised like a chosen card. */
+.noteLink {
+  justify-content: space-between;
+  color: inherit;
+  text-decoration: none;
+}
+
+.noteLink:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.noteMore {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: var(--space-4);
+  color: var(--lab-strong);
+  font-size: 14px;
+}
+
+@media (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
+  .noteMore svg {
+    transition: transform var(--motion-base) var(--ease-out);
+  }
+
+  .noteLink:hover .noteMore svg {
+    transform: translateX(3px);
+  }
+}
+
+/* A palette's four stops as two rows of chips. */
+.swatches {
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 8px;
+  margin: var(--space-2) 0 var(--space-1);
+}
+
+.swatches li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--lab-body);
+}
+
+.swatches code {
+  overflow: hidden;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+}
+
+.hex {
+  margin-left: auto;
+  color: var(--lab-muted);
+}
+
+.swatch {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.15);
+}
+
+/* An orb placed straight in a card sits centred above the left-aligned
+   text. A VoiceOrb's root is the element with data-state. */
+.card > [data-state] {
+  align-self: center;
+  margin-block: var(--space-2) var(--space-3);
+}
+
+/* ---------- inside the orb ---------- */
+
+.steps {
+  list-style: none;
+}
+
+/* A step's number, small in the corner of its tile. */
+.stepNumber {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--lab-raised);
+  box-shadow: var(--lab-raised-shadow);
+  color: var(--lab-strong);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.steps .cardMedia {
+  position: relative;
+}
+
+.steps .stepNumber {
+  position: absolute;
+  top: var(--space-4);
+  left: var(--space-4);
+}
+
+/* The path from sound to colour: numbered nodes joined by one line, across
+   on a wide screen and down on a phone. Each step draws its node and the
+   line from it to the next node, so the line never breaks between steps. */
+.pipeline {
+  margin-top: var(--space-12);
+}
+
+.pipelineSteps {
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  margin-top: var(--space-6);
+  counter-reset: step;
+}
+
+.pipelineStep {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-right: var(--space-5);
+  counter-increment: step;
+}
+
+/* The node: the step's number in a small raised disc. */
+.pipelineStep::before {
+  content: counter(step);
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  margin-bottom: var(--space-3);
+  border-radius: 50%;
+  background: var(--lab-raised);
+  box-shadow: var(--lab-raised-shadow);
+  color: var(--lab-strong);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The line on to the next node, with a little air at each end. */
+.pipelineStep:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  top: 12px;
+  left: 32px;
+  right: 8px;
+  height: 1px;
+  background: var(--lab-line-strong);
+}
+
+.pipelineStep b {
+  color: var(--lab-strong);
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.pipelineStep span {
+  color: var(--lab-muted);
+  font-size: 14px;
+  line-height: 1.5;
+  text-wrap: pretty;
+}
+
+/* ---------- use it ---------- */
+
+/* The three ways, one row each: what it is on the left, the code beside it. */
+.ways {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.way {
+  display: grid;
+  grid-template-columns: minmax(0, 300px) minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-8);
+  padding: var(--space-5) var(--space-5) var(--space-5) var(--space-6);
+}
+
+.wayHead {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-2);
+}
+
+/* Code: a white well with a copy button in its corner. */
+.code {
+  position: relative;
+  min-width: 0;
+}
+
+.code pre {
+  overflow-x: auto;
+  padding: var(--space-4) 44px var(--space-4) var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--lab-raised);
+  box-shadow: var(--lab-raised-shadow);
+  color: var(--lab-strong);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.codeCopy {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: grid;
+  place-items: center;
+  z-index: 1;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--lab-muted);
+  cursor: pointer;
+  transition:
+    color var(--motion-fast) var(--motion-ease),
+    background-color var(--motion-fast) var(--motion-ease),
+    transform var(--motion-press) var(--ease-out);
+}
+
+.codeCopy svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* The well's colour over its top-right corner, under the copy button, with
+   a short fade on its left: a long first line scrolls away beneath the
+   button instead of showing through it and out past it. */
+.code::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 52px;
+  height: 44px;
+  border-top-right-radius: var(--radius-md);
+  background: linear-gradient(to right, transparent, var(--lab-raised) 16px);
+  pointer-events: none;
+}
+
+/* A finger-sized target around the small icon. */
+.codeCopy::after {
+  content: "";
+  position: absolute;
+  inset: -8px;
+}
+
+.codeCopy:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .codeCopy:hover {
+    background: var(--lab-track);
+    color: var(--lab-strong);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .codeCopy:active {
+    transform: scale(0.94);
+  }
+}
+
+/* Props and files side by side under the three ways. */
+.reference {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-12);
+  margin-top: var(--space-12);
+}
+
+.props,
+.files {
+  margin-top: var(--space-4);
+  border-top: 1px solid var(--lab-line);
+}
+
+.props > div,
+.files li {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: var(--space-4);
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--lab-line);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.props dt {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.props dt code,
+.files code {
+  color: var(--lab-strong);
+  font-size: 13px;
+}
+
+.props dt span {
+  color: var(--lab-muted);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 11.5px;
+}
+
+.props dd,
+.files li > span {
+  color: var(--lab-body);
+}
+
+.files {
+  list-style: none;
+}
+
+.files li {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 2px;
+}
+
+.files a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  color: var(--lab-strong);
+  text-decoration: none;
+}
+
+.files a svg {
+  width: 12px;
+  height: 12px;
+  color: var(--lab-muted);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .files a:hover code {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+}
+
+/* ---------- responsive ---------- */
+
+@media (max-width: 1100px) {
+  .tune {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .preview {
+    position: static;
+    display: grid;
+    grid-template-columns: 220px minmax(0, 1fr);
+    align-items: center;
+  }
+
+  .previewHead {
+    grid-column: 1 / -1;
+  }
+
+  .levels {
+    margin: var(--space-3);
+  }
+
+}
+
+@media (max-width: 1024px) {
+  .grid4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .grid5 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 768px) {
+  .panel {
+    padding-block: var(--space-16);
+  }
+
+  .head {
+    padding-block: var(--space-12);
+  }
+
+  .stageShow {
+    padding: var(--space-10) var(--space-4) var(--space-6);
+  }
+
+  .controls,
+  .voice {
+    padding-inline: var(--space-5);
+  }
+
+  .youtube,
+  .reference,
+  .way {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .way {
+    gap: var(--space-4);
+  }
+
+  /* Down the page: the node in its own column, the words beside it. */
+  .pipelineSteps {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pipelineStep {
+    display: grid;
+    grid-template-columns: 24px minmax(0, 1fr);
+    align-content: start;
+    column-gap: var(--space-4);
+    row-gap: 2px;
+    padding: 0 0 var(--space-6);
+  }
+
+  .pipelineStep::before {
+    grid-row: 1 / span 2;
+    margin: 0;
+  }
+
+  .pipelineStep b {
+    line-height: 24px;
+  }
+
+  .pipelineStep:not(:last-child)::after {
+    top: 30px;
+    bottom: 6px;
+    left: 12px;
+    right: auto;
+    width: 1px;
+    height: auto;
+  }
+
+  .group {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-5);
+    padding: var(--space-6) var(--space-5);
+  }
+
+  .grid3,
+  .grid5 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .boardHead {
+    margin-bottom: var(--space-8);
+  }
+}
+
+@media (max-width: 640px) {
+  /* The header's two actions, one under the other at full width: equal,
+     easy to hit, and nothing left hanging at the end of a short row. */
+  .headActions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .headActions > a {
+    --b-h: 48px;
+    --b-fs: 16px;
+    width: 100%;
+  }
+
+  /* A section's actions share the full width in equal parts. */
+  .boardAside {
+    width: 100%;
+  }
+
+  .boardActions {
+    align-self: stretch;
+    display: grid;
+    grid-auto-columns: minmax(0, 1fr);
+    grid-auto-flow: column;
+  }
+
+  .boardActions > a,
+  .boardActions > button {
+    --b-h: 40px;
+    --b-fs: 14px;
+    width: 100%;
+  }
+
+  /* Choices in equal cells, two across, instead of a row that wraps
+     wherever its words run out; each set at the full width, its label
+     above it. */
+  .control {
+    align-items: stretch;
+  }
+
+  .voiceHead {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .segmented {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    border-radius: 21px;
+  }
+
+  .segment {
+    min-height: 36px;
+    padding-inline: 8px;
+  }
+
+  /* Less inset around the ways, so their code gets the width. */
+  .way {
+    padding: var(--space-5) var(--space-4);
+  }
+
+  .side {
+    display: none;
+  }
+
+  .controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .track {
+    flex-wrap: wrap;
+  }
+
+  .trackTitle {
+    white-space: normal;
+  }
+
+  .props > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+
+  .groupSliders {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .preview {
+    display: block;
+  }
+}
+
+@media (max-width: 480px) {
+  .grid3,
+  .grid4,
+  .grid5 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

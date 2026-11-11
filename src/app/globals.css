@@ -1,0 +1,182 @@
+/*!
+ * Voice orb by UV · https://github.com/imuvrays1/voice-orb
+ * Copyright (c) 2026 UV · MIT License (see LICENSE). Keep this notice in copies.
+ */
+
+/*
+ * The voice orb page's tokens and base styles.
+ *
+ * The orbs are the colour on every page, so the interface around them stays
+ * neutral: a warm white ground, black ink, warm greys, hairlines, and one
+ * blue kept for keyboard focus. The page a breath off white, cards a warm grey with no border, buttons black pills.
+ * Type is Inter for reading and controls, Inter Tight light for headings and
+ * Geist Mono for numbers, loaded by next/font in layout.tsx as --font-sans,
+ * --font-display and --font-mono.
+ */
+
+:root {
+  color-scheme: light;
+
+  /* Grounds, from the page inward. */
+  --paper: #fdfcfc;
+  --surface: #ffffff;
+  --surface-sunken: #f5f3f1;
+  --hairline: #ebe8e4;
+  --hairline-strong: #dcd8d3;
+
+  /* Ink, strongest to quietest: black, then warm greys. */
+  --ink: #000000;
+  --text-strong: var(--ink);
+  --text-body: #2e2b28;
+  --text-muted: #6b665f;
+
+  /* The same roles on the dark ground. */
+  --ink-inverse: #f7f7f5;
+  --text-inverse-strong: var(--ink-inverse);
+  --text-inverse-body: rgba(247, 247, 245, 0.72);
+  --text-inverse-muted: rgba(247, 247, 245, 0.5);
+
+  /* Signals. Focus is the only hue the interface uses on its own. */
+  --focus: #2f6bff;
+  --live: #1fae78;
+  --tint: rgba(0, 0, 0, 0.05);
+
+  /* Lines: the page frame and section dividers, barely there. */
+  --frame-line: rgba(0, 0, 0, 0.06);
+  --frame-mark: rgba(0, 0, 0, 0.22);
+
+  /* Depth: barely there. Surfaces separate by tone; a white card for
+     emphasis is lifted by a half-pixel ring and two soft shadows. */
+  --shadow-card: 0 0 0 0.5px rgba(0, 0, 0, 0.13), 0 1px 1px rgba(0, 0, 0, 0.04), 0 2px 4px rgba(0, 0, 0, 0.04);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06), 0 0 0 1px rgba(0, 0, 0, 0.03);
+  --shadow-lg: 0 12px 32px -12px rgba(0, 0, 0, 0.22), 0 2px 6px rgba(0, 0, 0, 0.06);
+
+  /* Shape. */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-2xl: 24px;
+  --radius-full: 9999px;
+
+  /* Space: one 4px scale. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+  --space-20: 80px;
+
+  --container-max: 1120px;
+  --container-padding: 32px;
+  /* The framed column: its width, and the room inside its lines. */
+  --frame-max: 1180px;
+  --frame-inset: 48px;
+  /* Between sections of a page. */
+  --section-gap: 96px;
+
+  /* Motion: interaction stays under 300ms; --motion-panel is for a whole
+     panel changing ground. */
+  --motion-fast: 0.15s;
+  --motion-base: 0.2s;
+  --motion-slow: 0.25s;
+  --motion-panel: 0.35s;
+  --motion-press: 0.16s;
+  --motion-ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* The page scrolls natively, so nothing above the viewport may become a
+   scroll container: overflow-x: hidden on html or body would make body one,
+   and wheel scrolling would stop there. clip trims the sides without that. */
+html {
+  scroll-behavior: smooth;
+  -webkit-text-size-adjust: 100%;
+  /* No grey flash on tap: every control has its own pressed state. */
+  -webkit-tap-highlight-color: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+body {
+  overflow-x: clip;
+  background: var(--paper);
+  color: var(--text-body);
+  font-family: var(--font-sans), system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  color: var(--text-strong);
+  font-weight: 500;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+
+p {
+  text-wrap: pretty;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+code,
+kbd,
+pre {
+  font-family: var(--font-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+a {
+  color: inherit;
+  transition: color var(--motion-base) var(--motion-ease);
+}
+
+/* Taps fire at once: nothing here double-taps to zoom. */
+a,
+button,
+input[type="range"] {
+  touch-action: manipulation;
+}
+
+img,
+canvas {
+  display: block;
+  max-width: 100%;
+}
+
+@media (max-width: 640px) {
+  :root {
+    --container-padding: 16px;
+    --section-gap: 64px;
+    --frame-inset: 20px;
+  }
+}

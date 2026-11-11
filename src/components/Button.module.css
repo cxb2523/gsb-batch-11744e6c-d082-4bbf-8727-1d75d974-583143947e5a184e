@@ -1,0 +1,183 @@
+/*!
+ * Voice orb by UV · https://github.com/imuvrays1/voice-orb
+ * Copyright (c) 2026 UV · MIT License (see LICENSE). Keep this notice in copies.
+ */
+
+/*
+ * The lab's button. Variants and surfaces only set the custom properties;
+ * the anatomy and states are written once.
+ *
+ *   --b-bg, --b-bg-hover   fill at rest and on hover
+ *   --b-fg                 label colour
+ *   --b-border             1px edge (transparent when there is none)
+ */
+
+.button {
+  --b-bg: transparent;
+  --b-bg-hover: transparent;
+  --b-fg: inherit;
+  --b-border: transparent;
+  --b-h: 40px;
+  --b-px: 16px;
+  --b-fs: 15px;
+
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: var(--b-h);
+  padding: 0 var(--b-px);
+  border: 1px solid var(--b-border);
+  border-radius: var(--radius-full);
+  background: var(--b-bg);
+  color: var(--b-fg);
+  font-size: var(--b-fs);
+  font-weight: 400;
+  line-height: 1;
+  white-space: nowrap;
+  text-decoration: none;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition:
+    background-color var(--motion-base) var(--motion-ease),
+    border-color var(--motion-base) var(--motion-ease),
+    color var(--motion-base) var(--motion-ease),
+    transform var(--motion-press) var(--ease-out);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .button:hover {
+    background-color: var(--b-bg-hover);
+  }
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* ---------- sizes ---------- */
+
+.sm {
+  --b-h: 32px;
+  --b-px: 12px;
+  --b-fs: 13px;
+}
+
+.md {
+  --b-h: 40px;
+  --b-px: 16px;
+  --b-fs: 15px;
+}
+
+.lg {
+  --b-h: 48px;
+  --b-px: 22px;
+  --b-fs: 16px;
+}
+
+.full {
+  width: 100%;
+}
+
+/* ---------- variants × surfaces ---------- */
+
+.primary.light {
+  --b-bg: var(--ink);
+  --b-bg-hover: #2b2a28;
+  --b-fg: var(--ink-inverse);
+}
+
+.primary.dark {
+  --b-bg: var(--ink-inverse);
+  --b-bg-hover: #e4e4e1;
+  --b-fg: var(--ink);
+}
+
+.secondary.light {
+  --b-bg: var(--surface);
+  --b-bg-hover: var(--surface-sunken);
+  --b-fg: var(--ink);
+  --b-border: var(--hairline);
+  box-shadow: var(--shadow-sm);
+}
+
+.secondary.dark {
+  --b-bg: rgba(255, 255, 255, 0.06);
+  --b-bg-hover: rgba(255, 255, 255, 0.12);
+  --b-fg: var(--ink-inverse);
+  --b-border: rgba(255, 255, 255, 0.18);
+}
+
+.ghost.light {
+  --b-bg-hover: var(--tint);
+  --b-fg: var(--ink);
+}
+
+.ghost.dark {
+  --b-bg-hover: rgba(255, 255, 255, 0.08);
+  --b-fg: var(--ink-inverse);
+}
+
+/* ---------- anatomy ---------- */
+
+.icon,
+.arrow {
+  display: inline-flex;
+  align-items: center;
+}
+
+.icon svg,
+.arrow svg {
+  width: 1.05em;
+  height: 1.05em;
+}
+
+.arrow {
+  margin-right: -2px;
+  transition: transform var(--motion-base) var(--ease-out);
+}
+
+@media (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
+  .button:hover .arrow {
+    transform: translateX(3px);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .button:active:not(:disabled) {
+    transform: scale(0.97);
+  }
+}
+
+/* ---------- states ---------- */
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.loading {
+  cursor: progress;
+}
+
+/* Loading is busy, not unavailable: it keeps nearly full strength. */
+.loading:disabled {
+  opacity: 0.85;
+}
+
+.spinner {
+  width: 1em;
+  height: 1em;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  border-right-color: transparent;
+  animation: buttonSpin 0.8s linear infinite;
+}
+
+@keyframes buttonSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}

@@ -1,0 +1,120 @@
+/*!
+ * Voice orb by UV · https://github.com/imuvrays1/voice-orb
+ * Copyright (c) 2026 UV · MIT License (see LICENSE). Keep this notice in copies.
+ */
+
+/* The info tip: a quiet icon, and a white bubble with the lab's card
+   shadow. Hidden with visibility as well as opacity, so it never catches the
+   pointer while invisible. */
+
+.tip {
+  position: relative;
+  display: inline-flex;
+  vertical-align: middle;
+}
+
+.button {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: var(--text-muted);
+  cursor: help;
+  transition: color var(--motion-fast) var(--motion-ease);
+}
+
+.button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+/* A finger-sized target around the small icon. */
+@media (pointer: coarse) {
+  .button {
+    position: relative;
+  }
+
+  .button::after {
+    content: "";
+    position: absolute;
+    inset: -10px;
+  }
+}
+
+.bubble {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: -10px;
+  z-index: 20;
+  width: max-content;
+  max-width: min(260px, 70vw);
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-card), var(--shadow-lg);
+  color: var(--text-body);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.45;
+  letter-spacing: 0;
+  text-align: left;
+  white-space: normal;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  /* --shift is set when it opens, to keep it inside the screen. */
+  translate: var(--shift, 0px) 0;
+  transform: translateY(4px);
+  transition:
+    opacity var(--motion-fast) var(--motion-ease),
+    transform var(--motion-fast) var(--ease-out),
+    visibility 0s linear var(--motion-fast);
+}
+
+.end .bubble {
+  left: auto;
+  right: -10px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .tip:hover .button {
+    color: var(--text-strong);
+  }
+
+  .tip:hover .bubble {
+    opacity: 1;
+    visibility: visible;
+    transform: none;
+    transition-delay: 0s;
+  }
+}
+
+.button:focus-visible + .bubble,
+.button:focus + .bubble {
+  opacity: 1;
+  visibility: visible;
+  transform: none;
+  transition-delay: 0s;
+}
+
+/* Escape closes it until focus or the pointer leaves. */
+.closed .bubble,
+.closed:hover .bubble {
+  opacity: 0;
+  visibility: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bubble {
+    transform: none;
+  }
+}

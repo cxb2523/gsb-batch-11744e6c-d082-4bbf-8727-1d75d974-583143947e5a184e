@@ -1,0 +1,135 @@
+/*!
+ * Voice orb by UV · https://github.com/imuvrays1/voice-orb
+ * Copyright (c) 2026 UV · MIT License (see LICENSE). Keep this notice in copies.
+ */
+
+/*
+ * Openfile's card: the page's raised surface, the mark on the left, the
+ * words in the middle and the action on the right. It reads the page's
+ * ground tokens (--lab-*), so it turns dark with the page. On a phone the
+ * action drops under the words at full width.
+ */
+.banner {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-5);
+  padding: var(--space-5) var(--space-6);
+  border-radius: var(--radius-xl);
+  background: var(--lab-raised);
+  box-shadow: var(--lab-raised-shadow);
+  color: inherit;
+  text-decoration: none;
+  /* Fades with the page's cards when the ground changes. */
+  transition:
+    transform var(--motion-press) var(--ease-out),
+    background-color var(--motion-panel) var(--motion-ease);
+}
+
+.banner:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.mark {
+  display: block;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  /* A hairline edge, so the black tile still has a shape on the dark ground. */
+  box-shadow: 0 0 0 1px var(--lab-line);
+}
+
+.text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* Set like a section's kicker: small, mono, upper case. */
+.label {
+  margin-bottom: 2px;
+  color: var(--lab-muted);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.title {
+  color: var(--lab-strong);
+  font-size: 17px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+.body {
+  max-width: 520px;
+  color: var(--lab-body);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* Drawn like the page's secondary button; the card around it is the link. */
+.cta {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 40px;
+  padding: 0 16px;
+  border: 1px solid var(--lab-line);
+  border-radius: var(--radius-full);
+  background: var(--lab-knob);
+  box-shadow: var(--shadow-sm);
+  color: var(--lab-strong);
+  font-size: 14px;
+  white-space: nowrap;
+  transition: background-color var(--motion-base) var(--motion-ease);
+}
+
+.cta svg {
+  width: 14px;
+  height: 14px;
+  transition: transform var(--motion-base) var(--ease-out);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .banner:hover .cta {
+    background: var(--lab-card);
+  }
+}
+
+@media (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
+  .banner:hover .cta svg {
+    transform: translate(2px, -2px);
+  }
+}
+
+/* A large surface only needs a small press. */
+@media (prefers-reduced-motion: no-preference) {
+  .banner:active {
+    transform: scale(0.99);
+  }
+}
+
+@media (max-width: 640px) {
+  .banner {
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+    gap: var(--space-4);
+    padding: var(--space-5);
+  }
+
+  .mark {
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+  }
+
+  .cta {
+    grid-column: 1 / -1;
+    height: 44px;
+  }
+}

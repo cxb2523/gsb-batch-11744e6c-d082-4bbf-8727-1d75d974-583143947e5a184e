@@ -1,0 +1,180 @@
+/*!
+ * Voice orb by UV · https://github.com/imuvrays1/voice-orb
+ * Copyright (c) 2026 UV · MIT License (see LICENSE). Keep this notice in copies.
+ */
+
+/* The top bar and the footer. Both read the page's ground tokens
+   (--lab-*), set on the page they sit in, so they turn dark with it. */
+
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  border-bottom: 1px solid var(--lab-frame, var(--frame-line));
+  /* Mostly solid: at 86% the words scrolling under it read through the mark on a phone. */
+  background: color-mix(in srgb, var(--lab-ground, var(--paper)) 92%, transparent);
+  backdrop-filter: saturate(1.4) blur(12px);
+  -webkit-backdrop-filter: saturate(1.4) blur(12px);
+}
+
+.inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  width: min(100% - 2 * var(--container-padding), var(--frame-max));
+  height: 56px;
+  margin-inline: auto;
+  padding-inline: var(--frame-inset);
+  border-inline: 1px solid var(--lab-frame, var(--frame-line));
+}
+
+.mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--lab-strong, var(--text-strong));
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+  /* The name never breaks; the links beside it give way first. */
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* The mark: a small orb, the only colour in the chrome. */
+.dot {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #f6c9ff 0%, #8a7fff 48%, #4a3aff 100%);
+  box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.12);
+}
+
+.end {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.links {
+  display: flex;
+  gap: 4px;
+  list-style: none;
+}
+
+.link {
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: var(--radius-full);
+  color: var(--lab-muted, var(--text-muted));
+  font-size: 14px;
+  text-decoration: none;
+  transition:
+    color var(--motion-base) var(--motion-ease),
+    background-color var(--motion-base) var(--motion-ease);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .link:hover {
+    color: var(--lab-strong, var(--text-strong));
+  }
+}
+
+/* A link that leaves the page: the same quiet text, with a small arrow out. */
+.external {
+  gap: 4px;
+}
+
+.external svg {
+  width: 12px;
+  height: 12px;
+  transition: transform var(--motion-base) var(--ease-out);
+}
+
+@media (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
+  .external:hover svg {
+    transform: translate(1px, -1px);
+  }
+}
+
+/* Pressed: the tap's only feedback now the browser's flash is off. */
+.mark:active,
+.link:active,
+.footerBy a:active,
+.footerLinks a:active {
+  opacity: 0.6;
+}
+
+.mark:focus-visible,
+.link:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-full);
+}
+
+.footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--space-3) var(--space-6);
+  width: min(100% - 2 * var(--container-padding), var(--frame-max));
+  margin-inline: auto;
+  padding: var(--space-8) var(--frame-inset) var(--space-16);
+  border-inline: 1px solid var(--lab-frame, var(--frame-line));
+  border-top: 1px solid var(--lab-frame, var(--frame-line));
+  color: var(--lab-muted, var(--text-muted));
+  font-size: 13px;
+}
+
+.footerBy a {
+  color: var(--lab-strong, var(--text-strong));
+  text-underline-offset: 3px;
+}
+
+.footerLinks {
+  display: flex;
+  gap: var(--space-5);
+}
+
+.footerLinks a {
+  color: var(--lab-strong, var(--text-strong));
+  text-underline-offset: 3px;
+}
+
+/* On a phone the section links give way to the mark, Templates and the stars. */
+@media (max-width: 640px) {
+  .links {
+    display: none;
+  }
+
+  .inner {
+    gap: var(--space-3);
+  }
+
+  .end {
+    gap: 4px;
+  }
+
+  .external {
+    padding-inline: 6px;
+  }
+}
+
+/* Narrow phones: the word alone, the arrow back once there's room for it. */
+@media (max-width: 389px) {
+  .external svg {
+    display: none;
+  }
+}
+
+/* The smallest phones: the mark and the stars only. The banner at the foot
+   of the page still links to Openfile. */
+@media (max-width: 339px) {
+  .external {
+    display: none;
+  }
+}
