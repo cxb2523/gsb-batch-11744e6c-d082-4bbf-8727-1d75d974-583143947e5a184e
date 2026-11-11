@@ -140,6 +140,10 @@ def main(argv=None):
         return _refuse("report file unreadable")
     if not payload.get("report_hash"):
         return _refuse("report_hash absent")
+    if not isinstance(payload.get("report_hash"), str):
+        # A non-string report_hash (int, list, object, ...) can never match a
+        # computed hex digest; refuse rather than misreport it as INTEGRITY.
+        return _refuse("report_hash is not a string")
     missing = [key for key in HASHED_KEYS if key not in payload]
     if missing:
         return _refuse("missing covered keys: " + ",".join(missing))

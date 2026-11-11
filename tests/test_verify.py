@@ -83,3 +83,50 @@ def test_rerun_drift_diverges(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out.splitlines()
     assert rc == 1
     assert out[0] == "DIVERGENCE"
+
+
+def test_missing_report_hash_not_reproducible(tmp_path, monkeypatch, capsys):
+    payload = _minimal_payload()
+    payload["report_hash"] = ""
+    path = _write(tmp_path, payload)
+
+    def fake_rerun(target, extra_args):
+        raise AssertionError("rerun must not run without a report_hash")
+
+    monkeypatch.setattr(verify, "_rerun", fake_rerun)
+    rc = verify.main([str(path)])
+    out = capsys.readouterr().out.splitlines()
+    assert rc == 2
+    assert out[0] == "NOT_REPRODUCIBLE"
+
+
+def test_non_string_report_hash_not_reproducible(tmp_path, monkeypatch, capsys):
+    for bad_hash in (12345, ["abc"], {"hash": "abc"}, 12.5):
+        payload = _minimal_payload()
+        payload["report_hash"] = bad_hash
+        path = _write(tmp_path, payload)
+
+        def fake_rerun(target, extra_args):
+            raise AssertionError("rerun must not run on a non-string report_hash")
+
+        monkeypatch.setattr(verify, "_rerun", fake_rerun)
+        rc = verify.main([str(path)])
+        out = capsys.readouterr().out.splitlines()
+        assert rc == 2, bad_hash
+        assert out[0] == "NOT_REPRODUCIBLE", bad_hash
+
+
+def test_tampered_report_hash_fails_integrity(tmp_path, monkeypatch, capsys):
+    payload = _minimal_payload()
+    payload["report_hash"] = "0" * 64  # valid string, wrong value
+    path = _write(tmp_path, payload)
+
+    def fake_rerun(target, extra_args):
+        raise AssertionError("rerun must not run on a tampered report")
+
+    monkeypatch.setattr(verify, "_rerun", fake_rerun)
+    rc = verify.main([str(path)])
+    out = capsys.readouterr().out.splitlines()
+    assert rc == 1
+    assert out[0] == "INTEGRITY"
+    assert out[1] == "report_hash"

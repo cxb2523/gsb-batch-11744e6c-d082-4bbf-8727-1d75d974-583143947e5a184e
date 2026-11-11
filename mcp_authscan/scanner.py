@@ -72,13 +72,49 @@ class Check:
 _WRITE_VERBS = ("write", "delete", "remove", "create", "update", "exec", "execute",
                 "run", "admin", "drop", "modify", "destroy")
 
+# Input-schema property names that signal a tool can reach files, shells,
+# databases or network targets even when its name carries no write verb.
+_SENSITIVE_INPUT_PARAMS = ("path", "command", "cmd", "script", "query", "sql",
+                           "url", "target")
+
+
+def _sensitive_input_params(tool):
+    """Return (present, required) sensitive-parameter name lists for one tool.
+
+    Reads the tool's inputSchema (falling back to input_schema) and matches its
+    properties against _SENSITIVE_INPUT_PARAMS. Never raises on malformed
+    schemas: a non-dict tool/schema/properties or a non-list required simply
+    yields no hits.
+    """
+    if not isinstance(tool, dict):
+        return [], []
+    schema = tool.get("inputSchema")
+    if not isinstance(schema, dict):
+        schema = tool.get("input_schema")
+    if not isinstance(schema, dict):
+        return [], []
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return [], []
+    required = schema.get("required")
+    required_names = ({r for r in required if isinstance(r, str)}
+                      if isinstance(required, list) else set())
+    present = [p for p in _SENSITIVE_INPUT_PARAMS if p in props]
+    return present, [p for p in present if p in required_names]
+
+
+def _quoted(names):
+    return ", ".join("'%s'" % n for n in names)
+
 
 def grade_zero_auth_response(resp):
     """Grade a zero-auth check by what the response demonstrated (calibration 2026.11.07.1).
 
     Returns (RiskLevel, severity_basis). CRITICAL only when a returned tool's NAME shows a
-    write/delete/execute action; HIGH when tools were returned but none names such an action;
-    MEDIUM otherwise (no tools, or body did not parse). Record-level data is not inspected.
+    write/delete/execute action; HIGH when tools were returned but none names such an action
+    (the severity_basis then also records whether any tool declares a sensitive input
+    parameter, and whether it is required); MEDIUM otherwise (no tools, or body did not
+    parse). Record-level data is not inspected.
     Mirrors monolith.grade_zero_auth; kept scanner-local because this path uses RiskLevel.
     """
     try:
@@ -98,14 +134,41 @@ def grade_zero_auth_response(resp):
                                   "inspected for record-level data")
     for t in tools:
         name = (t.get("name", "") if isinstance(t, dict) else "")
+        if not isinstance(name, str):
+            name = ""
         low = name.lower()
         for verb in _WRITE_VERBS:
             if verb in low:
+                present, required = _sensitive_input_params(t)
+                if required:
+                    param_note = ("; sensitive input parameter(s) %s declared as required"
+                                  % _quoted(required))
+                elif present:
+                    param_note = ("; sensitive input parameter(s) %s present but not required"
+                                  % _quoted(present))
+                else:
+                    param_note = "; no sensitive input parameters observed"
                 return RiskLevel.CRITICAL, ("zero-auth endpoint; tool '%s' name matches write/execute "
-                                            "action '%s'; body not inspected for record-level data"
-                                            % (name, verb))
+                                            "action '%s'%s; body not inspected for record-level data"
+                                            % (name, verb, param_note))
+    present_all, required_all = [], []
+    for t in tools:
+        present, required = _sensitive_input_params(t)
+        present_all.extend(p for p in present if p not in present_all)
+        required_all.extend(p for p in required if p not in required_all)
+    if required_all:
+        return RiskLevel.HIGH, ("zero-auth endpoint; %d tool(s) returned, none with a write, delete or "
+                                "execute action in the name, but sensitive input parameter(s) %s "
+                                "declared as required in tool input schema; body not inspected for "
+                                "record-level data" % (len(tools), _quoted(required_all)))
+    if present_all:
+        return RiskLevel.HIGH, ("zero-auth endpoint; %d tool(s) returned, none with a write, delete or "
+                                "execute action in the name, but sensitive input parameter(s) %s "
+                                "present but not required in tool input schema; body not inspected "
+                                "for record-level data" % (len(tools), _quoted(present_all)))
     return RiskLevel.HIGH, ("zero-auth endpoint; %d tool(s) returned, none with a write, delete or "
-                            "execute action in the name" % len(tools))
+                            "execute action in the name; body not inspected for record-level data"
+                            % len(tools))
 
 
 class MCPScanner:
