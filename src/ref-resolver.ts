@@ -1,0 +1,203 @@
+import type { Frame, Page } from 'playwright-core';
+
+import { StaleRefError } from './errors.js';
+import { ensurePageState, getPageState } from './page-utils.js';
+import type { RoleRefs } from './types.js';
+
+// ── Ref cache: keyed by "cdpUrl::targetId" ──
+
+const REFS_STALENESS_THRESHOLD_MS = 30_000;
+
+const roleRefsByTarget = new Map<
+  string,
+  {
+    refs: RoleRefs;
+    frameSelector?: string;
+    mode?: 'role' | 'aria';
+    storedAt: number;
+  }
+>();
+// FIFO eviction (not LRU) — sufficient because refs are short-lived and frequently
+// overwritten per-target. An LRU would add complexity without meaningful benefit here.
+const MAX_ROLE_REFS_CACHE = 50;
+
+export function normalizeCdpUrl(raw: string): string {
+  return raw.replace(/\/$/, '');
+}
+
+function roleRefsKey(cdpUrl: string, targetId: string): string {
+  return `${normalizeCdpUrl(cdpUrl)}::${targetId}`;
+}
+
+// ── Role Refs Storage ──
+
+/**
+ * Remember role refs in the target cache (without storing on page state).
+ * Used to persist refs across page reconnections.
+ */
+export function rememberRoleRefsForTarget(opts: {
+  cdpUrl: string;
+  targetId: string;
+  refs: RoleRefs;
+  frameSelector?: string;
+  mode?: 'role' | 'aria';
+}): void {
+  const targetId = opts.targetId.trim();
+  if (targetId === '') return;
+  roleRefsByTarget.set(roleRefsKey(opts.cdpUrl, targetId), {
+    refs: opts.refs,
+    ...(opts.frameSelector !== undefined && opts.frameSelector !== '' ? { frameSelector: opts.frameSelector } : {}),
+    ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
+    storedAt: Date.now(),
+  });
+  while (roleRefsByTarget.size > MAX_ROLE_REFS_CACHE) {
+    const first = roleRefsByTarget.keys().next();
+    if (first.done === true) break;
+    roleRefsByTarget.delete(first.value);
+  }
+}
+
+export function storeRoleRefsForTarget(opts: {
+  page: Page;
+  cdpUrl: string;
+  targetId?: string;
+  refs: RoleRefs;
+  frameSelector?: string;
+  frame?: Frame;
+  mode: 'role' | 'aria';
+}): void {
+  if (opts.frameSelector !== undefined && opts.frameSelector !== '' && !opts.frame) {
+    throw new Error('Frame-scoped role refs require their resolved frame.');
+  }
+  const state = ensurePageState(opts.page);
+  state.roleRefs = opts.refs;
+  state.roleRefsFrameSelector = opts.frameSelector;
+  state.roleRefsFrame = opts.frame;
+  state.roleRefsMode = opts.mode;
+  state.roleRefsStoredAt = Date.now();
+
+  if (opts.targetId === undefined || opts.targetId.trim() === '') return;
+  if (opts.frame) {
+    roleRefsByTarget.delete(roleRefsKey(opts.cdpUrl, opts.targetId.trim()));
+    return;
+  }
+  rememberRoleRefsForTarget({
+    cdpUrl: opts.cdpUrl,
+    targetId: opts.targetId,
+    refs: opts.refs,
+    frameSelector: opts.frameSelector,
+    mode: opts.mode,
+  });
+}
+
+/**
+ * Clear role refs for all targets associated with a CDP URL.
+ * Called when a browser disconnects.
+ */
+export function clearRoleRefsForCdpUrl(cdpUrl: string): void {
+  const normalized = normalizeCdpUrl(cdpUrl);
+  for (const key of roleRefsByTarget.keys()) {
+    if (key.startsWith(normalized + '::')) roleRefsByTarget.delete(key);
+  }
+}
+
+// ── Ref Parsing ──
+
+/**
+ * Parse a role ref string (e.g. "e1", "@e1", "ref=e1") to a normalized ref ID.
+ * Returns null if the string is not a valid role ref.
+ */
+export function parseRoleRef(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const normalized = trimmed.startsWith('@')
+    ? trimmed.slice(1)
+    : trimmed.startsWith('ref=')
+      ? trimmed.slice(4)
+      : trimmed;
+  return /^e\d+$/.test(normalized) ? normalized : null;
+}
+
+/**
+ * Require a ref string, normalizing and validating it.
+ * Throws if the ref is empty.
+ */
+export function requireRef(value: string | undefined): string {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  const ref = (raw ? parseRoleRef(raw) : null) ?? (raw.startsWith('@') ? raw.slice(1) : raw);
+  if (!ref) throw new Error('ref is required');
+  return ref;
+}
+
+/**
+ * Require either a ref or selector, returning whichever is provided.
+ * Throws if neither is provided.
+ */
+export function requireRefOrSelector(ref?: string, selector?: string): { ref?: string; selector?: string } {
+  const trimmedRef = typeof ref === 'string' ? ref.trim() : '';
+  const trimmedSelector = typeof selector === 'string' ? selector.trim() : '';
+  if (!trimmedRef && !trimmedSelector) throw new Error('ref or selector is required');
+  return { ref: trimmedRef || undefined, selector: trimmedSelector || undefined };
+}
+
+/** Clamp interaction timeout to [500, 60000]ms range, defaulting to 8000ms. */
+export function resolveInteractionTimeoutMs(timeoutMs?: number): number {
+  return Math.max(500, Math.min(60000, Math.floor(timeoutMs ?? 8000)));
+}
+
+/** Bounded delay validator for animation/interaction delays. */
+export function resolveBoundedDelayMs(value: number | undefined, label: string, maxMs: number): number {
+  const normalized = Math.floor(value ?? 0);
+  if (!Number.isFinite(normalized) || normalized < 0) throw new Error(`${label} must be >= 0`);
+  if (normalized > maxMs) throw new Error(`${label} exceeds maximum of ${String(maxMs)}ms`);
+  return normalized;
+}
+
+// ── Ref Locator ──
+
+const AX_REF_PATTERN = /^ax\d+$/;
+export const BROWSER_REF_MARKER_ATTRIBUTE = 'data-browserclaw-ref';
+
+export function refLocator(page: Page, ref: string) {
+  const normalized = ref.startsWith('@') ? ref.slice(1) : ref.startsWith('ref=') ? ref.slice(4) : ref;
+  if (normalized.trim() === '') throw new Error('ref is required');
+
+  if (/^e\d+$/.test(normalized) || AX_REF_PATTERN.test(normalized)) {
+    const state = getPageState(page);
+
+    // Warn if refs are stale
+    if (state?.roleRefsStoredAt !== undefined) {
+      const ageMs = Date.now() - state.roleRefsStoredAt;
+      if (ageMs > REFS_STALENESS_THRESHOLD_MS && state.roleRefsStaleWarned !== state.roleRefsStoredAt) {
+        state.roleRefsStaleWarned = state.roleRefsStoredAt;
+        console.warn(
+          `[browserclaw] refs are ${String(Math.round(ageMs / 1000))}s old — consider re-snapshotting for fresh refs`,
+        );
+      }
+    }
+
+    const info = state?.roleRefs?.[normalized];
+    // Never re-resolve an iframe selector: it could now identify a replacement frame.
+    if (state?.roleRefsFrameSelector !== undefined && state.roleRefsFrameSelector !== '' && !state.roleRefsFrame) {
+      throw new StaleRefError(normalized);
+    }
+    const scope = state?.roleRefsFrame ?? page;
+
+    if (info?.selector !== undefined && info.selector !== '') {
+      return scope.locator(info.selector);
+    }
+
+    if (state?.roleRefsMode === 'aria' && !AX_REF_PATTERN.test(normalized)) {
+      return scope.locator(`aria-ref=${normalized}`);
+    }
+
+    if (!info) throw new StaleRefError(normalized);
+
+    if (info.domMarker === true) return scope.locator(`[${BROWSER_REF_MARKER_ATTRIBUTE}="${normalized}"]`);
+    const role = info.role as Parameters<Page['getByRole']>[0];
+    const locator = scope.getByRole(role, { name: info.name ?? /^$|^.{901,}$/s, exact: true });
+    return info.nth !== undefined ? locator.nth(info.nth) : locator;
+  }
+
+  return page.locator(`aria-ref=${normalized}`);
+}

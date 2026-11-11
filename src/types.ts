@@ -1,0 +1,791 @@
+import type { ChildProcess } from 'node:child_process';
+import type { lookup as dnsLookup } from 'node:dns';
+
+import type { Frame } from 'playwright-core';
+
+// ── SSRF Policy ──
+
+/**
+ * Policy for controlling which URLs browser navigation is allowed to reach.
+ * Secure by default: private/internal/loopback addresses are blocked.
+ * Set `dangerouslyAllowPrivateNetwork: true` to allow them.
+ */
+export interface SsrfPolicy {
+  /**
+   * Allow navigation to private/internal network addresses.
+   * Default: `false` — private/internal/loopback addresses are blocked. Set to `true` to allow them.
+   * Hostname navigation stays exposed to browser-side DNS rebinding; see `requireAllowlistedHostnames`.
+   */
+  dangerouslyAllowPrivateNetwork?: boolean;
+  /**
+   * Allow navigation to private/internal network addresses.
+   * @deprecated Use `dangerouslyAllowPrivateNetwork` instead.
+   */
+  allowPrivateNetwork?: boolean;
+  /**
+   * Hostnames that bypass the private/internal-address check (permissive
+   * carve-out). Use this to connect to a named host that happens to resolve
+   * to a private IP (e.g. a corporate bastion) without fully disabling the
+   * private-network block.
+   */
+  allowedHostnames?: string[];
+  /**
+   * Restrictive hostname filter: when non-empty, navigation is blocked unless
+   * the hostname matches an entry (supports `*.example.com` patterns).
+   *
+   * Note: this is a *filter*, not a carve-out. Passing the filter does not
+   * also bypass the private-network check — to reach a loopback/private host
+   * via `hostnameAllowlist`, also include it in `allowedHostnames` or set
+   * `dangerouslyAllowPrivateNetwork: true`.
+   */
+  hostnameAllowlist?: string[];
+  /** Hostname patterns to deny (supports `*.example.com`); takes precedence over all private-network exemptions. */
+  blockedHostnames?: string[];
+  /**
+   * Require every navigation to target an IP-literal URL, an exact `allowedHostnames`
+   * entry, or a `hostnameAllowlist` pattern. This rejects unlisted DNS hostnames;
+   * listed names must still be trusted because Chrome resolves them independently.
+   * The gate does not pin browser DNS or grant private-address access to a
+   * `hostnameAllowlist` entry.
+   * Default: `false`. Has no effect when `dangerouslyAllowPrivateNetwork` is `true`.
+   */
+  requireAllowlistedHostnames?: boolean;
+  /**
+   * Allow navigation to the RFC 2544 benchmark testing range (198.18.0.0/15).
+   * This range is blocked by default. Enable only in proxy/fake-IP networking
+   * environments where this range is used for legitimate routing.
+   */
+  allowRfc2544BenchmarkRange?: boolean;
+  /**
+   * Allow navigation to the IPv6 unique local address range (fc00::/7).
+   * This range is blocked by default. Enable only in trusted fake-IP proxy
+   * stacks that use ULA addresses for legitimate routing.
+   */
+  allowIpv6UniqueLocalRange?: boolean;
+}
+
+// ── Chrome Launcher ──
+
+/** Supported browser types that can be detected and launched. */
+export type ChromeKind = 'chrome' | 'brave' | 'edge' | 'chromium' | 'canary' | 'custom';
+
+/** A detected browser executable on the system. */
+export interface ChromeExecutable {
+  /** The type of browser (chrome, brave, edge, etc.) */
+  kind: ChromeKind;
+  /** Absolute path to the browser executable */
+  path: string;
+}
+
+/** A running Chrome instance managed by browserclaw. */
+export interface RunningChrome {
+  /** Process ID of the Chrome process */
+  pid: number;
+  /** The browser executable that was launched */
+  exe: ChromeExecutable;
+  /** Path to the Chrome user data directory */
+  userDataDir: string;
+  /** CDP (Chrome DevTools Protocol) port number */
+  cdpPort: number;
+  /** Unix timestamp (ms) when the browser was started */
+  startedAt: number;
+  /** Milliseconds from spawn to CDP-ready */
+  launchMs: number;
+  /** The child process handle */
+  proc: ChildProcess;
+  /**
+   * Whether this profile was launched as isolated — set when `LaunchOptions.isolated`
+   * is truthy. `stopChrome()` removes isolated profiles' user-data directories on exit.
+   */
+  isolated?: boolean;
+}
+
+/** Options for launching a new browser instance. */
+export interface LaunchOptions {
+  /** URL to navigate to after launch. If omitted, the initial tab stays on `about:blank`. */
+  url?: string;
+  /** Run in headless mode (no visible window). Default: `false` */
+  headless?: boolean;
+  /** Path to a specific browser executable. Auto-detected if omitted. */
+  executablePath?: string;
+  /** CDP port to use. Default: `9222` */
+  cdpPort?: number;
+  /** Disable Chrome's sandbox (needed in some Docker/CI environments). Default: `false` */
+  noSandbox?: boolean;
+  /** Custom user data directory. Auto-generated if omitted. */
+  userDataDir?: string;
+  /** Profile name shown in the Chrome title bar. Default: `'browserclaw'` */
+  profileName?: string;
+  /** Profile accent color as a hex string (e.g. `'#FF4500'`). Default: `'#FF4500'` */
+  profileColor?: string;
+  /** Additional Chrome command-line arguments (e.g. `['--start-maximized']`). */
+  chromeArgs?: string[];
+  /** Ignore HTTPS certificate errors (e.g. expired local dev certs). Default: `false` */
+  ignoreHTTPSErrors?: boolean;
+  /** Add CI-deterministic Chrome flags (sync/component-update/translate/safebrowsing). May fingerprint as automation. Default: `false`. */
+  ciDefaults?: boolean;
+  /** Inject stealth patches (navigator.webdriver, plugins, WebGL vendor, etc.) to mimic native Chrome. The patches are themselves fingerprintable by sophisticated detectors and are off by default. Default: `false`. */
+  stealth?: boolean;
+  /**
+   * Launch in a fully isolated profile: uses a unique per-run profile name,
+   * a dedicated user-data directory, and does not share state with other
+   * BrowserClaw sessions. Useful when running multiple concurrent browsers
+   * or when you need to guarantee no login state, cookies, or extensions
+   * leak between runs.
+   *
+   * A run-scoped random suffix is always appended to guarantee that two
+   * concurrent launches never share a user-data directory. Passing a string
+   * acts as a label prefix for easier identification in
+   * `$TMPDIR/browserclaw/isolated/` — it does NOT make the profile stable
+   * across runs. `profileName` and `userDataDir` are ignored when this is
+   * set.
+   *
+   * Default: `false` (shares the default `browserclaw` profile).
+   */
+  isolated?: boolean | string;
+  /**
+   * SSRF policy controlling which URLs navigation is allowed to reach.
+   * Secure by default: private/internal/loopback addresses are blocked.
+   * Set `dangerouslyAllowPrivateNetwork: true` to allow them.
+   */
+  ssrfPolicy?: SsrfPolicy;
+  /**
+   * Allow navigation to internal/loopback addresses (localhost, 127.x, private IPs).
+   * @deprecated Use `ssrfPolicy: { dangerouslyAllowPrivateNetwork: true }` instead.
+   */
+  allowInternal?: boolean;
+  /**
+   * Record video for all pages. Requires a directory to save video files.
+   * Videos are saved when the page or context is closed.
+   */
+  recordVideo?: { dir: string; size?: { width: number; height: number } };
+}
+
+/** Options for connecting to an existing browser instance. */
+export interface ConnectOptions {
+  /**
+   * SSRF policy controlling which URLs navigation is allowed to reach.
+   * Secure by default: private/internal/loopback addresses are blocked.
+   * Set `dangerouslyAllowPrivateNetwork: true` to allow them.
+   */
+  ssrfPolicy?: SsrfPolicy;
+  /**
+   * Allow navigation to internal/loopback addresses (localhost, 127.x, private IPs).
+   * @deprecated Use `ssrfPolicy: { dangerouslyAllowPrivateNetwork: true }` instead.
+   */
+  allowInternal?: boolean;
+  /**
+   * Bearer token for authenticating with the CDP endpoint.
+   * Required when connecting to a browser instance that has auth enabled
+   * (e.g. OpenClaw browser control with gateway.auth.token).
+   */
+  authToken?: string;
+  /**
+   * Record video for all pages. Requires a directory to save video files.
+   * Videos are saved when the page or context is closed.
+   */
+  recordVideo?: { dir: string; size?: { width: number; height: number } };
+  /** Inject stealth patches. See `LaunchOptions.stealth` — same caveat applies. Default: `false`. */
+  stealth?: boolean;
+}
+
+// ── Snapshot ──
+
+/**
+ * Describes a single interactive element found during a snapshot.
+ * Used to resolve refs (e.g. `e1`) back to Playwright locators.
+ */
+export interface RoleRefInfo {
+  /** ARIA role of the element (e.g. `'button'`, `'textbox'`, `'link'`) */
+  role: string;
+  /** Accessible name of the element */
+  name?: string;
+  /** Disambiguation index when multiple elements share the same role + name */
+  nth?: number;
+  /** Whether the element is disabled (from `[disabled]` or `aria-disabled`) */
+  disabled?: boolean;
+  /** Whether a checkbox/radio/switch is checked */
+  checked?: boolean | 'mixed';
+  /**
+   * CSS selector for DOM-enriched refs — elements found by the DOM scan that
+   * are not present in the accessibility tree. When set, ref resolution uses
+   * this selector directly instead of `aria-ref` or `getByRole()`.
+   */
+  selector?: string;
+  /**
+   * For `axN` refs: set to true when a marker attribute was successfully
+   * stamped onto the live DOM node, allowing direct attribute-selector
+   * resolution instead of falling back to role+name+nth.
+   */
+  domMarker?: boolean;
+}
+
+/** Map of ref IDs (e.g. `'e1'`, `'e2'`) to their element information. */
+export type RoleRefs = Record<string, RoleRefInfo>;
+
+/**
+ * Metadata about the source of untrusted external content.
+ * Used by consumers (e.g. OpenClaw) to wrap browser outputs with
+ * structured external-content markers for prompt-injection mitigation.
+ */
+export interface UntrustedContentMeta {
+  /** The source URL of the content at the time of capture */
+  sourceUrl?: string;
+  /** Content type identifier (e.g. `'browser-snapshot'`, `'browser-aria-tree'`) */
+  contentType: string;
+  /** ISO 8601 timestamp of when the content was captured */
+  capturedAt: string;
+}
+
+/** Result of taking a page snapshot. */
+export interface SnapshotResult {
+  /** AI-readable text representation of the page with numbered refs */
+  snapshot: string;
+  /** Map of ref IDs to element information for targeting actions */
+  refs: RoleRefs;
+  /** Statistics about the snapshot */
+  stats?: SnapshotStats;
+  /** Whether the snapshot was truncated due to maxChars limit */
+  truncated?: boolean;
+  /**
+   * Indicates this content originates from an untrusted external source (the web page).
+   * AI agents should treat snapshot content as potentially adversarial
+   * (e.g. prompt injection via page text). Always `true` for browser snapshots.
+   */
+  untrusted?: true;
+  /** Structured metadata about the untrusted content source */
+  contentMeta?: UntrustedContentMeta;
+}
+
+/** Statistics about a snapshot's content. */
+export interface SnapshotStats {
+  /** Number of lines in the snapshot text */
+  lines: number;
+  /** Number of characters in the snapshot text */
+  chars: number;
+  /** Total number of refs assigned */
+  refs: number;
+  /** Number of interactive element refs (buttons, links, inputs, etc.) */
+  interactive: number;
+}
+
+/** Options for controlling snapshot output. */
+export interface SnapshotOptions {
+  signal?: AbortSignal;
+  /** Only include interactive elements (buttons, links, inputs, etc.) */
+  interactive?: boolean;
+  /** Remove structural containers that don't contain interactive elements */
+  compact?: boolean;
+  /** Maximum tree depth to include */
+  maxDepth?: number;
+  /** Maximum character count after snapshot enrichment */
+  maxChars?: number;
+  /** CSS selector to scope the snapshot to a specific element (role mode only — throws in aria mode) */
+  selector?: string;
+  /** Frame selector for snapshotting inside iframes (role mode only — throws in aria mode) */
+  frameSelector?: string;
+  /**
+   * Snapshot strategy:
+   * - `'aria'` (default) — uses Playwright's AI-mode snapshot, produces refs like `e1`
+   * - `'role'` — captures the native accessibility tree and binds refs to DOM identities
+   */
+  mode?: 'role' | 'aria';
+  /** Timeout in milliseconds for the snapshot operation (default: 5000) */
+  timeoutMs?: number;
+  /**
+   * How refs are stored for role-mode snapshots.
+   * - `'role'` (default) — native refs resolve through their bound DOM markers
+   * - `'aria'` — uses Playwright's AI snapshot and aria-ref locators; no selector/frame scope
+   * Only applies when `mode: 'role'`.
+   */
+  refsMode?: 'role' | 'aria';
+  /**
+   * Retry the snapshot until at least one interactive ref is present. Useful
+   * for SPAs where the first snapshot can land on an unhydrated shell.
+   *
+   * When a number is provided it's treated as the maximum wait time in ms.
+   * `true` uses a default budget of 5000ms. Defaults to off (no retries).
+   *
+   * Throws `SnapshotHydrationError` if the budget is exhausted without
+   * producing interactive refs. The final (possibly still-empty) snapshot
+   * is attached as `cause.snapshot` for inspection.
+   */
+  waitForHydration?: boolean | number;
+  /**
+   * Minimum number of interactive refs required to consider the snapshot
+   * hydrated when `waitForHydration` is enabled. Default: 1.
+   */
+  minInteractiveRefs?: number;
+}
+
+/** A node in the raw ARIA accessibility tree. */
+export interface AriaNode {
+  /** Ref ID for this node (e.g. `'ax1'`) */
+  ref: string;
+  /** ARIA role (e.g. `'button'`, `'heading'`, `'generic'`) */
+  role: string;
+  /** Accessible name */
+  name: string;
+  /** Current value (for inputs, sliders, etc.) */
+  value?: string;
+  /** Accessible description */
+  description?: string;
+  /** Backend DOM node ID (for CDP operations) */
+  backendDOMNodeId?: number;
+  /** Depth in the accessibility tree (0 = root) */
+  depth: number;
+}
+
+/** Result of a raw ARIA tree snapshot. */
+export interface AriaSnapshotResult {
+  /** Flat list of accessibility tree nodes */
+  nodes: AriaNode[];
+  /**
+   * Indicates this content originates from an untrusted external source (the web page).
+   * AI agents should treat snapshot content as potentially adversarial. Always `true`.
+   */
+  untrusted?: true;
+  /** Structured metadata about the untrusted content source */
+  contentMeta?: UntrustedContentMeta;
+}
+
+// ── Actions ──
+
+/** A form field to fill as part of a batch `fill()` operation. */
+export interface FormField {
+  /** Ref ID of the form field (e.g. `'e3'`) */
+  ref: string;
+  /** Field type: `'text'`, `'checkbox'`, `'radio'`, etc. */
+  type?: string;
+  /** Value to set. Booleans for checkboxes, strings for text fields. */
+  value?: string | number | boolean;
+}
+
+/** Options for click actions. */
+export interface ClickOptions {
+  /** Double-click instead of single click */
+  doubleClick?: boolean;
+  /** Mouse button to use */
+  button?: 'left' | 'right' | 'middle';
+  /** Modifier keys to hold during click */
+  modifiers?: ('Alt' | 'Control' | 'ControlOrMeta' | 'Meta' | 'Shift')[];
+  /** Delay in ms between hover and click (hovers first, waits, then clicks). Max: `5000` */
+  delayMs?: number;
+  /** Timeout in milliseconds. Default: `8000` */
+  timeoutMs?: number;
+  /** Force click even if element is hidden or covered. Dispatches the event regardless of visibility. */
+  force?: boolean;
+  /** Cancel the click without disconnecting other tabs. */
+  signal?: AbortSignal;
+}
+
+/** Options for type actions. */
+export interface TypeOptions {
+  /** Cancel typing without disconnecting other tabs. */
+  signal?: AbortSignal;
+  /** Press Enter after typing */
+  submit?: boolean;
+  /** Type character-by-character with delay (75ms per key) instead of instant fill */
+  slowly?: boolean;
+  /** Timeout in milliseconds. Default: `8000` */
+  timeoutMs?: number;
+}
+
+/**
+ * Options for waiting on various conditions.
+ * Multiple conditions can be combined — they are checked in order.
+ */
+export interface WaitOptions {
+  /** Wait for a fixed duration (milliseconds) */
+  timeMs?: number;
+  /** Wait until text appears on the page */
+  text?: string;
+  /** Wait until text disappears from the page */
+  textGone?: string;
+  /** Wait until a CSS selector matches a visible element */
+  selector?: string;
+  /** Wait until the URL matches a pattern (supports `**` wildcards) */
+  url?: string;
+  /** Wait for a specific page load state */
+  loadState?: 'load' | 'domcontentloaded' | 'networkidle';
+  /** Wait until a JavaScript function returns truthy (evaluated in browser context). Accepts a string or a serializable function. */
+  fn?: string | ((arg?: unknown) => unknown);
+  /** Serializable argument passed to `fn` in the browser context. Use an array or object to pass multiple values. */
+  arg?: unknown;
+  /** Shared timeout budget for condition waits in milliseconds. Default: `20000` */
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+/** Options for screenshot capture. */
+export interface ScreenshotOptions {
+  /** Capture the full scrollable page instead of just the viewport */
+  fullPage?: boolean;
+  /** Capture a specific element by ref ID */
+  ref?: string;
+  /** Capture a specific element by CSS selector */
+  element?: string;
+  /** Image format. Default: `'png'` */
+  type?: 'png' | 'jpeg';
+  /** Enable labeled screenshot mode (used internally by screenshotWithLabels) */
+  labels?: boolean;
+  /** Max ms to wait for a standard screenshot. Default: 20000. Pass 0 to disable. */
+  timeoutMs?: number;
+  /** Cancel a standard screenshot without disconnecting the browser. */
+  signal?: AbortSignal;
+}
+
+// ── Activity ──
+
+/** A console message captured from the browser page. */
+export interface ConsoleMessage {
+  /** Message type: `'log'`, `'info'`, `'warning'`, `'error'`, `'debug'` */
+  type: string;
+  /** The message text */
+  text: string;
+  /** ISO 8601 timestamp */
+  timestamp: string;
+  /** Source location where the message was logged */
+  location?: { url?: string; lineNumber?: number; columnNumber?: number };
+}
+
+/** An uncaught error from the browser page. */
+export interface PageError {
+  /** Error message */
+  message: string;
+  /** Error name (e.g. `'TypeError'`) */
+  name?: string;
+  /** Stack trace */
+  stack?: string;
+  /** ISO 8601 timestamp */
+  timestamp: string;
+}
+
+/** A network request captured from the browser page. */
+export interface NetworkRequest {
+  /** Internal request ID (e.g. `'r1'`, `'r2'`) */
+  id: string;
+  /** ISO 8601 timestamp */
+  timestamp: string;
+  /** HTTP method (e.g. `'GET'`, `'POST'`) */
+  method: string;
+  /** Request URL */
+  url: string;
+  /** Resource type (e.g. `'document'`, `'xhr'`, `'fetch'`, `'image'`) */
+  resourceType: string;
+  /** HTTP status code (set when response is received) */
+  status?: number;
+  /** Whether the response status was 2xx */
+  ok?: boolean;
+  /** Error text if the request failed */
+  failureText?: string;
+}
+
+// ── Storage ──
+
+/** Web storage type. */
+export type StorageKind = 'local' | 'session';
+
+/** Cookie data for setting a browser cookie. */
+export interface CookieData {
+  /** Cookie name */
+  name: string;
+  /** Cookie value */
+  value: string;
+  /** URL to associate the cookie with (alternative to domain+path) */
+  url?: string;
+  /** Cookie domain */
+  domain?: string;
+  /** Cookie path */
+  path?: string;
+  /** Expiration as Unix timestamp in seconds */
+  expires?: number;
+  /** HTTP-only flag */
+  httpOnly?: boolean;
+  /** Secure flag */
+  secure?: boolean;
+  /** SameSite attribute */
+  sameSite?: 'Strict' | 'Lax' | 'None';
+}
+
+// ── Tab ──
+
+/** Information about an open browser tab. */
+export interface BrowserTab {
+  /** CDP target ID (used to identify this tab in API calls) */
+  targetId: string;
+  /** Page title */
+  title: string;
+  /** Current URL */
+  url: string;
+  /** Target type (usually `'page'`) */
+  type: string;
+}
+
+// ── Downloads ──
+
+/** Result of a download operation. */
+export interface DownloadResult {
+  /** The URL that initiated the download */
+  url: string;
+  /** Filename suggested by the server */
+  suggestedFilename: string;
+  /** Local path where the file was saved */
+  path: string;
+}
+
+// ── Dialog ──
+
+/** Options for arming a dialog handler. */
+export interface DialogOptions {
+  /** Whether to accept or dismiss the dialog */
+  accept: boolean;
+  /** Text to enter in a prompt dialog */
+  promptText?: string;
+  /** Timeout for waiting for the dialog. Default: `30000` */
+  timeoutMs?: number;
+}
+
+/** Information about a dialog event passed to `onDialog` handlers. */
+export interface DialogEvent {
+  /** Dialog type: `'alert'`, `'confirm'`, `'prompt'`, or `'beforeunload'` */
+  type: string;
+  /** The message displayed in the dialog */
+  message: string;
+  /** The default prompt value (for prompt dialogs) */
+  defaultValue: string;
+  /** Accept the dialog (optionally with prompt text) */
+  accept: (promptText?: string) => Promise<void>;
+  /** Dismiss the dialog */
+  dismiss: () => Promise<void>;
+}
+
+/** Callback for persistent dialog handling. */
+export type DialogHandler = (event: DialogEvent) => void | Promise<void>;
+
+// ── Response Body ──
+
+/** Result of waiting for a network request to complete. */
+export interface RequestResult {
+  /** The final request URL */
+  url: string;
+  /** HTTP method (e.g. `'GET'`, `'POST'`) */
+  method: string;
+  /** Request body (for POST/PUT/PATCH requests) */
+  postData?: string;
+  /** HTTP response status code */
+  status: number;
+  /** Whether the response status was 2xx */
+  ok: boolean;
+  /** Response body text */
+  responseBody?: string;
+  /** Whether the response body was truncated due to maxChars */
+  truncated?: boolean;
+}
+
+/** Result of intercepting a response body. */
+export interface ResponseBodyResult {
+  /** The response URL */
+  url: string;
+  /** HTTP status code */
+  status?: number;
+  /** Response headers */
+  headers?: Record<string, string>;
+  /** Response body text */
+  body: string;
+  /** Whether the body was truncated due to maxChars */
+  truncated?: boolean;
+}
+
+// ── Trace ──
+
+/** Options for starting a Playwright trace. */
+export interface TraceStartOptions {
+  /** Capture screenshots during tracing */
+  screenshots?: boolean;
+  /** Capture DOM snapshots during tracing */
+  snapshots?: boolean;
+  /** Include source files in the trace */
+  sources?: boolean;
+}
+
+// ── Emulation ──
+
+/** Color scheme for media emulation. */
+export type ColorScheme = 'dark' | 'light' | 'no-preference' | null;
+
+/** Options for geolocation emulation. */
+export interface GeolocationOptions {
+  /** Latitude in degrees */
+  latitude?: number;
+  /** Longitude in degrees */
+  longitude?: number;
+  /** Accuracy in meters */
+  accuracy?: number;
+  /** Origin to grant geolocation permission for (e.g. `'https://demo.playwright.dev'`) */
+  origin?: string;
+  /** Clear geolocation override */
+  clear?: boolean;
+}
+
+/** HTTP credentials for authentication. */
+export interface HttpCredentials {
+  /** Username for HTTP authentication */
+  username?: string;
+  /** Password for HTTP authentication */
+  password?: string;
+  /** Clear HTTP credentials */
+  clear?: boolean;
+}
+
+// ── Context State ──
+
+export interface ContextState {
+  traceActive: boolean;
+}
+
+// ── Page State (internal) ──
+
+/** @internal */
+export interface PageState {
+  console: ConsoleMessage[];
+  errors: PageError[];
+  requests: NetworkRequest[];
+  requestIds: WeakMap<object, string>;
+  nextRequestId: number;
+  roleRefs?: RoleRefs;
+  roleRefsFrameSelector?: string;
+  roleRefsFrame?: Frame;
+  roleRefsMode?: 'role' | 'aria';
+  roleRefsStoredAt?: number;
+  roleRefsStaleWarned?: number;
+  armIdUpload: number;
+  armIdDialog: number;
+  armIdDownload: number;
+  nextArmIdUpload: number;
+  nextArmIdDialog: number;
+  nextArmIdDownload: number;
+  downloadWaiterDepth: number;
+  dialogHandler?: DialogHandler;
+}
+
+// ── Anti-Bot ──
+
+/** The kind of anti-bot challenge detected on a page. */
+export type ChallengeKind =
+  | 'cloudflare-js'
+  | 'cloudflare-block'
+  | 'cloudflare-turnstile'
+  | 'hcaptcha'
+  | 'recaptcha'
+  | 'blocked'
+  | 'rate-limited';
+
+/** Information about a detected anti-bot challenge. */
+export interface ChallengeInfo {
+  /** What type of challenge is present */
+  kind: ChallengeKind;
+  /** Human-readable description */
+  message: string;
+}
+
+/** Result of waiting for an anti-bot challenge to resolve. */
+export interface ChallengeWaitResult {
+  /** Whether the challenge cleared within the timeout */
+  resolved: boolean;
+  /** The challenge still present (null if resolved) */
+  challenge: ChallengeInfo | null;
+}
+
+// ── Auth Health ──
+
+/**
+ * A single rule for checking whether the browser session is authenticated.
+ * Multiple rules can be combined — all must pass for `authenticated: true`.
+ */
+export interface AuthCheckRule {
+  /** URL must contain this substring (checked against page URL) */
+  url?: string;
+  /** A cookie with this name must exist (non-empty value) */
+  cookie?: string;
+  /** A CSS selector that must match at least one element on the page (includes hidden elements) */
+  selector?: string;
+  /** Text that must be present on the page */
+  text?: string;
+  /** Text that must NOT be present on the page (e.g. "Sign in", "Log in") */
+  textGone?: string;
+  /** JavaScript function (as string) that must return a truthy value in the browser context */
+  fn?: string;
+}
+
+/** The kind of auth check rule that was evaluated. */
+export type AuthCheckRuleKind = 'url' | 'cookie' | 'selector' | 'text' | 'textGone' | 'fn';
+
+/** Result of a single auth check rule evaluation. */
+export interface AuthCheckDetail {
+  /** Which rule type was checked */
+  rule: AuthCheckRuleKind;
+  /** Whether this individual check passed */
+  passed: boolean;
+  /** Human-readable detail (e.g. the actual URL, cookie value presence, etc.) */
+  detail?: string;
+}
+
+/** Result of an `isAuthenticated()` call. */
+export interface AuthCheckResult {
+  /** `true` only if ALL rules passed */
+  authenticated: boolean;
+  /** Per-rule results for debugging */
+  checks: AuthCheckDetail[];
+}
+
+// ── Run Telemetry ──
+
+/** Standard exit reasons for structured telemetry. */
+export type ExitReason =
+  | 'success'
+  | 'auth_failed'
+  | 'nav_failed'
+  | 'timeout'
+  | 'crash'
+  | 'disconnected'
+  | 'manual'
+  | 'error';
+
+/** Structured telemetry envelope for a browser session lifecycle. */
+export interface RunTelemetry {
+  /** Milliseconds to launch Chrome (undefined if connected to existing instance) */
+  launchMs?: number;
+  /** Milliseconds to establish CDP connection */
+  connectMs?: number;
+  /** Milliseconds for initial navigation (if a URL was provided at launch) */
+  navMs?: number;
+  /** Whether auth verification passed (undefined if not checked) */
+  authOk?: boolean;
+  /** Structured exit reason when the session ends */
+  exitReason?: ExitReason | (string & {});
+  /** Whether cleanup (process kill, connection close) succeeded */
+  cleanupOk?: boolean;
+  /** Key timestamps in ISO 8601 format */
+  timestamps: {
+    /** When the launch/connect sequence started */
+    startedAt: string;
+    /** When Chrome process became reachable */
+    launchedAt?: string;
+    /** When Playwright CDP connection was established */
+    connectedAt?: string;
+    /** When initial navigation completed */
+    navigatedAt?: string;
+    /** When stop() was called */
+    stoppedAt?: string;
+  };
+}
+
+// ── DNS Pinning ──
+
+/** Result of DNS pinning resolution — hostname locked to resolved addresses. */
+export interface PinnedHostname {
+  hostname: string;
+  addresses: string[];
+  lookup: typeof dnsLookup;
+}

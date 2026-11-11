@@ -1,0 +1,969 @@
+import type * as ChildProcess from 'node:child_process';
+import fs from 'node:fs';
+import type * as Net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+import * as cdpNetwork from './cdp-network.js';
+
+const { execFileMock } = vi.hoisted(() => ({
+  execFileMock: vi.fn(),
+}));
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof ChildProcess>();
+  return {
+    ...actual,
+    execFile: (
+      file: string,
+      args: string[],
+      optsOrCb: unknown,
+      cb?: (err: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      const callback = typeof optsOrCb === 'function' ? (optsOrCb as typeof cb) : cb;
+      execFileMock(file, args);
+      if (typeof callback === 'function') callback(null, '', '');
+      return { kill: () => undefined, unref: () => undefined } as unknown as ReturnType<typeof actual.execFile>;
+    },
+  };
+});
+
+const {
+  isLoopbackHost,
+  isDirectCdpWebSocketEndpoint,
+  hasProxyEnvConfigured,
+  normalizeCdpWsUrl,
+  normalizeCdpHttpBaseForJsonEndpoints,
+  resolveIsolatedProfile,
+  processExists,
+  clearChromeSingletonArtifacts,
+  clearStaleChromeSingletonLocks,
+  CHROME_SINGLETON_IN_USE_PATTERN,
+  buildChromeLaunchArgs,
+  wipeChromeSessionState,
+  reserveFreePortFromList,
+  activateMacOsWindowByPid,
+  readJsonResponseBounded,
+  getChromeWebSocketUrl,
+  markCdpUrlProxyRouted,
+  clearCdpUrlProxyRouted,
+  isCdpUrlProxyRouted,
+  createChromeLaunchStderrDiagnostics,
+  chromeLaunchStderrHint,
+} = await import('./chrome-launcher.js');
+
+describe('bounded Chrome launch stderr', () => {
+  it('does not begin the final hint with half of a surrogate pair', () => {
+    expect(chromeLaunchStderrHint(`old🙂${'x'.repeat(1999)}`)).toBe(`\nChrome stderr:\n${'x'.repeat(1999)}`);
+  });
+
+  it('control: retains complete characters, the raw diagnostic text, and the ordinary length limit', () => {
+    expect(chromeLaunchStderrHint(`old🙂${'x'.repeat(1998)}`)).toBe(`\nChrome stderr:\n🙂${'x'.repeat(1998)}`);
+    expect(chromeLaunchStderrHint(`old${'x'.repeat(2000)}`)).toBe(`\nChrome stderr:\n${'x'.repeat(2000)}`);
+    expect(chromeLaunchStderrHint('token=raw')).toBe('\nChrome stderr:\ntoken=raw');
+    expect(chromeLaunchStderrHint('')).toBe('');
+  });
+
+  it('keeps only the bounded tail of large and successive chunks', () => {
+    const diagnostics = createChromeLaunchStderrDiagnostics(16);
+    diagnostics.append(Buffer.from('old'.repeat(1000)));
+    diagnostics.append(Buffer.from('latest diagnostic'));
+    expect(diagnostics.text()).toBe('atest diagnostic');
+    expect(Buffer.byteLength(diagnostics.text())).toBeLessThanOrEqual(16);
+  });
+
+  it('retains a split brand-agnostic singleton marker after its text is evicted', () => {
+    const diagnostics = createChromeLaunchStderrDiagnostics(64);
+    diagnostics.append(Buffer.from('The profile appears to be in use by another Goo'));
+    diagnostics.append(Buffer.from('gle Chrome process (123).'));
+    diagnostics.append(Buffer.from('x'.repeat(1000)));
+    expect(diagnostics.text()).toBe('x'.repeat(64));
+    expect(diagnostics.hasSingletonConflict()).toBe(true);
+    diagnostics.clear();
+    expect(diagnostics.text()).toBe('');
+    expect(diagnostics.hasSingletonConflict()).toBe(false);
+    diagnostics.append(Buffer.from('unrelated Chrome error'));
+    expect(diagnostics.hasSingletonConflict()).toBe(false);
+  });
+
+  it('does not split UTF-8 characters at either end of the retained tail', () => {
+    const diagnostics = createChromeLaunchStderrDiagnostics(7);
+    diagnostics.append(Buffer.from('🙂🙂🙂'));
+    expect(diagnostics.text()).toBe('🙂');
+    diagnostics.clear();
+    diagnostics.append(Buffer.from([0x61, 0xf0, 0x9f]));
+    expect(diagnostics.text()).toBe('a');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// isLoopbackHost
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('isLoopbackHost', () => {
+  it('recognizes localhost', () => {
+    expect(isLoopbackHost('localhost')).toBe(true);
+  });
+
+  it('recognizes 127.0.0.1', () => {
+    expect(isLoopbackHost('127.0.0.1')).toBe(true);
+  });
+
+  it('recognizes ::1', () => {
+    expect(isLoopbackHost('::1')).toBe(true);
+  });
+
+  it('recognizes [::1]', () => {
+    expect(isLoopbackHost('[::1]')).toBe(true);
+  });
+
+  it('strips trailing dots', () => {
+    expect(isLoopbackHost('localhost.')).toBe(true);
+    expect(isLoopbackHost('localhost...')).toBe(true);
+  });
+
+  it('rejects external hostnames', () => {
+    expect(isLoopbackHost('example.com')).toBe(false);
+    expect(isLoopbackHost('192.168.1.1')).toBe(false);
+    expect(isLoopbackHost('10.0.0.1')).toBe(false);
+    expect(isLoopbackHost('0.0.0.0')).toBe(false);
+  });
+
+  it('rejects empty string', () => {
+    expect(isLoopbackHost('')).toBe(false);
+  });
+
+  it('is case sensitive (hostnames are typically lowercase)', () => {
+    expect(isLoopbackHost('LOCALHOST')).toBe(false);
+    expect(isLoopbackHost('Localhost')).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// isDirectCdpWebSocketEndpoint
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('isDirectCdpWebSocketEndpoint', () => {
+  it('recognizes /devtools/browser/<id>', () => {
+    expect(isDirectCdpWebSocketEndpoint('ws://localhost:9222/devtools/browser/abc-123')).toBe(true);
+    expect(isDirectCdpWebSocketEndpoint('wss://remote:443/devtools/browser/abc-123')).toBe(true);
+  });
+
+  it('recognizes /devtools/page/<id>, /devtools/worker/<id>, /devtools/shared_worker/<id>, /devtools/service_worker/<id>', () => {
+    expect(isDirectCdpWebSocketEndpoint('ws://host/devtools/page/abc')).toBe(true);
+    expect(isDirectCdpWebSocketEndpoint('ws://host/devtools/worker/abc')).toBe(true);
+    expect(isDirectCdpWebSocketEndpoint('ws://host/devtools/shared_worker/abc')).toBe(true);
+    expect(isDirectCdpWebSocketEndpoint('ws://host/devtools/service_worker/abc')).toBe(true);
+  });
+
+  it('rejects non-WS protocols', () => {
+    expect(isDirectCdpWebSocketEndpoint('http://localhost:9222/devtools/browser/abc')).toBe(false);
+    expect(isDirectCdpWebSocketEndpoint('https://localhost:9222/devtools/browser/abc')).toBe(false);
+  });
+
+  it('rejects WS URLs without a /devtools/<type>/<id> path', () => {
+    expect(isDirectCdpWebSocketEndpoint('ws://proxy/cdp')).toBe(false);
+    expect(isDirectCdpWebSocketEndpoint('ws://localhost:9222/')).toBe(false);
+    expect(isDirectCdpWebSocketEndpoint('ws://localhost:9222/devtools/browser/')).toBe(false);
+    expect(isDirectCdpWebSocketEndpoint('ws://localhost:9222/devtools/unknown/abc')).toBe(false);
+  });
+
+  it('rejects invalid URLs', () => {
+    expect(isDirectCdpWebSocketEndpoint('')).toBe(false);
+    expect(isDirectCdpWebSocketEndpoint('not a url')).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// hasProxyEnvConfigured
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('hasProxyEnvConfigured', () => {
+  it('returns false for empty env', () => {
+    expect(hasProxyEnvConfigured({})).toBe(false);
+  });
+
+  it('detects HTTP_PROXY', () => {
+    expect(hasProxyEnvConfigured({ HTTP_PROXY: 'http://proxy:8080' })).toBe(true);
+  });
+
+  it('detects HTTPS_PROXY', () => {
+    expect(hasProxyEnvConfigured({ HTTPS_PROXY: 'http://proxy:8080' })).toBe(true);
+  });
+
+  it('detects ALL_PROXY', () => {
+    expect(hasProxyEnvConfigured({ ALL_PROXY: 'socks5://proxy:1080' })).toBe(true);
+  });
+
+  it('detects lowercase variants', () => {
+    expect(hasProxyEnvConfigured({ http_proxy: 'http://proxy:8080' })).toBe(true);
+    expect(hasProxyEnvConfigured({ https_proxy: 'http://proxy:8080' })).toBe(true);
+    expect(hasProxyEnvConfigured({ all_proxy: 'socks5://proxy:1080' })).toBe(true);
+  });
+
+  it('ignores empty string values', () => {
+    expect(hasProxyEnvConfigured({ HTTP_PROXY: '' })).toBe(false);
+  });
+
+  it('ignores whitespace-only values', () => {
+    expect(hasProxyEnvConfigured({ HTTP_PROXY: '   ' })).toBe(false);
+  });
+
+  it('ignores undefined values', () => {
+    expect(hasProxyEnvConfigured({ HTTP_PROXY: undefined })).toBe(false);
+  });
+
+  it('ignores unrelated env vars', () => {
+    expect(hasProxyEnvConfigured({ NODE_ENV: 'production', HOME: '/root' })).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// normalizeCdpWsUrl
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('normalizeCdpWsUrl', () => {
+  it('preserves ws URL when both are local', () => {
+    const result = normalizeCdpWsUrl('ws://127.0.0.1:9222/devtools/browser/abc', 'http://127.0.0.1:9222');
+    expect(result).toContain('ws://');
+    expect(result).toContain('127.0.0.1');
+  });
+
+  it('replaces loopback hostname with external CDP hostname', () => {
+    const result = normalizeCdpWsUrl('ws://127.0.0.1:9222/devtools/browser/abc', 'https://remote.example.com:3000');
+    expect(result).toContain('remote.example.com');
+    expect(result).toContain('3000');
+    expect(result).toContain('wss://');
+  });
+
+  it('replaces wildcard bind 0.0.0.0 with CDP hostname', () => {
+    const result = normalizeCdpWsUrl('ws://0.0.0.0:9222/devtools/browser/abc', 'https://my-host.com:4000');
+    expect(result).toContain('my-host.com');
+  });
+
+  it('replaces wildcard bind [::] with CDP hostname', () => {
+    const result = normalizeCdpWsUrl('ws://[::]:9222/devtools/browser/abc', 'https://my-host.com:4000');
+    expect(result).toContain('my-host.com');
+  });
+
+  it('upgrades ws to wss when CDP is https', () => {
+    const result = normalizeCdpWsUrl('ws://127.0.0.1:9222/path', 'https://remote.com');
+    expect(result.startsWith('wss://')).toBe(true);
+  });
+
+  it('normalizes loopback aliases (ws localhost, cdp 127.0.0.1 → use cdp alias)', () => {
+    const result = normalizeCdpWsUrl('ws://localhost:9222/devtools/browser/abc', 'http://127.0.0.1:9222');
+    expect(result).toContain('127.0.0.1');
+    expect(result).not.toContain('localhost');
+  });
+
+  it('inherits the cdp port when a loopback ws URL omits its port', () => {
+    const result = normalizeCdpWsUrl('ws://localhost/devtools/browser/abc', 'http://127.0.0.1:9222');
+    expect(result).toContain('127.0.0.1:9222');
+  });
+
+  it('keeps an explicitly advertised default port instead of inheriting the cdp port', () => {
+    const result = normalizeCdpWsUrl('ws://localhost:80/devtools/browser/abc', 'http://127.0.0.1:9222');
+    expect(new URL(result).port).toBe('');
+    expect(result).not.toContain('9222');
+    const v6 = normalizeCdpWsUrl('ws://[::1]:80/devtools/browser/abc', 'http://127.0.0.1:9222');
+    expect(new URL(v6).port).toBe('');
+  });
+
+  it('normalizes loopback aliases in reverse (ws 127.0.0.1, cdp localhost → use cdp alias)', () => {
+    const result = normalizeCdpWsUrl('ws://127.0.0.1:9222/devtools/browser/abc', 'http://localhost:9222');
+    expect(result).toContain('localhost');
+    expect(result).not.toContain('127.0.0.1');
+  });
+
+  it('normalizes IPv6 loopback to IPv4 loopback when cdp is IPv4 ([::1] → 127.0.0.1)', () => {
+    const result = normalizeCdpWsUrl('ws://[::1]:9222/devtools/browser/abc', 'http://127.0.0.1:9222');
+    expect(result).toContain('127.0.0.1');
+    expect(result).not.toContain('[::1]');
+  });
+
+  it('inherits URL credentials from CDP URL', () => {
+    const result = normalizeCdpWsUrl('ws://localhost:9222/path', 'http://user:pass@localhost:9222');
+    const parsed = new URL(result);
+    expect(parsed.username).toBe('user');
+    expect(parsed.password).toBe('pass');
+  });
+
+  it('does not override existing ws credentials', () => {
+    const result = normalizeCdpWsUrl('ws://wsuser:wspass@localhost:9222/path', 'http://cdpuser:cdppass@localhost:9222');
+    const parsed = new URL(result);
+    expect(parsed.username).toBe('wsuser');
+  });
+
+  it('inherits search params from CDP URL', () => {
+    const result = normalizeCdpWsUrl('ws://localhost:9222/path', 'http://localhost:9222?token=abc');
+    expect(result).toContain('token=abc');
+  });
+
+  it('does not override existing ws search params', () => {
+    const result = normalizeCdpWsUrl('ws://localhost:9222/path?token=ws', 'http://localhost:9222?token=cdp');
+    const parsed = new URL(result);
+    expect(parsed.searchParams.get('token')).toBe('ws');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// normalizeCdpHttpBaseForJsonEndpoints
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('normalizeCdpHttpBaseForJsonEndpoints', () => {
+  it('converts ws: to http:', () => {
+    expect(normalizeCdpHttpBaseForJsonEndpoints('ws://localhost:9222')).toBe('http://localhost:9222');
+  });
+
+  it('converts wss: to https:', () => {
+    expect(normalizeCdpHttpBaseForJsonEndpoints('wss://remote.com:9222')).toBe('https://remote.com:9222');
+  });
+
+  it('strips /devtools/browser/ path', () => {
+    const result = normalizeCdpHttpBaseForJsonEndpoints('ws://localhost:9222/devtools/browser/abc-123');
+    expect(result).toBe('http://localhost:9222');
+  });
+
+  it('strips /cdp path', () => {
+    const result = normalizeCdpHttpBaseForJsonEndpoints('ws://localhost:9222/cdp');
+    expect(result).toBe('http://localhost:9222');
+  });
+
+  it('strips trailing slash', () => {
+    const result = normalizeCdpHttpBaseForJsonEndpoints('http://localhost:9222/');
+    expect(result).toBe('http://localhost:9222');
+  });
+
+  it('handles already-http URLs', () => {
+    expect(normalizeCdpHttpBaseForJsonEndpoints('http://localhost:9222')).toBe('http://localhost:9222');
+  });
+
+  it('fallback: handles malformed URLs gracefully', () => {
+    // The fallback branch uses string replacement
+    const result = normalizeCdpHttpBaseForJsonEndpoints('ws://localhost:9222/devtools/browser/xyz');
+    expect(result).toBe('http://localhost:9222');
+  });
+
+  it('preserves custom paths that are not CDP-specific', () => {
+    const result = normalizeCdpHttpBaseForJsonEndpoints('ws://localhost:9222/custom/path');
+    expect(result).toContain('/custom/path');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// resolveIsolatedProfile
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('resolveIsolatedProfile', () => {
+  const isolatedRoot = path.join(os.tmpdir(), 'browserclaw', 'isolated');
+
+  it('produces a unique directory for isolated: true across calls', () => {
+    const a = resolveIsolatedProfile(true);
+    const b = resolveIsolatedProfile(true);
+    expect(a.userDataDir).not.toBe(b.userDataDir);
+    expect(a.profileName).not.toBe(b.profileName);
+  });
+
+  it('produces a unique directory when the same string label is reused', () => {
+    // Guards the concurrent-launch case: two runs with isolated: "myname"
+    // must not end up on the same user-data-dir (Chrome SingletonLock).
+    const a = resolveIsolatedProfile('myname');
+    const b = resolveIsolatedProfile('myname');
+    expect(a.userDataDir).not.toBe(b.userDataDir);
+    expect(a.profileName).not.toBe(b.profileName);
+  });
+
+  it('prefixes the directory with the sanitized label for easy identification', () => {
+    const { userDataDir } = resolveIsolatedProfile('my/weird name!');
+    const namePart = path.basename(userDataDir);
+    expect(namePart.startsWith('my_weird_name_-')).toBe(true);
+    expect(path.dirname(userDataDir)).toBe(isolatedRoot);
+  });
+
+  it('falls back to "run" label when no string is provided', () => {
+    const { userDataDir, profileName } = resolveIsolatedProfile(true);
+    const namePart = path.basename(userDataDir);
+    expect(namePart.startsWith('run-')).toBe(true);
+    expect(profileName.startsWith('browserclaw-run-')).toBe(true);
+  });
+
+  it('treats empty / whitespace strings as an unlabelled run', () => {
+    const { userDataDir } = resolveIsolatedProfile('   ');
+    expect(path.basename(userDataDir).startsWith('run-')).toBe(true);
+  });
+
+  it('places isolated profiles under $TMPDIR/browserclaw/isolated/', () => {
+    const { userDataDir } = resolveIsolatedProfile(true);
+    expect(userDataDir.startsWith(isolatedRoot + path.sep)).toBe(true);
+  });
+
+  it('caps the label portion at 32 chars before appending the suffix', () => {
+    const { userDataDir } = resolveIsolatedProfile('a'.repeat(100));
+    const namePart = path.basename(userDataDir);
+    const label = namePart.split('-')[0];
+    expect(label.length).toBe(32);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// processExists
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('processExists', () => {
+  it('returns true for the current process pid', () => {
+    expect(processExists(process.pid)).toBe(true);
+  });
+
+  it('returns false for an obviously dead pid', () => {
+    expect(processExists(2147483646)).toBe(false);
+  });
+
+  it('rejects non-positive integers', () => {
+    expect(processExists(0)).toBe(false);
+    expect(processExists(-1)).toBe(false);
+    expect(processExists(1.5)).toBe(false);
+    expect(processExists(Number.NaN)).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// clearChromeSingletonArtifacts / clearStaleChromeSingletonLocks
+// ─────────────────────────────────────────────────────────────────────────────
+
+function makeTempDir(): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'bc-singleton-'));
+}
+
+describe('clearChromeSingletonArtifacts', () => {
+  it('removes Singleton* files when present', () => {
+    const dir = makeTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'SingletonLock'), 'x');
+      fs.writeFileSync(path.join(dir, 'SingletonSocket'), 'x');
+      fs.writeFileSync(path.join(dir, 'SingletonCookie'), 'x');
+      clearChromeSingletonArtifacts(dir);
+      expect(() => fs.lstatSync(path.join(dir, 'SingletonLock'))).toThrow();
+      expect(fs.existsSync(path.join(dir, 'SingletonSocket'))).toBe(false);
+      expect(fs.existsSync(path.join(dir, 'SingletonCookie'))).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('is a no-op when no artifacts exist', () => {
+    const dir = makeTempDir();
+    try {
+      expect(() => {
+        clearChromeSingletonArtifacts(dir);
+      }).not.toThrow();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('clearStaleChromeSingletonLocks', () => {
+  // Skip on Windows where SingletonLock isn't a symlink
+  const itUnix = process.platform === 'win32' ? it.skip : it;
+
+  itUnix('returns false when SingletonLock is absent', () => {
+    const dir = makeTempDir();
+    try {
+      expect(clearStaleChromeSingletonLocks(dir)).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  itUnix('returns false when lock is held by a live process on the same host', () => {
+    const dir = makeTempDir();
+    try {
+      const target = `${os.hostname()}-${String(process.pid)}`;
+      fs.symlinkSync(target, path.join(dir, 'SingletonLock'));
+      expect(clearStaleChromeSingletonLocks(dir, os.hostname())).toBe(false);
+      expect(fs.lstatSync(path.join(dir, 'SingletonLock')).isSymbolicLink()).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  itUnix('clears artifacts when lock pid is dead and warns', () => {
+    const dir = makeTempDir();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const target = `${os.hostname()}-2147483646`;
+      fs.symlinkSync(target, path.join(dir, 'SingletonLock'));
+      fs.writeFileSync(path.join(dir, 'SingletonSocket'), 'x');
+      expect(clearStaleChromeSingletonLocks(dir, os.hostname())).toBe(true);
+      expect(() => fs.lstatSync(path.join(dir, 'SingletonLock'))).toThrow();
+      expect(fs.existsSync(path.join(dir, 'SingletonSocket'))).toBe(false);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('process no longer running'));
+    } finally {
+      warnSpy.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  itUnix('clears a foreign-host lock (cross-host liveness cannot be verified) and warns', () => {
+    const dir = makeTempDir();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const target = `some-other-host-${String(process.pid)}`;
+      fs.symlinkSync(target, path.join(dir, 'SingletonLock'));
+      fs.writeFileSync(path.join(dir, 'SingletonSocket'), 'x');
+      expect(clearStaleChromeSingletonLocks(dir, os.hostname())).toBe(true);
+      expect(() => fs.lstatSync(path.join(dir, 'SingletonLock'))).toThrow();
+      expect(fs.existsSync(path.join(dir, 'SingletonSocket'))).toBe(false);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('lock is from another host'));
+    } finally {
+      warnSpy.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  itUnix('returns false when lock target has unexpected format', () => {
+    const dir = makeTempDir();
+    try {
+      fs.symlinkSync('not-a-valid-target', path.join(dir, 'SingletonLock'));
+      expect(clearStaleChromeSingletonLocks(dir, os.hostname())).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('CHROME_SINGLETON_IN_USE_PATTERN', () => {
+  it('matches the Chromium-branded message', () => {
+    expect(
+      CHROME_SINGLETON_IN_USE_PATTERN.test(
+        'The profile appears to be in use by another Chromium process (123) on another computer (abc).',
+      ),
+    ).toBe(true);
+  });
+
+  it('matches the Google-Chrome-branded message', () => {
+    expect(
+      CHROME_SINGLETON_IN_USE_PATTERN.test(
+        'The profile appears to be in use by another Google Chrome process (123) on another computer (abc).',
+      ),
+    ).toBe(true);
+  });
+
+  it('matches the Microsoft-Edge-branded message', () => {
+    expect(
+      CHROME_SINGLETON_IN_USE_PATTERN.test(
+        'The profile appears to be in use by another Microsoft Edge process (123) on another computer (abc).',
+      ),
+    ).toBe(true);
+  });
+
+  it('does not match unrelated stderr output', () => {
+    expect(
+      CHROME_SINGLETON_IN_USE_PATTERN.test('Failed to create a ProcessSingleton for your profile directory.'),
+    ).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// buildChromeLaunchArgs
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('buildChromeLaunchArgs', () => {
+  const baseOpts = {
+    cdpPort: 9222,
+    userDataDir: '/tmp/test',
+    headless: false,
+    noSandbox: false,
+    ignoreHTTPSErrors: false,
+    ciDefaults: false,
+    platform: 'darwin' as NodeJS.Platform,
+  };
+
+  it('emits the minimum CDP-required args by default', () => {
+    const args = buildChromeLaunchArgs(baseOpts);
+    expect(args).toContain('--remote-debugging-port=9222');
+    expect(args).toContain('--user-data-dir=/tmp/test');
+    expect(args).toContain('--no-first-run');
+    expect(args).toContain('--no-default-browser-check');
+    expect(args).toContain('--disable-blink-features=AutomationControlled');
+    expect(args).toContain('about:blank');
+  });
+
+  it('does NOT include CI-deterministic flags by default (anti-fingerprint)', () => {
+    const args = buildChromeLaunchArgs(baseOpts);
+    expect(args).not.toContain('--disable-sync');
+    expect(args).not.toContain('--disable-background-networking');
+    expect(args).not.toContain('--disable-component-update');
+    expect(args).not.toContain('--disable-features=Translate,MediaRouter');
+  });
+
+  it('adds CI-deterministic flags when ciDefaults: true', () => {
+    const args = buildChromeLaunchArgs({ ...baseOpts, ciDefaults: true });
+    expect(args).toContain('--disable-sync');
+    expect(args).toContain('--disable-background-networking');
+    expect(args).toContain('--disable-component-update');
+    expect(args).toContain('--disable-features=Translate,MediaRouter');
+  });
+
+  it('adds --use-mock-keychain only on darwin with useMockKeychain', () => {
+    expect(buildChromeLaunchArgs({ ...baseOpts, useMockKeychain: true })).toContain('--use-mock-keychain');
+    expect(buildChromeLaunchArgs(baseOpts)).not.toContain('--use-mock-keychain');
+    expect(
+      buildChromeLaunchArgs({ ...baseOpts, platform: 'linux' as NodeJS.Platform, useMockKeychain: true }),
+    ).not.toContain('--use-mock-keychain');
+  });
+
+  it('adds --password-store=basic on every platform (matches OpenClaw; avoids macOS Keychain hang)', () => {
+    for (const platform of ['linux', 'darwin', 'win32'] as const) {
+      expect(buildChromeLaunchArgs({ ...baseOpts, platform })).toContain('--password-store=basic');
+      expect(buildChromeLaunchArgs({ ...baseOpts, platform, ciDefaults: true })).toContain('--password-store=basic');
+    }
+  });
+
+  it('adds --ignore-certificate-errors when ignoreHTTPSErrors: true', () => {
+    expect(buildChromeLaunchArgs({ ...baseOpts, ignoreHTTPSErrors: true })).toContain('--ignore-certificate-errors');
+    expect(buildChromeLaunchArgs(baseOpts)).not.toContain('--ignore-certificate-errors');
+  });
+
+  it('adds --headless=new and --disable-gpu when headless', () => {
+    const args = buildChromeLaunchArgs({ ...baseOpts, headless: true });
+    expect(args).toContain('--headless=new');
+    expect(args).toContain('--disable-gpu');
+  });
+
+  it('adds --no-sandbox when requested', () => {
+    const args = buildChromeLaunchArgs({ ...baseOpts, noSandbox: true });
+    expect(args).toContain('--no-sandbox');
+  });
+
+  it('does NOT add --disable-setuid-sandbox (was redundant with --no-sandbox)', () => {
+    const args = buildChromeLaunchArgs({ ...baseOpts, noSandbox: true });
+    expect(args).not.toContain('--disable-setuid-sandbox');
+  });
+
+  it('adds --disable-dev-shm-usage on linux', () => {
+    const args = buildChromeLaunchArgs({ ...baseOpts, platform: 'linux' });
+    expect(args).toContain('--disable-dev-shm-usage');
+  });
+
+  it('does not add --disable-dev-shm-usage on darwin', () => {
+    const args = buildChromeLaunchArgs({ ...baseOpts, platform: 'darwin' });
+    expect(args).not.toContain('--disable-dev-shm-usage');
+  });
+
+  it('adds --no-proxy-server by default so a managed Chrome ignores caller proxy env', () => {
+    expect(buildChromeLaunchArgs(baseOpts)).toContain('--no-proxy-server');
+  });
+
+  it('skips --no-proxy-server when the caller passed a proxy control arg in chromeArgs', () => {
+    for (const userArg of [
+      '--proxy-server=http://proxy.test:8080',
+      '--proxy-pac-url=http://wpad.test/proxy.pac',
+      '--proxy-auto-detect',
+      '--no-proxy-server',
+    ]) {
+      const args = buildChromeLaunchArgs({ ...baseOpts, chromeArgs: [userArg] });
+      const noProxyDefaults = args.filter((a) => a === '--no-proxy-server');
+      const userPassedNoProxy = userArg === '--no-proxy-server';
+      expect(noProxyDefaults.length).toBe(userPassedNoProxy ? 1 : 0);
+      expect(args).toContain(userArg);
+    }
+  });
+
+  it('appends extra chromeArgs after defaults but before about:blank', () => {
+    const args = buildChromeLaunchArgs({ ...baseOpts, chromeArgs: ['--start-maximized', '--lang=en-US'] });
+    expect(args).toContain('--start-maximized');
+    expect(args).toContain('--lang=en-US');
+    expect(args[args.length - 1]).toBe('about:blank');
+  });
+
+  it('filters non-string and empty chromeArgs entries', () => {
+    const args = buildChromeLaunchArgs({
+      ...baseOpts,
+      chromeArgs: ['--ok', '', '   ', null as unknown as string, '--also-ok'],
+    });
+    expect(args).toContain('--ok');
+    expect(args).toContain('--also-ok');
+    expect(args).not.toContain('');
+    expect(args).not.toContain('   ');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// wipeChromeSessionState
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('wipeChromeSessionState', () => {
+  it('removes Tabs_* and Session_* files but preserves cookies and other data', () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-wipe-'));
+    const sessionsDir = path.join(tmpRoot, 'Default', 'Sessions');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(path.join(sessionsDir, 'Tabs_1700000000000'), 'tabs');
+    fs.writeFileSync(path.join(sessionsDir, 'Session_1700000000000'), 'session');
+    fs.writeFileSync(path.join(sessionsDir, 'Cookies'), 'cookies');
+    fs.writeFileSync(path.join(tmpRoot, 'Default', 'Preferences'), '{}');
+
+    wipeChromeSessionState(tmpRoot);
+
+    expect(fs.existsSync(path.join(sessionsDir, 'Tabs_1700000000000'))).toBe(false);
+    expect(fs.existsSync(path.join(sessionsDir, 'Session_1700000000000'))).toBe(false);
+    expect(fs.existsSync(path.join(sessionsDir, 'Cookies'))).toBe(true);
+    expect(fs.existsSync(path.join(tmpRoot, 'Default', 'Preferences'))).toBe(true);
+
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it('does not throw when Sessions dir does not exist', () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-wipe-'));
+    expect(() => {
+      wipeChromeSessionState(tmpRoot);
+    }).not.toThrow();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// reserveFreePortFromList
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('reserveFreePortFromList', () => {
+  it('does not select a port occupied only on the IPv4 CDP address', async () => {
+    const net = await import('node:net');
+    const blocker = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      blocker.once('error', reject).listen(0, '127.0.0.1', resolve);
+    });
+    const address = blocker.address();
+    if (address === null || typeof address === 'string') {
+      throw new Error('Expected an ephemeral TCP port');
+    }
+    try {
+      await expect(reserveFreePortFromList([address.port])).rejects.toThrow(/No free port/);
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        blocker.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+    }
+  });
+
+  it('returns the first free port from the candidate list', async () => {
+    const start = 39000 + Math.floor(Math.random() * 1000);
+    const candidates = [start, start + 1, start + 2];
+    const port = await reserveFreePortFromList(candidates);
+    expect(candidates).toContain(port);
+  });
+
+  it('skips a held port and returns the next free candidate', async () => {
+    const net = await import('node:net');
+    const start = 39000 + Math.floor(Math.random() * 1000);
+    const blocker = await new Promise<Net.Server>((resolve, reject) => {
+      const s = net
+        .createServer()
+        .once('error', reject)
+        .once('listening', () => {
+          resolve(s);
+        })
+        .listen(start, '127.0.0.1');
+    });
+    try {
+      const port = await reserveFreePortFromList([start, start + 1]);
+      expect(port).toBe(start + 1);
+    } finally {
+      await new Promise<void>((resolve) => {
+        blocker.close(() => {
+          resolve();
+        });
+      });
+    }
+  });
+
+  it('throws when no candidate is free', async () => {
+    const net = await import('node:net');
+    const start = 39000 + Math.floor(Math.random() * 1000);
+    const blocker = await new Promise<Net.Server>((resolve, reject) => {
+      const s = net
+        .createServer()
+        .once('error', reject)
+        .once('listening', () => {
+          resolve(s);
+        })
+        .listen(start, '127.0.0.1');
+    });
+    try {
+      await expect(reserveFreePortFromList([start])).rejects.toThrow(/No free port/);
+    } finally {
+      await new Promise<void>((resolve) => {
+        blocker.close(() => {
+          resolve();
+        });
+      });
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// activateMacOsWindowByPid
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('activateMacOsWindowByPid', () => {
+  beforeEach(() => {
+    execFileMock.mockReset();
+  });
+
+  it('invokes osascript with frontmost-by-pid for the given numeric pid', async () => {
+    await activateMacOsWindowByPid(12345);
+    expect(execFileMock).toHaveBeenCalledTimes(1);
+    const call = execFileMock.mock.calls[0] as [string, string[]] | undefined;
+    expect(call?.[0]).toBe('osascript');
+    expect(call?.[1][0]).toBe('-e');
+    expect(call?.[1][1]).toContain('System Events');
+    expect(call?.[1][1]).toContain('unix id is 12345');
+    expect(call?.[1][1]).toContain('set frontmost');
+  });
+
+  it('does not throw when execFile errors (best-effort contract)', async () => {
+    execFileMock.mockImplementationOnce(() => {
+      throw new Error('osascript not found');
+    });
+    await expect(activateMacOsWindowByPid(99)).resolves.toBeUndefined();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// readJsonResponseBounded
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('readJsonResponseBounded', () => {
+  it('parses a JSON body within the limit', async () => {
+    await expect(readJsonResponseBounded(new Response('{"a":1}'), 'test')).resolves.toEqual({ a: 1 });
+  });
+
+  it.each([true, false])('rejects malformed UTF-8 (stream=%s)', async (stream) => {
+    const bytes = new Uint8Array([34, 128, 34]);
+    const response = stream
+      ? new Response(bytes)
+      : ({ body: undefined, arrayBuffer: () => Promise.resolve(bytes.buffer) } as unknown as Response);
+    await expect(readJsonResponseBounded(response, 'test')).rejects.toThrow('test: malformed JSON response');
+  });
+
+  it('control: preserves valid multibyte characters', async () => {
+    await expect(readJsonResponseBounded(new Response('{"title":"頁面🙂"}'), 'test')).resolves.toEqual({
+      title: '頁面🙂',
+    });
+  });
+
+  it('rejects a body that exceeds the byte limit', async () => {
+    const res = new Response(`"${'x'.repeat(64)}"`);
+    await expect(readJsonResponseBounded(res, 'test', 16)).rejects.toThrow('test: JSON response exceeds 16 bytes');
+  });
+
+  it('rejects malformed JSON with a labeled error', async () => {
+    await expect(readJsonResponseBounded(new Response('{oops'), 'test')).rejects.toThrow(
+      'test: malformed JSON response',
+    );
+  });
+
+  it('reads via arrayBuffer when the response has no stream body', async () => {
+    const bytes = new TextEncoder().encode('[1,2,3]');
+    const res = { body: undefined, arrayBuffer: () => Promise.resolve(bytes.buffer) } as unknown as Response;
+    await expect(readJsonResponseBounded(res, 'test')).resolves.toEqual([1, 2, 3]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// getChromeWebSocketUrl — credential-bearing endpoints
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('getChromeWebSocketUrl with URL credentials', () => {
+  it('moves URL credentials into a Basic Authorization header and never fetches a credentialed URL', async () => {
+    const fetchMock = vi
+      .spyOn(cdpNetwork, 'fetchCdpJson')
+      .mockResolvedValue({ webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/browser/abc' });
+    try {
+      const wsUrl = await getChromeWebSocketUrl('http://user:p%40ss@127.0.0.1:9222', 500);
+      expect(wsUrl).toContain('/devtools/browser/abc');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [fetchedUrl, init] = fetchMock.mock.calls[0] as [string, { headers: Record<string, string> }];
+      expect(fetchedUrl).toBe('http://127.0.0.1:9222/json/version');
+      expect(init.headers.Authorization).toBe(`Basic ${Buffer.from('user:p@ss').toString('base64')}`);
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it('retries /json/version/ when a credentialed endpoint exposes no WebSocket URL', async () => {
+    const fetchMock = vi
+      .spyOn(cdpNetwork, 'fetchCdpJson')
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({ webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/browser/xyz' });
+    try {
+      const wsUrl = await getChromeWebSocketUrl('http://user:pass@127.0.0.1:9222', 500);
+      expect(wsUrl).toContain('/devtools/browser/xyz');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const secondUrl = fetchMock.mock.calls[1][0];
+      expect(secondUrl).toBe('http://127.0.0.1:9222/json/version/');
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it('retries /json/version/ for a bearer-authenticated endpoint that exposes no WebSocket URL', async () => {
+    const fetchMock = vi
+      .spyOn(cdpNetwork, 'fetchCdpJson')
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({ webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/browser/bearer' });
+    try {
+      const wsUrl = await getChromeWebSocketUrl('http://127.0.0.1:9222', 500, 'tok3n');
+      expect(wsUrl).toContain('/devtools/browser/bearer');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const [secondUrl, init] = fetchMock.mock.calls[1] as [string, { headers: Record<string, string> }];
+      expect(secondUrl).toBe('http://127.0.0.1:9222/json/version/');
+      expect(init.headers.Authorization).toBe('Bearer tok3n');
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it('does not retry the trailing-slash form for credential-free endpoints', async () => {
+    const fetchMock = vi.spyOn(cdpNetwork, 'fetchCdpJson').mockResolvedValue({});
+    try {
+      await getChromeWebSocketUrl('http://127.0.0.1:9222', 500);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [, init] = fetchMock.mock.calls[0] as [string, { headers: Record<string, string> }];
+      expect(init.headers.Authorization).toBeUndefined();
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// proxy-routed CDP URL registry
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('proxy-routed CDP URL registry', () => {
+  it('marks, reports, and clears a proxy-routed cdpUrl (normalizing trailing slash/case)', () => {
+    const url = 'http://127.0.0.1:9222';
+    expect(isCdpUrlProxyRouted(url)).toBe(false);
+    markCdpUrlProxyRouted(url);
+    expect(isCdpUrlProxyRouted(url)).toBe(true);
+    // normalization: trailing slash + case are ignored
+    expect(isCdpUrlProxyRouted('http://127.0.0.1:9222/')).toBe(true);
+    expect(isCdpUrlProxyRouted('HTTP://127.0.0.1:9222')).toBe(true);
+    clearCdpUrlProxyRouted(url);
+    expect(isCdpUrlProxyRouted(url)).toBe(false);
+  });
+
+  it('keeps distinct ports separate', () => {
+    markCdpUrlProxyRouted('http://127.0.0.1:9333');
+    expect(isCdpUrlProxyRouted('http://127.0.0.1:9333')).toBe(true);
+    expect(isCdpUrlProxyRouted('http://127.0.0.1:9334')).toBe(false);
+    clearCdpUrlProxyRouted('http://127.0.0.1:9333');
+  });
+});
