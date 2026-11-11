@@ -1,0 +1,416 @@
+OPENSHIELD FRONTEND API ENDPOINT REFERENCE
+Last verified: 2026-08-18
+Finding severity source: contracts/severity.v1.json
+
+This file describes the API contract used by the React frontend. The source of
+truth is the implementation in frontend/src/utils/api.js,
+frontend/src/utils/aiApi.js, api/app.py, and api/routes/.
+
+
+BASE URL
+========
+
+Set VITE_API_URL to the API origin, without a trailing /api path.
+
+  Direct Flask default:       http://localhost:5000
+  Local Compose profile:      http://localhost:8000
+  Production fallback:        https://openshield-api.onrender.com
+  Example override:           VITE_API_URL=https://api.example.com
+
+The frontend appends /api for application endpoints and calls /health directly.
+The Flask development server also defaults to port 5000 through PORT.
+
+
+AUTHENTICATION
+==============
+
+Default behavior
+----------------
+
+Every route except the always-public routes below requires a valid JWT:
+
+  Authorization: Bearer <jwt>
+
+The API verifies it according to OPENSHIELD_AUTH_MODE: HS256 with JWT_SECRET
+(shared_secret, default) or the identity provider's JWKS (oidc). The frontend
+holds the token in memory only (api.setToken); it never reads a build-time
+token and never stores one in localStorage (issue #294).
+
+Always public:
+
+  GET /                 API metadata
+  GET /health           process liveness
+  GET /ready            database readiness
+  GET /metrics          observability metrics
+  OPTIONS *             CORS preflight
+
+Public demo behavior
+--------------------
+
+When the API is started with OPENSHIELD_PUBLIC_DEMO=true, unauthenticated GET
+requests are allowed. POST requests, including scan triggers and every AI
+request, still require a valid JWT. Do not enable this setting for deployments
+that contain real Azure scan data.
+
+OPENSHIELD_PUBLIC_DEMO is a backend read-only access mode. The current frontend
+does not have a Demo/Live data toggle, does not load frontend mock-data files,
+and does not fall back to mock security data when the backend is unavailable.
+
+
+COMMON REQUEST AND ERROR RULES
+==============================
+
+JSON request bodies use Content-Type: application/json. Request bodies are
+limited to 2 MiB. Validation failures return 400, missing or invalid auth
+returns 401, unknown resources return 404, and unexpected server failures
+return a safe JSON error response. Error responses generally have this shape:
+
+  { "error": "<safe message>", "request_id": "<request id when available>" }
+
+
+FRONTEND-CONSUMED ENDPOINTS
+===========================
+
+Method  Path                                  Frontend use
+------  ------------------------------------  ---------------------------------
+GET     /health                               Header connection indicator
+GET     /api/score                            Monitoring security score
+GET     /api/score/cve-summary                CVE summary and AI CVE panel
+GET     /api/findings                         Scan, monitoring, discovery, AI
+GET     /api/findings/<finding_id>            Exposed by the API service layer
+GET     /api/findings/<finding_id>/playbook   Detailed Scan remediation content
+GET     /api/scans                            Monitoring and scan history
+GET     /api/scans/<scan_id>                  Scan status polling
+POST    /api/scans/trigger                    Start a scan
+GET     /api/resources                        Discovery inventory
+GET     /api/prioritization                   Prioritization page
+GET     /api/drift                            Drift page
+GET     /api/compliance/<framework>           Compliance page
+POST    /api/ai/ask                           AI question and answer
+POST    /api/ai/summary                       AI executive summary
+POST    /api/ai/insights                      AI insights/remediation plan
+POST    /api/ai/prioritise                    AI-ranked findings
+
+There is no GET /api/monitoring endpoint. The Monitoring page composes its data
+from GET /api/score, GET /api/findings, and GET /api/scans.
+
+
+HEALTH
+======
+
+GET /health
+
+Authentication: always public.
+Response:
+
+  { "status": "ok" }
+
+
+SCORE AND CVE SUMMARY
+=====================
+
+GET /api/score
+
+Response (a completed scan exists)
+────────
+  {
+    "status": "OK",
+    "score": 68,
+    "max_score": 100
+  }
+
+Response (no completed scan yet — never a false 100)
+────────
+  {
+    "status": "NO_SCAN_DATA",
+    "score": null,
+    "max_score": 100,
+    "message": "No completed scan is available yet, so there is no security posture to score."
+  }
+
+A null score must be rendered as "not assessed", never coerced to 0.
+
+GET /api/score/cve-summary
+
+Returns CVE enrichment status and summary values for the latest completed scan:
+
+  {
+    "status": "COMPLETED",
+    "total_findings": 12,
+    "exploit_count": 2,
+    "max_cvss_score": 9.8,
+    "avg_cvss_score": 6.42,
+    "critical_cve_count": 1
+  }
+
+When no completed scan exists, status is UNKNOWN, counts are zero, and score
+values are null.
+
+
+FINDINGS AND PLAYBOOKS
+======================
+
+GET /api/findings
+
+Supported query parameters (each may appear at most once):
+
+  severity   CRITICAL, HIGH, MEDIUM, LOW, or INFO
+  category   A supported rule category
+  rule_id    A rule ID such as AZ-STOR-001
+  scan_id    Canonical scan UUID
+
+Unknown, repeated, or invalid query parameters return 400. This endpoint does
+not currently support limit or offset pagination parameters.
+
+Response:
+
+  {
+    "count": 1,
+    "findings": [
+      {
+        "id": 42,
+        "scan_id": "<uuid>",
+        "rule_id": "AZ-STOR-001",
+        "rule_name": "Public Blob Access Enabled",
+        "severity": "HIGH",
+        "category": "Storage",
+        "resource_id": "<Azure resource ID>",
+        "resource_name": "example-storage",
+        "resource_type": "Microsoft.Storage/storageAccounts",
+        "description": "...",
+        "remediation": "...",
+        "detected_at": "<ISO-8601 timestamp>"
+      }
+    ]
+  }
+
+Finding records may also contain CVE, framework, metadata, and playbook fields
+persisted by the scanner.
+
+GET /api/findings/<finding_id>
+
+finding_id is a positive integer. Returns one finding record, or 404 with
+{ "error": "Finding not found" }.
+
+GET /api/findings/<finding_id>/playbook
+
+The backend looks up the finding, loads the matching script from playbooks/cli,
+and returns structured remediation content:
+
+  {
+    "portal_steps": ["..."],
+    "cli_commands": ["..."],
+    "validation_steps": ["..."],
+    "references": ["..."]
+  }
+
+The frontend does not enrich findings from a mock scan.json file.
+
+
+SCANS
+=====
+
+GET /api/scans
+
+Returns a JSON array containing at most the 100 most recent scan records. Common
+fields include scan_id, subscription_id, status, started_at, completed_at,
+total_findings, score, error_message, and cve_enrichment_status.
+
+GET /api/scans/<scan_id>
+
+scan_id must be a canonical UUID. Returns the scan record, or 404 when absent.
+
+POST /api/scans/trigger
+
+Requires JWT even in public-demo mode. Accepts an optional JSON object:
+
+  { "subscription_id": "<uuid>" }
+
+If subscription_id is omitted, the API uses AZURE_SUBSCRIPTION_ID. If neither
+is available, it returns 400. A successful request returns 202 immediately:
+
+  {
+    "scan_id": "<uuid>",
+    "status": "pending",
+    "message": "Scan has been queued and will start shortly."
+  }
+
+Poll GET /api/scans/<scan_id> for status. The frontend does not automatically
+retry this state-changing request.
+
+
+RESOURCES
+=========
+
+GET /api/resources
+
+Returns unique Azure resources derived from findings in the latest scan that
+has findings. The highest finding severity becomes each resource's risk value.
+
+  {
+    "summary": {
+      "total": 1,
+      "by_category": { "Storage": 1 },
+      "by_risk_level": { "CRITICAL": 0, "HIGH": 1, "MEDIUM": 0, "LOW": 0, "INFO": 0, "NONE": 0 },
+      "last_scan_at": "<ISO-8601 timestamp>"
+    },
+    "resources": [
+      {
+        "id": "<Azure resource ID>",
+        "name": "example-storage",
+        "type": "Microsoft.Storage/storageAccounts",
+        "category": "Storage",
+        "resource_group": "example-rg",
+        "subscription_id": "<uuid>",
+        "location": "",
+        "risk": "HIGH",
+        "discovered_at": "<ISO-8601 timestamp>",
+        "config": {}
+      }
+    ]
+  }
+
+With no qualifying scan, summary counts are empty/zero and resources is [].
+
+
+PRIORITIZATION
+==============
+
+GET /api/prioritization
+
+Groups findings from the latest scan by rule and ranks them using severity and
+affected-resource count. Response keys are:
+
+  matrix        Entries with id, rule_id, name, risk, effort, category,
+                severity, affected_resources, and resource.
+  rankings      Up to 25 entries with rank, rule_id, name, score, severity,
+                category, effort, impact, and resource.
+  action_items  Up to 10 entries with id, action, impact, effort, eta, rule_id,
+                and resource.
+  summary       Finding counts, recommended action count, estimated fix time,
+                and top priority.
+
+With no scan containing findings, the three lists and summary are empty.
+
+
+DRIFT
+=====
+
+GET /api/drift
+
+Compares the two most recent scans that contain findings. ADDED means a
+(rule_id, resource_id) pair exists only in the latest scan; REMOVED means it
+exists only in the previous scan. The current implementation reports modified
+as zero.
+
+  {
+    "summary": {
+      "total": 1,
+      "added": 1,
+      "removed": 0,
+      "modified": 0,
+      "last_checked": "<ISO-8601 timestamp>"
+    },
+    "events": [
+      {
+        "id": 1,
+        "type": "ADDED",
+        "severity": "HIGH",
+        "resource_name": "example-nsg",
+        "resource_type": "Microsoft.Network/networkSecurityGroups",
+        "resource_group": "example-rg",
+        "field": "security_policy",
+        "old_value": null,
+        "new_value": "HIGH",
+        "changed_by": "azure-policy-scan",
+        "changed_at": "<ISO-8601 timestamp>",
+        "rule_violated": "AZ-NET-001"
+      }
+    ]
+  }
+
+With fewer than two qualifying scans, events is [] and summary counts are zero.
+
+
+COMPLIANCE
+==========
+
+GET /api/compliance/<framework>
+
+Supported framework values:
+
+  cis, nist, iso27001, soc2, ncsc_pqc, enisa_pqc
+
+The current Compliance page requests cis, nist, iso27001, and soc2. A response
+contains framework, version, total_controls, passed, failed, score_percent,
+reviewed_controls, unreviewed_controls, and a controls array. Any control whose
+review_status is not reviewed is returned as UNREVIEWED_MAPPING and excluded
+from the direct-evidence score denominator, regardless of mapping_type.
+not_applicable and organizational controls are also excluded. When every
+mapping awaits review, status is NO_REVIEWED_CONTROLS and score_percent is null;
+the UI renders “Mapping review pending” rather than a percentage.
+
+An unsupported framework returns 400 and a supported-values list.
+
+
+AI REQUESTS
+===========
+
+All AI endpoints are POST requests and require JWT, including in public-demo
+mode. They also require bring-your-own provider credentials in the JSON body.
+Common fields are:
+
+  provider   Supported provider identifier (required)
+  api_key    Provider API key (required)
+  model      Provider model override (optional)
+  findings   Current finding objects (optional or required by the operation)
+  question   User question (required by /ask; optional for /insights)
+
+POST /api/ai/ask
+  Requires question. Returns answer, sources, provider, and model.
+
+POST /api/ai/summary
+  Accepts findings. Returns summary, sources, provider, and model.
+
+POST /api/ai/insights
+  Requires findings. Returns executive_summary and remediation_plan, plus
+  answer when question was supplied.
+
+POST /api/ai/prioritise
+  Accepts findings. Returns prioritised_findings, sources, provider, and model.
+
+The implemented question endpoint is /api/ai/ask, not /api/ai/chat. AI summary
+is POST, not GET. CVE dashboard data comes from GET /api/score/cve-summary;
+there is no GET /api/ai/cve-analysis route.
+
+
+OTHER REGISTERED BACKEND ROUTES
+===============================
+
+These routes are implemented and registered but are not called by the current
+frontend API utilities:
+
+Method  Path
+------  ------------------------------------------
+POST    /api/scans/<scan_id>/enrich
+POST    /api/ai/threat-simulation
+GET     /api/assurance/physical-layer
+GET     /api/assurance/data-link-layer
+GET     /api/assurance/network-layer
+GET     /api/cbom
+GET     /api/cbom/summary
+GET     /api/cbom/migration-roadmap
+
+They follow the same authentication rule: GET is JWT-protected by default and
+becomes unauthenticated only with OPENSHIELD_PUBLIC_DEMO=true; POST always
+requires JWT. Consult the matching module under api/routes/ for specialized
+request and response details.
+
+
+IMPLEMENTATION STATUS
+=====================
+
+All frontend-consumed endpoints listed in this file are implemented and
+registered. Resources, prioritization, drift, finding playbooks, and the AI
+routes are not deferred. The frontend uses backend responses only; it does not
+silently substitute mock posture data when a request fails.

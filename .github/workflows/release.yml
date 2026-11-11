@@ -1,0 +1,106 @@
+name: Signed Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: signed-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.verify.outputs.release_tag }}
+      release_commit: ${{ steps.verify.outputs.release_commit }}
+      tag_object: ${{ steps.verify.outputs.tag_object }}
+    env:
+      TAG: ${{ github.ref_name }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout signed tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify signed tag and main ancestry
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release_integrity.py verify
+
+      - name: Install Syft
+        env:
+          SYFT_VERSION: "1.46.0"
+          SYFT_SHA256: d654f678b709eb53c393d38519d5ed7d2e57205529404018614cfefa0fb2b5ca
+        run: |
+          set -euo pipefail
+          archive="syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location \
+            --output "$archive" \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/${archive}"
+          echo "${SYFT_SHA256}  ${archive}" | sha256sum --check --strict
+          sudo tar --extract --gzip --file "$archive" --directory /usr/local/bin syft
+
+      - name: Build deterministic release artifacts
+        env:
+          RELEASE_COMMIT: ${{ steps.verify.outputs.release_commit }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          syft dir:. --source-name openshield --source-version "$TAG" \
+            -o "cyclonedx-json=dist/openshield-${TAG}-sbom.cyclonedx.json"
+          git archive --format=tar --prefix="openshield-${TAG}/" "$RELEASE_COMMIT" | \
+            gzip --no-name > "dist/openshield-${TAG}.tar.gz"
+          cd dist
+          sha256sum "openshield-${TAG}.tar.gz" "openshield-${TAG}-sbom.cyclonedx.json" > SHA256SUMS
+
+      - name: Attest source archive
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/openshield-${{ env.TAG }}.tar.gz
+
+      - name: Attest SBOM
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/openshield-${{ env.TAG }}-sbom.cyclonedx.json
+
+      - name: Attest checksum manifest
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/SHA256SUMS
+
+      - name: Reverify source before release publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ steps.verify.outputs.release_commit }}
+          EXPECTED_TAG_OBJECT: ${{ steps.verify.outputs.tag_object }}
+        run: python3 scripts/release_integrity.py verify
+
+      - name: Publish release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          generate_release_notes: true
+          make_latest: true
+          files: dist/*
+
+  container:
+    needs: release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/docker.yml
+    with:
+      release_tag: ${{ needs.release.outputs.release_tag }}
+      release_commit: ${{ needs.release.outputs.release_commit }}
+      tag_object: ${{ needs.release.outputs.tag_object }}

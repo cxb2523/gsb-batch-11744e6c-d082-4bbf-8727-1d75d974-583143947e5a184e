@@ -1,0 +1,699 @@
+# API Reference
+
+The OpenShield API is a Flask app registered in `api/app.py`. By default, every
+`/api/*` route requires an `Authorization: Bearer <jwt>` header; only the
+explicitly listed health and observability endpoints are public. Read-only API
+routes become public only when the deliberate demo-mode setting is enabled.
+
+## Authentication
+
+`/`, `/health`, `/ready`, and `/metrics` are always public. All other routes — including all `/api/*` GET endpoints — require an `Authorization: Bearer <jwt>` header, verified by `api/auth.py` according to `OPENSHIELD_AUTH_MODE`:
+
+| Mode | Verification | Role source | Intended for |
+|---|---|---|---|
+| `shared_secret` (default) | HS256 with `JWT_SECRET`; `exp` and `sub` required; `iss`/`aud` checked when `JWT_ISSUER`/`JWT_AUDIENCE` are set | `role` claim | Local development, CI smoke tests |
+| `oidc` | Asymmetric signature (default `RS256`) against `OIDC_JWKS_URL`; `iss`=`OIDC_ISSUER`, `aud`=`OIDC_AUDIENCE`, `exp`, `iat`, `sub` required; `tid` must be in `OIDC_ALLOWED_TENANTS` when set | IdP-assigned app roles (`OIDC_ROLE_CLAIM`, default `roles`) mapped by `OIDC_ROLE_MAP` | Enterprise deployments |
+
+Every accepted token resolves to one of `viewer`, `operator`, or `admin`:
+
+- `exp` is always required; a token with no expiry is rejected.
+- In `shared_secret` mode a missing or unrecognized `role` is rejected with `401`.
+- In `oidc` mode a valid identity with no mapped OpenShield app role is rejected with `403`, and a self-asserted `role` claim is ignored. HS256 and unsigned tokens are refused, so a token minted with `JWT_SECRET` can never pass as an IdP token. If the JWKS endpoint cannot be reached the API fails closed with `503`.
+- `OPENSHIELD_AUTH_MODE=oidc` with a missing `OIDC_ISSUER`, `OIDC_AUDIENCE` or `OIDC_JWKS_URL`, a non-HTTPS JWKS URL, or a symmetric algorithm stops the API at startup.
+
+`viewer` is read-only: any non-`GET`/`HEAD` request (scan trigger, AI endpoints) from a `viewer` token is rejected with `403`, regardless of demo mode. Only `operator` and `admin` may perform a write. This is enforced in `api/app.py`'s middleware, not per-route, so it applies uniformly to every current and future write endpoint.
+
+The dashboard never embeds a token (see [authentication and containment](security/authentication.md)). `scripts/generate_demo_jwt.py` mints a short-lived `viewer` token for local API calls in `shared_secret` mode only.
+
+### Subscription authorization
+
+`POST /api/scans/trigger` also checks `subscription_id` against `OPENSHIELD_AUTHORIZED_SUBSCRIPTIONS`, a comma-separated allowlist. A valid `operator`/`admin` token can otherwise trigger a scan against *any* subscription_id — role alone doesn't say which subscription a caller is entitled to. Left unset, every subscription_id is accepted (matches historical behavior); the API logs a loud startup warning when it's unset. This is a single-tenant containment boundary, not a substitute for real per-tenant authorization — see issue #294 for the remaining tenant-ownership scope this is a stopgap for.
+
+## Input limits
+
+- Request bodies are limited to 2 MiB.
+- Scan and subscription identifiers use canonical UUID format.
+- Finding filters accept only `severity`, `category`, `rule_id`, and `scan_id`;
+  unknown or repeated parameters return `400`.
+- AI routes accept a supported provider, an API key of at most 4,096 characters,
+  an optional model identifier of at most 128 characters, questions of at most
+  4,000 characters, and at most 1,000 finding objects.
+- Full boundary details are maintained in `docs/input-validation-audit.md`.
+
+### Public demo mode
+
+Set `OPENSHIELD_PUBLIC_DEMO=true` to allow unauthenticated GET requests to `/api/*`. This is intended for local development and public demo dashboards where the data is not sensitive. POST endpoints (scan trigger, AI) always require a valid JWT regardless of this setting.
+
+| Environment variable | Value | GET /api/* behavior |
+|---|---|---|
+| `OPENSHIELD_PUBLIC_DEMO` | not set or `false` | JWT required (default) |
+| `OPENSHIELD_PUBLIC_DEMO` | `true` | public, no JWT needed |
+
+Do not enable `OPENSHIELD_PUBLIC_DEMO` in a deployment that holds real Azure scan data.
+---
+
+## GET /health
+
+Health check for the API process.
+
+Query parameters: none
+
+Example response:
+
+```json
+{
+  "status": "ok"
+}
+```
+
+---
+
+## GET /api/findings
+
+Returns findings, optionally filtered by severity, category, rule ID, or scan ID.
+
+Query parameters:
+
+| Name | Description |
+|---|---|
+| `severity` | `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, or `INFO` (`INFORMATIONAL` is normalized to `INFO`) |
+| `category` | Rule category, such as `Storage`, `Network`, `Identity`, `Database`, `Compute`, or `Key Vault` |
+| `rule_id` | Rule ID, such as `AZ-STOR-001` |
+| `scan_id` | UUID of a specific scan |
+
+Example response:
+
+```json
+{
+  "count": 1,
+  "findings": [
+    {
+      "id": 42,
+      "scan_id": "6f4a08ac-7d3a-4d9a-a4b4-2a26e5f63c8a",
+      "rule_id": "AZ-STOR-001",
+      "rule_name": "Public Blob Access Enabled on Storage Account",
+      "severity": "HIGH",
+      "category": "Storage",
+      "resource_id": "/subscriptions/example/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/example",
+      "resource_name": "example",
+      "resource_type": "Microsoft.Storage/storageAccounts",
+      "description": "Storage accounts with public blob access enabled allow unauthenticated read access to blob data over the internet.",
+      "remediation": "Disable public blob access on the storage account.",
+      "playbook": "playbooks/cli/fix_az_stor_001.sh",
+      "frameworks": {
+        "CIS": "3.5",
+        "NIST": "PR.AC-3",
+        "ISO27001": "A.8.3"
+      },
+      "metadata": {},
+      "detected_at": "2026-05-09T12:00:00Z"
+    }
+  ]
+}
+```
+
+---
+
+## GET /api/findings/&lt;finding_id&gt;
+
+Returns one finding by integer ID.
+
+Query parameters: none
+
+Example response:
+
+```json
+{
+  "id": 42,
+  "scan_id": "6f4a08ac-7d3a-4d9a-a4b4-2a26e5f63c8a",
+  "rule_id": "AZ-STOR-001",
+  "rule_name": "Public Blob Access Enabled on Storage Account",
+  "severity": "HIGH",
+  "category": "Storage",
+  "resource_id": "/subscriptions/example/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/example",
+  "resource_name": "example",
+  "resource_type": "Microsoft.Storage/storageAccounts",
+  "description": "Storage accounts with public blob access enabled allow unauthenticated read access to blob data over the internet.",
+  "remediation": "Disable public blob access on the storage account.",
+  "playbook": "playbooks/cli/fix_az_stor_001.sh",
+  "frameworks": {
+    "CIS": "3.5",
+    "NIST": "PR.AC-3",
+    "ISO27001": "A.8.3"
+  },
+  "metadata": {},
+  "detected_at": "2026-05-09T12:00:00Z"
+}
+```
+
+Not found response:
+
+```json
+{
+  "error": "Finding not found"
+}
+```
+
+---
+
+## GET /api/scans
+
+Returns historical scan records ordered by most recent first.
+
+Query parameters: none
+
+Example response:
+
+```json
+{
+  "count": 1,
+  "scans": [
+    {
+      "scan_id": "6f4a08ac-7d3a-4d9a-a4b4-2a26e5f63c8a",
+      "subscription_id": "00000000-0000-0000-0000-000000000000",
+      "started_at": "2026-05-09T12:00:00Z",
+      "completed_at": "2026-05-09T12:02:00Z",
+      "total_findings": 3
+    }
+  ]
+}
+```
+
+---
+
+## GET /api/scans/&lt;scan_id&gt;
+
+Returns the details and current status of a specific scan.
+
+Path parameters: `scan_id` — UUID of the scan.
+
+Example response:
+
+```json
+{
+  "scan_id": "6f4a08ac-7d3a-4d9a-a4b4-2a26e5f63c8a",
+  "subscription_id": "00000000-0000-0000-0000-000000000000",
+  "status": "completed",
+  "started_at": "2026-05-09T12:00:00Z",
+  "completed_at": "2026-05-09T12:02:00Z",
+  "total_findings": 3,
+  "score": 85,
+  "error_message": null
+}
+```
+
+---
+
+## POST /api/scans/trigger
+
+Admits an asynchronous scan against the configured subscription. Execution happens in a background worker process; the response returns as soon as the scan is durably recorded.
+
+Request body (optional — falls back to `AZURE_SUBSCRIPTION_ID`):
+
+```json
+{
+  "subscription_id": "00000000-0000-0000-0000-000000000000"
+}
+```
+
+### Admission semantics
+
+Admission is serialized per subscription and enforced by the database, so concurrent and replayed triggers converge on one logical scan rather than creating duplicates:
+
+- **At most one active scan per subscription.** While a `pending` or `running` scan exists, a further trigger returns that existing scan instead of queueing another.
+- **`Idempotency-Key` (optional request header, 1–200 characters).** A repeat of the same key for the same subscription returns the original scan. The key is scoped to the subscription; the same key under a different subscription is a different request. A trigger carries no request input other than `subscription_id`, so a key that resolves to an existing scan is always a replay of the same logical request and there is no changed-payload conflict to report.
+- **`OPENSHIELD_MAX_SCANS_PER_SUBSCRIPTION_PER_HOUR`** adds an optional hourly admission quota. Unset or `0` (the default) applies no time-window limit; the one-active-scan rule still applies.
+
+### Responses
+
+| Status | When | Body |
+| --- | --- | --- |
+| `202 Accepted` | A new scan was admitted and queued. | `scan_id`, `status: "pending"`, `message` |
+| `200 OK` | The request resolved to an existing logical scan — an `Idempotency-Key` replay of the same request, or a trigger while a scan is already active for the subscription. | `scan_id`, `status` (the existing scan's `pending`/`running`), `message: "Existing logical scan returned."` |
+| `400 Bad Request` | Malformed body, invalid `subscription_id`, missing subscription, or an `Idempotency-Key` outside 1–200 characters. | `error` |
+| `403 Forbidden` | `subscription_id` is not on the `OPENSHIELD_AUTHORIZED_SUBSCRIPTIONS` allowlist. | `error` |
+| `429 Too Many Requests` | The configured hourly quota for this subscription is exhausted. | `error: "Scan quota exceeded for this subscription."` |
+
+New scan (`202`):
+
+```json
+{
+  "scan_id": "6f4a08ac-7d3a-4d9a-a4b4-2a26e5f63c8a",
+  "status": "pending",
+  "message": "Scan has been queued and will start shortly."
+}
+```
+
+Replay or already-active scan (`200`):
+
+```json
+{
+  "scan_id": "6f4a08ac-7d3a-4d9a-a4b4-2a26e5f63c8a",
+  "status": "running",
+  "message": "Existing logical scan returned."
+}
+```
+
+Missing subscription response (`400`):
+
+```json
+{
+  "error": "subscription_id is required"
+}
+```
+
+---
+
+## POST /api/scans/&lt;scan_id&gt;/enrich
+
+Queues durable CVE enrichment for a completed scan's findings. Enrichment runs as a database-backed job claimed by the background worker — the request never owns a thread, so the work survives an API restart.
+
+There is **never more than one enrichment job per scan**. Repeat calls are safe: they report the state of the single job rather than creating another.
+
+### Responses
+
+Every response carries `scan_id`, `job_id`, `status` (the job row's state) and an `outcome` naming what this call did:
+
+| Status | `outcome` | When |
+| --- | --- | --- |
+| `202 Accepted` | `created` | No job existed; one was queued. |
+| `202 Accepted` | `requeued` | A previously **failed** job was reset to `pending` and will be retried. |
+| `202 Accepted` | `active` | A `pending` or `running` job already exists and was returned unchanged. A live claim is never interrupted. |
+| `200 OK` | `completed` | Enrichment already finished; nothing was restarted. |
+| `404 Not Found` | — | Unknown `scan_id`, or the scan has no findings to enrich and has not already been enriched. |
+
+An already-enriched scan always reports `completed`, including a clean scan that had no findings to enrich in the first place.
+
+A job that exhausts its retry budget becomes `failed`. Re-POSTing this endpoint is the supported operator recovery: it atomically returns the job to `pending` with a fresh retry budget, clears the lease, and keeps the last `error_message` and the `checkpoint` so the retry resumes rather than re-enriching findings that already succeeded. Concurrent re-POSTs converge — exactly one reports `requeued` and the rest report `active`.
+
+Newly queued (`202`):
+
+```json
+{
+  "scan_id": "6f4a08ac-7d3a-4d9a-a4b4-2a26e5f63c8a",
+  "job_id": "1f2e3d4c-5b6a-4790-8123-456789abcdef",
+  "status": "pending",
+  "outcome": "created",
+  "message": "CVE enrichment queued; poll GET /api/scans/<scan_id> for completion."
+}
+```
+
+Requeued after terminal failure (`202`):
+
+```json
+{
+  "scan_id": "6f4a08ac-7d3a-4d9a-a4b4-2a26e5f63c8a",
+  "job_id": "1f2e3d4c-5b6a-4790-8123-456789abcdef",
+  "status": "pending",
+  "outcome": "requeued",
+  "message": "Previously failed enrichment job requeued; poll GET /api/scans/<scan_id> for completion."
+}
+```
+
+Poll `GET /api/scans/<scan_id>` for `cve_enrichment_status` (`PENDING`, `ENRICHING`, `COMPLETED`, `FAILED`).
+
+---
+
+## GET /api/score
+
+Returns the overall security posture score from 0 to 100. Under [severity contract v1](severity-contract.md), the score starts at 100 and deducts 20 per CRITICAL finding, 10 per HIGH finding, 5 per MEDIUM finding, and 2 per LOW finding; INFO findings deduct zero. Scoped to the most recent **completed** scan — if no completed scan exists yet, this returns `status: "NO_SCAN_DATA"` with `score: null` rather than a misleading 100 (a scan with no findings and no evidence at all would otherwise be indistinguishable).
+
+Query parameters:
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `subscription_id` | UUID string | No | Scopes the "most recent completed scan" lookup to one Azure subscription. Defaults to the deployment's `AZURE_SUBSCRIPTION_ID`; if neither is set the latest completed scan from *any* subscription is used, which is only correct for a single-tenant database. A malformed value is a `400`, never a silently unscoped result. |
+
+Example response (a completed scan exists):
+
+```json
+{
+  "status": "OK",
+  "score": 82,
+  "max_score": 100
+}
+```
+
+Example response (no completed scan exists yet):
+
+```json
+{
+  "status": "NO_SCAN_DATA",
+  "score": null,
+  "max_score": 100,
+  "message": "No completed scan is available yet, so there is no security posture to score."
+}
+```
+
+Consumers must check `status` and treat a `null` `score` as "not assessed" — never coerce it to `0`, which would misrepresent absence of evidence as a confirmed worst-case score.
+
+---
+
+## GET /api/compliance/&lt;framework&gt;
+
+Returns technical-evidence coverage against a compliance framework mapping pack, scoped to the most recent **completed** scan. This is coverage, not a certification or a claim of full framework compliance — see `docs/compliance-mapping-pack.md` for the full mapping-pack schema and `evaluation_basis` semantics.
+
+Supported frameworks:
+
+| Path value | Framework file |
+|---|---|
+| `cis` | `cis_azure_benchmark.json` |
+| `nist` | `nist_csf.json` |
+| `iso27001` | `iso27001.json` |
+| `soc2` | `soc2.json` |
+| `ncsc_pqc` | `ncsc_pqc.json` |
+| `enisa_pqc` | `enisa_pqc.json` |
+
+Query parameters:
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `subscription_id` | UUID string | No | Scopes the "most recent completed scan" lookup to one Azure subscription. Defaults to the deployment's `AZURE_SUBSCRIPTION_ID`; if neither is set the latest completed scan from *any* subscription is used, which is only correct for a single-tenant database. A malformed value is a `400`, never a silently unscoped result. |
+
+`status` is one of:
+- `OK` — a completed scan exists and at least one mapped control is in scope; `score_percent` is a real evaluated percentage.
+- `NO_SCAN_DATA` — no completed scan exists yet, so there is no evidence to report; `score_percent` is `null`.
+- `NO_REVIEWED_CONTROLS` — a completed scan exists, but every mapping awaits review; `score_percent` is `null` and no direct-evidence score exists.
+- `NO_IN_SCOPE_CONTROLS` — a completed scan exists, but every reviewed mapped control for this framework is `not_applicable`/`organizational` and excluded from the denominator; `score_percent` is `null`.
+
+Per-control `status` is evaluation-derived (issue #263) only after its mapping
+has been reviewed: `PASS`/`FAIL`/`UNKNOWN`/`ERROR` is the rolled-up status of
+that rule's persisted `rule_evaluations` rows for the scan, not an inference
+from the mere absence of a finding. A reviewed control whose rule has no
+evaluation row for the scan (a legacy rule not yet migrated to `evaluate()`,
+or one that was skipped) is reported `UNKNOWN`. `UNKNOWN` and `ERROR` count in
+the `score_percent` denominator without counting as a pass, so missing or lost
+evidence lowers the score rather than shrinking the base it is measured
+against. Unreviewed, `not_applicable`, and `organizational` controls are
+excluded.
+
+Any control with `review_status` other than `reviewed` has control status
+`UNREVIEWED_MAPPING`, regardless of its `mapping_type`. It is excluded from
+the denominator alongside `not_applicable` and `organizational` controls, and
+does not contribute to `passed` or `failed`. Consumers must check `status` and
+never treat a `null` `score_percent` as `0` — a missing/excluded score is a
+different fact from a real, evaluated 0%. `reviewed_controls`,
+`unreviewed_controls`, `not_applicable`, `organizational`, and
+`excluded_controls` make the reason explicit.
+
+Example response (`OK`):
+
+```json
+{
+  "framework": "CIS Microsoft Azure Foundations Benchmark",
+  "version": "2.0.0",
+  "contract_version": "3",
+  "status": "OK",
+  "mapping_pack_version": "1.0.0",
+  "mapping_pack_status": "current",
+  "mapping_pack_source": "OpenShield compliance mapping pack, authored against CIS Microsoft Azure Foundations Benchmark v2.0.0 official control text. Technical-evidence mapping only; not a certification statement.",
+  "mapping_pack_published": "2026-08-22",
+  "scan_id": "scan-1",
+  "evaluation_basis": "Status is evaluation-derived: PASS/FAIL/UNKNOWN/ERROR for each control is the rolled-up status of its rule's persisted rule_evaluations rows for the most recent completed scan (issue #263). ...",
+  "total_controls": 95,
+  "in_scope_controls": 20,
+  "excluded_controls": 75,
+  "reviewed_controls": 66,
+  "unreviewed_controls": 29,
+  "not_applicable": 40,
+  "organizational": 6,
+  "passed": 18,
+  "failed": 2,
+  "unknown": 0,
+  "error": 0,
+  "score_percent": 92,
+  "controls": [
+    {
+      "rule_id": "AZ-STOR-001",
+      "control_id": "3.5",
+      "control_name": "Ensure that 'Public access level' is set to Private for blob containers",
+      "status": "FAIL",
+      "mapping_type": "direct",
+      "evidence_type": "automated_configuration_scan",
+      "primary_source": "CIS Microsoft Azure Foundations Benchmark v2.0.0, control 3.5",
+      "rationale": "...",
+      "owner": null,
+      "review_status": "pending_review",
+      "review_date": null
+    }
+  ]
+}
+```
+
+Example response (`NO_SCAN_DATA`, HTTP 200 — never 500):
+
+```json
+{
+  "status": "NO_SCAN_DATA",
+  "message": "No completed scan is available yet, so no technical evidence exists to report against this framework.",
+  "total_controls": 95,
+  "in_scope_controls": null,
+  "excluded_controls": null,
+  "reviewed_controls": null,
+  "unreviewed_controls": null,
+  "passed": null,
+  "failed": null,
+  "score_percent": null,
+  "controls": []
+}
+```
+
+Unknown framework response (HTTP 400):
+
+```json
+{
+  "error": "Invalid request parameters",
+  "supported": ["cis", "nist", "iso27001", "soc2", "ncsc_pqc", "enisa_pqc"]
+}
+```
+
+---
+
+## GET /api/resources
+
+Returns unique Azure resources derived from the most recent scan that has findings. Resources are aggregated from findings — one entry per distinct `resource_id`. Risk level is computed from the maximum severity finding on each resource.
+
+Query parameters: none
+
+Example response:
+
+```json
+{
+  "summary": {
+    "total": 12,
+    "by_category": { "Storage": 3, "Network": 4, "Identity": 3, "Database": 2 },
+    "by_risk_level": { "CRITICAL": 1, "HIGH": 3, "MEDIUM": 6, "LOW": 2, "INFO": 0, "NONE": 0 },
+    "last_scan_at": "2026-06-03T15:12:51Z"
+  },
+  "resources": [
+    {
+      "resource_id": "/subscriptions/00000000/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/example",
+      "resource_name": "example",
+      "resource_type": "Microsoft.Storage/storageAccounts",
+      "resource_group": "rg",
+      "subscription_id": "00000000-0000-0000-0000-000000000000",
+      "category": "Storage",
+      "risk_level": "HIGH",
+      "finding_count": 2
+    }
+  ]
+}
+```
+
+No findings response (no scan with findings exists):
+
+```json
+{
+  "summary": { "total": 0, "by_category": {}, "by_risk_level": {}, "last_scan_at": null },
+  "resources": []
+}
+```
+
+---
+
+## GET /api/prioritization
+
+Returns findings from the most recent scan grouped and ranked by risk score (`severity_weight × affected_resource_count`). Produces a matrix view, a ranked list, and recommended action items.
+
+Query parameters: none
+
+Example response:
+
+```json
+{
+  "matrix": [
+    {
+      "id": "AZ-STOR-001",
+      "ruleId": "AZ-STOR-001",
+      "name": "Public Blob Access Enabled",
+      "risk": "HIGH",
+      "effort": 2,
+      "category": "Storage",
+      "severity": "HIGH",
+      "affectedResources": 3,
+      "resource": "storageAccount"
+    }
+  ],
+  "rankings": [
+    {
+      "rank": 1,
+      "ruleId": "AZ-STOR-001",
+      "name": "Public Blob Access Enabled",
+      "score": 30,
+      "impact": "HIGH",
+      "effort": 2,
+      "category": "Storage",
+      "resource": "storageAccount"
+    }
+  ],
+  "action_items": [
+    {
+      "priority": 1,
+      "ruleId": "AZ-STOR-001",
+      "action": "Disable public blob access on all storage accounts",
+      "impact": "HIGH",
+      "effort": "LOW",
+      "resources_affected": 3
+    }
+  ],
+  "summary": {
+    "total_issues": 8,
+    "high_priority": 3,
+    "total_affected_resources": 12
+  }
+}
+```
+
+---
+
+## GET /api/drift
+
+Compares the two most recent scans that have findings to surface configuration changes. Returns `ADDED` events (rule fired in latest scan but not the previous) and `REMOVED` events (rule fired in previous scan but not the latest). Returns an empty events list when fewer than two scans with findings exist.
+
+Query parameters: none
+
+Example response:
+
+```json
+{
+  "summary": {
+    "added": 2,
+    "removed": 1,
+    "modified": 0,
+    "last_checked": "2026-06-03T15:12:51Z"
+  },
+  "events": [
+    {
+      "id": "AZ-NET-001-/subscriptions/00000000/.../nsg",
+      "type": "ADDED",
+      "rule_id": "AZ-NET-001",
+      "rule_name": "SSH Access from Internet Not Restricted",
+      "resource_id": "/subscriptions/00000000/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/nsg",
+      "resource_name": "nsg",
+      "severity": "HIGH",
+      "category": "Network",
+      "detected_at": "2026-06-03T15:12:51Z"
+    }
+  ]
+}
+```
+
+No drift response (fewer than two scans):
+
+```json
+{
+  "summary": { "added": 0, "removed": 0, "modified": 0, "last_checked": null },
+  "events": []
+}
+```
+
+---
+
+## GET /api/findings/&lt;id&gt;/playbook
+
+Returns the structured remediation playbook for a specific finding. Loads the matching `playbooks/cli/fix_<rule>.sh` script and wraps the finding's remediation text as a portal step. Appends NVD links from any CVE references on the finding.
+
+Path parameters: `id` — integer finding ID from `GET /api/findings`.
+
+Example response:
+
+```json
+{
+  "finding_id": 42,
+  "rule_id": "AZ-STOR-001",
+  "portal_steps": [
+    "Navigate to Storage Accounts in the Azure Portal. Select the storage account. Under 'Configuration', set 'Allow Blob public access' to Disabled."
+  ],
+  "cli_commands": [
+    "az storage account update --name <storage-account-name> --resource-group <rg> --allow-blob-public-access false"
+  ],
+  "validation_steps": [
+    "Verify with: az storage account show --name <name> --query allowBlobPublicAccess"
+  ],
+  "references": [
+    "https://nvd.nist.gov/vuln/detail/CVE-2021-XXXXX"
+  ]
+}
+```
+
+Not found response:
+
+```json
+{
+  "error": "Finding 99 not found"
+}
+```
+
+---
+
+## AI endpoints
+
+`POST /api/ai/summary`, `/api/ai/insights`, `/api/ai/prioritise`, `/api/ai/ask` and `/api/ai/threat-simulation` send scan findings to the caller's chosen LLM provider. Every request carries `provider` (`anthropic`, `groq` or `gemini`) and `api_key`; `model` is optional, and `/ask` and `/insights` also accept `question`.
+
+### Evidence
+
+Findings are read on the server, never trusted from the browser:
+
+- `scan_id` (optional, UUID) selects a completed scan. An unknown or not-yet-completed scan returns `404`.
+- Without `scan_id`, the latest completed scan is used, the same data `GET /api/findings` returns by default.
+- `findings` (a client-supplied array) is **deprecated** and kept only for compatibility. It cannot be combined with `scan_id` (`400`).
+
+Every response includes an `evidence` object saying what the answer was built from:
+
+```json
+{
+  "evidence": {
+    "source": "scan",
+    "scan_id": "11111111-2222-4333-8444-555555555555",
+    "verified": true,
+    "finding_count": 37,
+    "findings_in_prompt": 37
+  }
+}
+```
+
+`source` is `scan`, `client_supplied` (`verified: false`) or `none` (no completed scan, only possible on endpoints where findings are optional). At most the 200 most severe findings go into one prompt; `finding_count` is the scan total.
+
+`/insights` and `/threat-simulation` need findings: no completed scan returns `404`, a scan with no findings returns `422`, and an evidence lookup failure returns `503`.
+
+### Prompt safety
+
+Finding fields such as `resource_name` and `description` can contain text written by whoever controls the scanned resource. Before anything reaches the model, each field is stripped of control, bidi and zero-width characters, collapsed to one line, length-capped, JSON-encoded, and placed in a data block whose delimiters carry a per-request random boundary. The instructions tell the model to treat those blocks as evidence only (OWASP Top 10 for LLM Applications, LLM01).
+
+### Validated output
+
+`/prioritise` and `/threat-simulation` ask the model for JSON and validate what comes back (LLM05):
+
+- Items citing a `rule_id`, or a rule/resource pair, that is not in the evidence are dropped and counted in `discarded_items`.
+- `/prioritise` items need a positive integer `priority` and a contract severity. `/threat-simulation` stages must use the documented stage names and cite at least one rule from the evidence.
+- Output that is not valid JSON, or has the wrong shape, returns `502 {"error": "AI response failed validation"}`. Raw model text is never passed through.
+
+---
+
+## Deferred endpoints
+
+The following endpoints are called by the frontend but have no backend implementation yet. The frontend falls back to static mock data when these return 404.
+
+| Endpoint | Used by | Status |
+|---|---|---|
+| `GET /api/monitoring` | Monitoring page — score trend chart, category distribution | Deferred. Score and findings data come from `GET /api/score` and `GET /api/findings` instead. |
