@@ -16,10 +16,11 @@ import { TextInput } from '@astryxdesign/core/TextInput';
 import { useToast } from '@astryxdesign/core/Toast';
 import { ToggleButton, ToggleButtonGroup } from '@astryxdesign/core/ToggleButton';
 import { Token } from '@astryxdesign/core/Token';
-import { KeyRound, Search, Trash2 } from 'lucide-react';
+import { History, KeyRound, Search, Trash2 } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 
 import { AddUserDialog } from './add-user-dialog';
+import { CredentialEventsDialog } from './credential-events-dialog';
 import { DeleteUserDialog } from './delete-user-dialog';
 import { ResetPasswordDialog } from './reset-password-dialog';
 
@@ -95,6 +96,7 @@ export function UsersCard() {
   const [addOpen, setAddOpen] = useState(false);
   const [resetTarget, setResetTarget] = useState<{ id: string; email: string } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; email: string } | null>(null);
+  const [eventsTarget, setEventsTarget] = useState<{ id: string; email: string } | null>(null);
 
   const refresh = useCallback(async () => {
     const res = await fetch('/api/users');
@@ -169,10 +171,18 @@ export function UsersCard() {
     {
       key: 'actions',
       header: '',
-      width: pixel(112),
+      width: pixel(152),
       resizable: false,
       renderCell: (u) => (
         <div className="flex items-center justify-end gap-2">
+          <IconButton
+            icon={<History aria-hidden className="size-4" />}
+            label={`Credential events for ${u.email}`}
+            variant="secondary"
+            size="sm"
+            className="min-h-11 min-w-11 md:min-h-7 md:min-w-7"
+            onClick={() => setEventsTarget({ id: u.id, email: u.email })}
+          />
           <IconButton
             icon={<KeyRound aria-hidden className="size-4" />}
             label={`Reset password for ${u.email}`}
@@ -316,6 +326,11 @@ export function UsersCard() {
         onOpenChange={(v) => !v && setDeleteTarget(null)}
         user={deleteTarget}
         onDeleted={refresh}
+      />
+      <CredentialEventsDialog
+        open={eventsTarget !== null}
+        onOpenChange={(v) => !v && setEventsTarget(null)}
+        user={eventsTarget}
       />
     </Card>
   );

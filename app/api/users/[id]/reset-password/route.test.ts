@@ -63,6 +63,14 @@ beforeEach(() => {
       user_agent TEXT,
       user_id TEXT NOT NULL
     );
+    CREATE TABLE credential_event (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      source TEXT NOT NULL,
+      actor_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+      revoked_sessions INTEGER NOT NULL
+    );
   `);
   globalThis.__speedtestDb = { sqlite, db };
   getSession.mockResolvedValue({ user: { id: 'admin-id', email: 'admin@x.y', role: 'admin' } });
@@ -79,6 +87,13 @@ const sessionIds = (userId: string) =>
     .query('SELECT id FROM session WHERE user_id = ? ORDER BY id')
     .all(userId)
     .map((r) => (r as { id: string }).id);
+
+const credentialEvents = (userId: string) =>
+  sqlite.query('SELECT source, actor_id, revoked_sessions FROM credential_event WHERE user_id = ?').all(userId) as {
+    source: string;
+    actor_id: string;
+    revoked_sessions: number;
+  }[];
 
 describe('POST /api/users/:id/reset-password', () => {
   it('admin resets target password', async () => {
@@ -127,5 +142,40 @@ describe('POST /api/users/:id/reset-password', () => {
       { params: Promise.resolve({ id: u.id }) },
     );
     expect(res.status).toBe(400);
+  });
+
+  it('writes an admin_reset audit event counting every revoked session', async () => {
+    const u = createUser({ email: 'b@x.y', role: 'viewer', provider: 'local' });
+    insertSession('sess-1', u.id);
+    insertSession('sess-2', u.id);
+    insertSession('sess-3', u.id);
+    const res = await POST(
+      new Request(`http://x/api/users/${u.id}/reset-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ newPassword: 'hunter2hunter2' }),
+      }),
+      { params: Promise.resolve({ id: u.id }) },
+    );
+    expect(res.status).toBe(200);
+    const events = credentialEvents(u.id);
+    expect(events).toHaveLength(1);
+    expect(events[0].source).toBe('admin_reset');
+    expect(events[0].actor_id).toBe('admin-id');
+    expect(events[0].revoked_sessions).toBe(3);
+  });
+
+  it('does not write an audit event when validation fails', async () => {
+    const u = createUser({ email: 'b@x.y', role: 'viewer', provider: 'local' });
+    const res = await POST(
+      new Request(`http://x/api/users/${u.id}/reset-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ newPassword: 'short' }),
+      }),
+      { params: Promise.resolve({ id: u.id }) },
+    );
+    expect(res.status).toBe(400);
+    expect(credentialEvents(u.id)).toHaveLength(0);
   });
 });

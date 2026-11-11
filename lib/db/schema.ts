@@ -112,6 +112,24 @@ export const account = sqliteTable('account', {
   updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
 });
 
+export const credentialEvent = sqliteTable(
+  'credential_event',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    source: text('source', { enum: ['admin_reset', 'self_change'] }).notNull(),
+    // No FK on actor: the audit trail must survive deletion of the acting admin.
+    actorId: text('actor_id').notNull(),
+    createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+    revokedSessions: integer('revoked_sessions').notNull(),
+  },
+  (t) => ({
+    userCreatedIdx: index('credential_event_user_created_idx').on(t.userId, t.createdAt),
+  }),
+);
+
 export const verification = sqliteTable('verification', {
   id: text('id').primaryKey(),
   identifier: text('identifier').notNull(),
@@ -126,3 +144,6 @@ export type NewUser = typeof user.$inferInsert;
 export type Session = typeof session.$inferSelect;
 export type Account = typeof account.$inferSelect;
 export type NewAccount = typeof account.$inferInsert;
+export type CredentialEvent = typeof credentialEvent.$inferSelect;
+export type NewCredentialEvent = typeof credentialEvent.$inferInsert;
+export type CredentialEventSource = 'admin_reset' | 'self_change';

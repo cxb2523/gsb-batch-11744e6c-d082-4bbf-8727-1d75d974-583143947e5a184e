@@ -4,7 +4,13 @@ import { z } from 'zod';
 import { apiError, apiValidationError } from '@/lib/api-errors';
 import { requireSession } from '@/lib/auth/authorize';
 import { hashPassword, verifyPassword } from '@/lib/auth/hash';
-import { findUserById, getCredentialPasswordHash, revokeUserSessions, setCredentialPassword } from '@/lib/auth/users';
+import {
+  findUserById,
+  getCredentialPasswordHash,
+  recordCredentialEvent,
+  revokeUserSessions,
+  setCredentialPassword,
+} from '@/lib/auth/users';
 
 const schema = z.object({
   currentPassword: z.string().min(1),
@@ -35,6 +41,7 @@ export async function POST(req: Request) {
     return apiError('wrong_password', 'Current password is incorrect.', 400);
   }
   setCredentialPassword(user.id, await hashPassword(parsed.data.newPassword));
-  revokeUserSessions(user.id, { exceptSessionId: session.sessionId });
+  const revokedSessions = revokeUserSessions(user.id, { exceptSessionId: session.sessionId });
+  recordCredentialEvent({ userId: user.id, source: 'self_change', actorId: user.id, revokedSessions });
   return NextResponse.json({ ok: true });
 }

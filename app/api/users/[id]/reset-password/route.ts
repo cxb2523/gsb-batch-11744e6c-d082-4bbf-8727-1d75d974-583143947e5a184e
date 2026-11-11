@@ -4,14 +4,14 @@ import { z } from 'zod';
 import { apiError, apiValidationError } from '@/lib/api-errors';
 import { requireAdmin } from '@/lib/auth/authorize';
 import { hashPassword } from '@/lib/auth/hash';
-import { findUserById, revokeUserSessions, setCredentialPassword } from '@/lib/auth/users';
+import { findUserById, recordCredentialEvent, revokeUserSessions, setCredentialPassword } from '@/lib/auth/users';
 
 const schema = z.object({ newPassword: z.string().min(10).max(1024) });
 
 type Params = { params: Promise<{ id: string }> };
 
 export async function POST(req: Request, { params }: Params) {
-  await requireAdmin();
+  const admin = await requireAdmin();
   const { id } = await params;
   if (!id) {
     return apiError('invalid_id', 'User id is required.', 400);
@@ -31,6 +31,7 @@ export async function POST(req: Request, { params }: Params) {
     return apiValidationError(parsed.error);
   }
   setCredentialPassword(id, await hashPassword(parsed.data.newPassword));
-  revokeUserSessions(id);
+  const revokedSessions = revokeUserSessions(id);
+  recordCredentialEvent({ userId: id, source: 'admin_reset', actorId: admin.id, revokedSessions });
   return NextResponse.json({ ok: true });
 }

@@ -1,9 +1,18 @@
 import { randomUUID } from 'node:crypto';
 
-import { and, eq, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, ne, sql } from 'drizzle-orm';
 
 import { getDb } from '../db/client';
-import { account, type NewUser, session, type User, user } from '../db/schema';
+import {
+  account,
+  type CredentialEvent,
+  type CredentialEventSource,
+  credentialEvent,
+  type NewUser,
+  session,
+  type User,
+  user,
+} from '../db/schema';
 
 export type PublicUser = {
   id: string;
@@ -100,12 +109,54 @@ export function deleteUser(id: string): void {
 // Sessions must die when credentials change (CWE-613): a stolen session must
 // not survive a password reset. Pass `exceptSessionId` to keep the caller's
 // own session alive; omitted or undefined revokes everything (fail-secure).
-export function revokeUserSessions(userId: string, opts?: { exceptSessionId?: string }): void {
+// Returns the number of sessions actually deleted, so callers can record it
+// in the credential-event audit trail.
+export function revokeUserSessions(userId: string, opts?: { exceptSessionId?: string }): number {
   const db = getDb();
   const where = opts?.exceptSessionId
     ? and(eq(session.userId, userId), ne(session.id, opts.exceptSessionId))
     : eq(session.userId, userId);
-  db.delete(session).where(where).run();
+  const deleted = db.delete(session).where(where).returning({ id: session.id }).all();
+  return deleted.length;
+}
+
+// Credential-change audit trail: every successful password change (admin reset
+// or self-service) records who did it and how many sessions were revoked, so
+// revocation is observable after the fact. Failed attempts must NOT be
+// recorded - the routes only call this after the password write succeeded.
+export function recordCredentialEvent(input: {
+  userId: string;
+  source: CredentialEventSource;
+  actorId: string;
+  revokedSessions: number;
+}): CredentialEvent {
+  const db = getDb();
+  return db
+    .insert(credentialEvent)
+    .values({
+      id: randomUUID(),
+      userId: input.userId,
+      source: input.source,
+      actorId: input.actorId,
+      revokedSessions: input.revokedSessions,
+    })
+    .returning()
+    .get();
+}
+
+export function listCredentialEvents(userId: string, limit: number): CredentialEvent[] {
+  const db = getDb();
+  return (
+    db
+      .select()
+      .from(credentialEvent)
+      .where(eq(credentialEvent.userId, userId))
+      // rowid tiebreak: events written within the same millisecond still come
+      // back in insertion (newest-first) order.
+      .orderBy(desc(credentialEvent.createdAt), desc(sql`rowid`))
+      .limit(limit)
+      .all()
+  );
 }
 
 // Credential account helpers - Better Auth stores password hashes on

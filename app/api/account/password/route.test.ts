@@ -65,6 +65,14 @@ beforeEach(async () => {
       user_agent TEXT,
       user_id TEXT NOT NULL
     );
+    CREATE TABLE credential_event (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      source TEXT NOT NULL,
+      actor_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+      revoked_sessions INTEGER NOT NULL
+    );
   `);
   globalThis.__speedtestDb = { sqlite, db };
   const u = createUser({ email: 'me@x', provider: 'local', role: 'viewer' });
@@ -90,6 +98,13 @@ const sessionIds = (userId: string) =>
     .query('SELECT id FROM session WHERE user_id = ? ORDER BY id')
     .all(userId)
     .map((r) => (r as { id: string }).id);
+
+const credentialEvents = (userId: string) =>
+  sqlite.query('SELECT source, actor_id, revoked_sessions FROM credential_event WHERE user_id = ?').all(userId) as {
+    source: string;
+    actor_id: string;
+    revoked_sessions: number;
+  }[];
 
 describe('POST /api/account/password', () => {
   it('requires current password match', async () => {
@@ -141,5 +156,48 @@ describe('POST /api/account/password', () => {
     const res = await POST(body({ currentPassword: 'oldpassword1', newPassword: 'hunter2hunter2' }));
     expect(res.status).toBe(200);
     expect(sessionIds(other.id)).toEqual(['sess-theirs']);
+  });
+
+  it('writes a self_change audit event counting only the deleted sessions', async () => {
+    const u = findUserByEmail('me@x')!;
+    insertSession('sess-current', u.id);
+    insertSession('sess-a', u.id);
+    insertSession('sess-b', u.id);
+    getSession.mockResolvedValue({
+      session: { id: 'sess-current' },
+      user: { id: u.id, email: u.email, role: u.role },
+    });
+    const res = await POST(body({ currentPassword: 'oldpassword1', newPassword: 'hunter2hunter2' }));
+    expect(res.status).toBe(200);
+    expect(sessionIds(u.id)).toEqual(['sess-current']);
+    const events = credentialEvents(u.id);
+    expect(events).toHaveLength(1);
+    expect(events[0].source).toBe('self_change');
+    expect(events[0].actor_id).toBe(u.id);
+    expect(events[0].revoked_sessions).toBe(2);
+  });
+
+  it('writes no audit event when the current password is wrong', async () => {
+    const u = findUserByEmail('me@x')!;
+    insertSession('sess-a', u.id);
+    const res = await POST(body({ currentPassword: 'wrong', newPassword: 'hunter2hunter2' }));
+    expect(res.status).toBe(400);
+    expect(credentialEvents(u.id)).toHaveLength(0);
+    expect(sessionIds(u.id)).toEqual(['sess-a']);
+  });
+
+  it('writes no audit event for SSO accounts without a local password', async () => {
+    const sso = createUser({ email: 'sso@x', provider: 'oidc', role: 'viewer' });
+    getSession.mockResolvedValue({ user: { id: sso.id, email: sso.email, role: sso.role } });
+    const res = await POST(body({ currentPassword: 'whatever', newPassword: 'hunter2hunter2' }));
+    expect(res.status).toBe(400);
+    expect(credentialEvents(sso.id)).toHaveLength(0);
+  });
+
+  it('writes no audit event when validation fails', async () => {
+    const u = findUserByEmail('me@x')!;
+    const res = await POST(body({ currentPassword: 'oldpassword1', newPassword: 'short' }));
+    expect(res.status).toBe(400);
+    expect(credentialEvents(u.id)).toHaveLength(0);
   });
 });
