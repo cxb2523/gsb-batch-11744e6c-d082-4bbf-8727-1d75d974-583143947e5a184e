@@ -1,0 +1,16 @@
+# 예전 사본 / 배포용 zip / 작업 파일
+pmd/
+*.zip
+.claude/
+__pycache__/
+assets_in/
+# 원작 음악은 별도 저장소(pmd-fan-web/assets)에 둔다
+music/*.mp3
+music/*.ogg
+music/*.m4a
+music/*.wav
+# 원작 아이템·함정 그림 (테스트용 사본, 사이트는 pmd-fan-web/assets 저장소에서 불러온다)
+pmdgfx/
+
+# 내 컴퓨터 전용 설정 (개발용 Firebase)
+js/config.local.js

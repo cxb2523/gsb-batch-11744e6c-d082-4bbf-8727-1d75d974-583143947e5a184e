@@ -1,0 +1,397 @@
+// 던전용 특수 기술 규칙 (원작 조건을 턴제 던전에 맞게 재해석)
+'use strict';
+
+const RECOIL_MUL = 0.5;     // 반동 데미지 완화 (원작의 절반)
+const PROJ_RANGE = 5;       // 원거리 기술 사거리 (직선 칸 수)
+const MOVE_RULES = {};
+function rule(ids, r) { for (const id of ids) MOVE_RULES[id] = { ...(MOVE_RULES[id] || {}), ...r }; }
+
+// 카타스트로피·앙갚음: 데이터에 위력이 1로 들어 있어 따로 계산한다
+// 카타스트로피는 HP 절반이 던전에서는 너무 강해서 위력 90의 보통 공격 기술로
+if (DATA.moves[877]) DATA.moves[877].p = 90;
+rule([877], { text: '던전에서는 상대 HP를 절반으로 줄이는 대신 위력 90으로 공격한다.' });
+rule([894], { comeuppance: true, text: '지난 턴 이후 공격으로 받은 데미지의 1.5배를 돌려준다. 받은 데미지가 없으면 실패한다.' });
+
+// 원작 설명이 데이터에 없는 9세대 기술: 원작 효과를 짧게 적어 둔다 (던전에서 실제로 하는 일은 기술 정보의 효과 줄과 ⚑ 던전 규칙)
+const MOVE_DESC_FILL = {
+  827: '독이 묻은 날카로운 손톱으로 할퀸다. 50% 확률로 상대를 독·마비·잠듦 중 하나로 만든다.',
+  828: '에너지를 몸에 두르고 부딪친다. 자신의 방어가 올라간다.',
+  830: '바위 도끼로 내리친다. 상대 주변에 뾰족한 바위 조각을 흩뿌린다.',
+  831: '사랑과 미움이 담긴 거센 바람으로 상대를 감싸 공격한다. 상대의 공격을 떨어뜨릴 때가 있다.',
+  832: '신비한 힘을 내뿜어 공격한다. 자신의 특수공격이 올라간다.',
+  833: '2~3턴 동안 불꽃을 휘두르며 날뛴다. 날뛴 뒤에는 혼란에 빠진다.',
+  834: '물을 두르고 온몸으로 부딪친다. 자신도 반동 데미지를 받는다.',
+  835: '모은 엽록소를 한꺼번에 쏘아 공격한다. 자신도 큰 데미지를 받는다.',
+  836: '거대한 얼음덩이를 던져 공격한다. 상대를 풀죽게 할 때가 있다.',
+  838: '온몸으로 들이받는다. 자신의 방어와 특수방어가 떨어진다.',
+  839: '독침을 잔뜩 날려 공격한다. 독 상태로 만들 때가 있고, 독 상태인 상대에게는 위력이 2배가 된다.',
+  840: '오라를 실은 날개로 베어 공격한다. 급소에 맞기 쉽고 자신의 스피드가 올라간다.',
+  841: '소름 끼치는 원한을 실어 공격한다. 상대의 공격을 떨어뜨린다.',
+  843: '발차기 뒤에 화살 세 발을 쏜다. 급소에 맞기 쉽고, 상대의 방어를 떨어뜨리거나 풀죽게 할 때가 있다.',
+  844: '수많은 도깨비불로 공격한다. 화상을 입힐 때가 있고, 상태이상인 상대에게는 위력이 2배가 된다.',
+  845: '조개껍질 검으로 벤다. 상대 주변에 날카로운 조개 파편을 흩뿌린다.',
+  846: '차갑고 거센 바람으로 공격한다. 상대의 스피드를 떨어뜨릴 때가 있다.',
+  847: '번개를 품은 폭풍으로 공격한다. 마비시킬 때가 있다.',
+  848: '뜨겁게 달군 모래 폭풍으로 공격한다. 화상을 입힐 때가 있다.',
+  851: '모은 결정 에너지를 쏘아 공격한다.',
+  853: '다리를 높이 들어 내려찍는다. 혼란에 빠뜨릴 때가 있고, 빗나가면 자신이 데미지를 받는다.',
+  854: '쓰러진 동료들의 원통함을 담아 공격한다. 쓰러진 동료가 많을수록 위력이 올라간다.',
+  855: '마음까지 비추는 이상한 빛을 쏜다. 상대의 특수방어를 크게 떨어뜨린다.',
+  856: '멋진 몸놀림으로 공격한다. 입 안에 있는 싸리용의 모습에 따라 능력이 올라간다.',
+  857: '주먹에 물을 감아 눈에 보이지 않는 속도로 친다. 반드시 먼저 공격할 수 있다.',
+  859: '바퀴를 맹렬하게 굴려 부딪친다. 자신의 스피드가 크게 떨어진다.',
+  860: '동료들이 모여 차례로 공격한다. 1~10번 연속으로 맞힌다.',
+  861: '발에 얼음을 두르고 빙글빙글 돌며 부딪친다.',
+  862: '온몸을 던져 돌격한다. 사용한 뒤에는 다음 턴까지 받는 데미지가 커진다.',
+  864: '상대를 소금에 절여 공격한다. 매 턴 데미지를 주고, 물·강철 타입에게는 더 큰 데미지를 준다.',
+  865: '호흡을 맞춘 다이빙으로 3번 연속 공격한다.',
+  866: '빙글빙글 돌며 공격해 몸을 묶는 효과를 떨쳐 내고, 상대를 독 상태로 만든다.',
+  869: '엎드린 척하다가 베어 공격한다. 공격은 반드시 맞는다.',
+  870: '꽃다발을 던져 공격한다. 반드시 맞고, 반드시 급소에 맞는다.',
+  871: '타오르는 불꽃을 노래하듯 내뿜는다. 자신의 특수공격이 올라간다.',
+  872: '경쾌한 스텝으로 상대를 농락하며 공격한다. 자신의 스피드가 올라간다.',
+  873: '성난 소처럼 맹렬하게 돌진한다. 상대의 방어벽을 깨뜨린다.',
+  874: '동전을 잔뜩 던져 공격한다. 자신의 특수공격이 떨어진다.',
+  875: '빛나는 칼날로 베어 공격한다.',
+  876: '뜨거운 물을 기세 좋게 뿜는다. 쾌청일 때도 위력이 떨어지지 않고 오히려 올라간다.',
+  877: '재앙을 일으켜 상대의 HP를 절반으로 줄인다.',
+  878: '고대의 힘으로 맹렬하게 부딪친다. 효과가 굉장하면 위력이 더 올라간다.',
+  884: '달려들어 공격한다. 상대의 스피드를 떨어뜨린다.',
+  885: '풀숲에서 튀어나오듯 공격한다. 자신의 스피드가 올라간다.',
+  886: '차가운 물을 끼얹어 공격한다. 상대의 공격을 떨어뜨린다.',
+  887: '고속으로 회전하는 드릴로 공격한다. 방어 기술을 뚫고 맞힌다.',
+  888: '눈에서 신비한 광선을 쏘아 2번 연속 공격한다.',
+  889: '분노를 담아 친다. 공격을 받은 횟수가 많을수록 위력이 올라간다.',
+  890: '불타는 갑옷을 쏘아 공격한다. 자신의 방어와 특수방어가 떨어진다.',
+  891: '원념이 담긴 칼로 벤다. 준 데미지의 절반만큼 HP를 회복한다.',
+  892: '몸의 전기를 모두 써서 공격한다.',
+  893: '거대한 해머를 휘둘러 공격한다. 같은 기술을 연속으로 쓸 수 없다.',
+  901: '붉은 보름달처럼 거대한 기운을 쏘아 공격한다. 같은 기술을 연속으로 쓸 수 없다.',   // 블러드문 (다투곰 붉은달, v0.102)
+  894: '마지막으로 받은 데미지를 더 강하게 돌려준다.',
+  895: '물을 칼처럼 날카롭게 뿜어 벤다. 급소에 맞기 쉽다.',
+  902: '말차를 쏘아 공격한다. 준 데미지의 절반만큼 HP를 회복하고, 화상을 입힐 때가 있다.',
+  903: '끈적한 시럽을 뿌려 공격한다. 3턴 동안 상대의 스피드를 떨어뜨린다.',
+  904: '덩굴을 감은 방망이로 때린다. 급소에 맞기 쉽고, 쓰고 있는 가면에 따라 타입이 바뀐다.',
+  905: '전기를 모은 뒤 쏘아 공격한다. 모을 때 특수공격이 올라가고, 비가 오면 바로 쏜다.',
+  906: '결정 에너지를 퍼부어 공격한다.',
+  907: '광선을 쏘아 공격한다. 가끔 위력이 2배가 된다.',
+  914: '천사 같은 목소리로 공격한다. 능력이 올라간 상대를 혼란에 빠뜨린다.',
+  915: '성을 내며 공격한다. 지난번 기술이 실패했으면 위력이 2배가 된다.',
+  916: '전기를 두르고 덮친다. 빗나가면 자신이 데미지를 받는다.',
+  917: '불쾌한 음파로 공격한다. 2턴 동안 상대가 HP를 회복하지 못하게 한다.',
+  918: '상대가 선제 기술을 쓰려 할 때 먼저 쳐서 풀죽게 한다.',
+  919: '독으로 된 사슬로 감아 공격한다. 맹독 상태로 만들 때가 있다.',
+  868: '자신의 HP를 깎아서 공격과 특수공격, 스피드를 크게 올린다.',
+  882: '주변을 깨끗이 정리해서 자신의 공격과 스피드를 올린다.',
+};
+for (const [id, d] of Object.entries(MOVE_DESC_FILL)) if (DATA.moves[id] && !DATA.moves[id].d) DATA.moves[id].d = d;
+// 새로 넣은 변화 기술 (js/extramoves.js)
+rule([580], { setTerrain: 'grassy' }); rule([581], { setTerrain: 'misty' }); rule([604], { setTerrain: 'electric' }); rule([678], { setTerrain: 'psychic' });   // 필드 (v0.100)
+rule([240], { setWx: 'rain' }); rule([241], { setWx: 'sun' }); rule([201], { setWx: 'sand' }); rule([883], { setWx: 'snow' });
+rule([182], { protect: true });
+rule([156], { rest: true });
+rule([115], { screen: 'phys', team: true }); rule([113], { screen: 'spec', team: true });
+rule([694], { screen: 'both', team: true, needWx: 'snow' });   // 오로라베일 (v0.92): 설경일 때만, 리플렉터 + 빛의장막
+rule([144], { transform: true });   // 변신: 앞의 포켓몬으로 (js/dungeon.js transformInto)
+rule([73], { seed: true }); rule([269], { taunt: true }); rule([281], { yawn: true });
+const SCREEN_TURNS = 20, TAUNT_TURNS = 10, SEED_TURNS = 20, REST_TURNS = 3;
+
+// 날씨에 따라 명중이 바뀌는 기술 (원작): wxAcc[날씨] = 'sure'(반드시 맞음) 또는 명중률 (원래 명중 대신)
+rule([87, 542], { wxAcc: { rain: 'sure', sun: 50 }, text: '비가 오면 반드시 맞고, 쾌청이면 명중률이 50이 된다.' });
+rule([59], { wxAcc: { snow: 'sure' }, text: '설경이면 반드시 맞는다.' });
+rule([846, 847, 848], { wxAcc: { rain: 'sure' }, text: '비가 오면 반드시 맞는다.' });   // 찬바람폭풍·번개폭풍·열사의폭풍
+rule([876], { text: '쾌청이면 위력이 떨어지지 않고 오히려 1.5배가 된다.' });   // 하이드로스팀
+rule([905], { charge: '전기를 모으고 있다!', chargeSc: [[4, 1]], rainNoCharge: true, text: '1턴째에 전기를 모으며 특수공격이 오르고 다음 행동 때 쏜다. 비가 오면 모으지 않고 바로 쏜다.' });   // 일렉트로빔
+
+// 블랙·화이트큐레무 전용기: 원본 데이터에 없는 프리즈볼트·콜드플레어를 넣고, 두 모습이 크로스썬더·크로스플레임과 함께 배운다 (Lv1)
+DATA.moves[553] = DATA.moves[553] || { n: '프리즈볼트', t: 15, p: 140, a: 90, pp: 5, c: 2, r: 'p', ail: 1, ac: 30,
+  d: '전기를 두른 얼음 덩어리를 2턴째에 상대에게 부딪친다. 마비 상태로 만들 때가 있다.' };
+DATA.moves[554] = DATA.moves[554] || { n: '콜드플레어', t: 15, p: 140, a: 90, pp: 5, c: 3, r: 'p', ail: 4, ac: 30,
+  d: '모든 것을 얼리는 바람으로 2턴째에 상대를 감싼다. 화상 상태로 만들 때가 있다.' };
+for (const id of [553, 554]) DATA.moves[id].id = id;
+rule([553], { charge: '차가운 빛에 휩싸였다!' });
+// 되살린 기술 (v0.98, js/oldmoves.js)
+rule([13], { charge: '회오리바람을 일으켰다!' });
+rule([507], { charge: '하늘 높이 날아올랐다!', invuln: true });
+rule([868], { hpCostPct: 50, text: '최대 HP의 절반을 깎아서 사용한다. HP가 부족하면 실패한다.' });   // 제살깎기 (v0.98)
+rule([301], { chain: 3, text: '연속으로 쓸 때마다 위력이 2배 (최대 8배). 다른 행동을 하면 초기화.' });
+rule([554], { charge: '얼어붙은 공기에 휩싸였다!' });
+for (const [sp, mvs] of [[1211, [553, 559]], [1212, [554, 558]]]) {
+  const s = DATA.species[sp]; if (!s) continue;
+  for (const mid of mvs) if (!s.l.some(x => x[1] === mid)) s.l.unshift([1, mid]);
+}
+
+// 잠재파워: 원본 설명이 '사용할 수 없는 기술'(최신작 문구)이라 던전 동작에 맞게 바꾼다 (던전에서는 노말 타입 그대로)
+if (DATA.moves[237]) DATA.moves[237].d = '자신만이 가진 숨은 힘을 날려서 공격한다. (던전에서는 노말 타입)';
+
+// 보스가 회복 기술(날개쉬기·HP회복·알낳기·광합성 등)을 쓰면 최대 HP의 BOSS_HEAL_MAX%까지만 (보스는 HP가 많아서)
+const BOSS_HEAL_MAX = 20;
+// 날씨에 따라 회복량이 바뀌는 기술 (원작): 아침햇살·광합성·달빛은 쾌청 2/3, 다른 날씨(비·모래바람·설경·안개) 1/4 / 모래모으기는 모래바람 2/3
+const WEATHER_HEAL_MUL = 4 / 3, WEATHER_HEAL_LOW = 0.5;
+rule([234, 235, 236], { sunHeal: true, text: '쾌청이면 회복량 4/3배 (최대 HP의 2/3), 다른 날씨(비·모래바람·설경·안개)면 절반 (1/4).' });
+rule([659], { sandHeal: true, text: '모래바람이면 회복량 4/3배 (최대 HP의 2/3).' });
+
+// 기술 정의에 번호를 붙여 둔다 (상성이 특별한 기술 등을 번호로 알아보게. 복사한 기술에도 남는다)
+for (const [id, m] of Object.entries(DATA.moves)) m.id = +id;
+rule([573], { text: '물타입에게도 효과가 굉장하다.' });
+rule([560], { text: '격투와 비행 두 타입의 상성을 함께 계산한다.' });
+rule([614], { text: '비행타입과 부유 특성인 상대에게도 맞는다 (비행에게는 보통 상성).' });
+
+// 같은 편 전체 기술: 자신과 주변(TEAM_RANGE칸 안, 보이는 곳)의 같은 편 모두에게
+const TEAM_RANGE = 3;
+rule([791], { team: true, text: '자신과 주변(3칸 안)의 같은 편 모두의 HP를 최대 HP의 1/4 회복한다.' });
+rule([336, 597, 811], { team: true, text: '자신과 주변(3칸 안)의 같은 편 모두에게 효과가 있다.' });
+rule([777], { team: true, text: '자신과 주변(3칸 안)의 같은 편 모두의 공격과 특수공격을 2랭크씩 올린다.' });   // 데코레이션 (v0.90)
+
+// 첫 공격 전용: 그 적에게 하는 첫 공격일 때만 성공
+rule([252, 660], { first: true, text: '그 적에게 하는 첫 공격일 때만 성공한다.' });
+// 기습: 상대가 잠듦·얼음 상태이거나 나를 알아채지 못했으면 실패
+rule([389], { sucker: true, text: '상대가 잠들었거나 얼어 있거나 아직 나를 알아채지 못했으면 실패한다.' });
+// 꿈먹기 / 코골기
+rule([138], { needSleepTarget: true, text: '잠든 상대에게만 성공한다.' });
+rule([173], { needSleepSelf: true, text: '자신이 잠들어 있을 때만 쓸 수 있다. (잠든 상태에서도 사용 가능)' });
+// 힘껏펀치: 지난 행동 이후 공격을 받았다면 실패
+rule([264], { focus: true, text: '지난 행동 이후 공격을 받았다면 실패한다.' });
+// 반동으로 다음 턴 행동 불가
+rule([63, 416, 439, 459, 711, 794, 307, 308, 338, 795], { recharge: true, text: '사용한 다음 턴은 움직일 수 없다.' });
+// 관통 (v1.03): 위력이 아주 세고 패널티가 큰 원거리 기술은 앞 직선 사거리 안의 모든 적에게 맞는다 (같은 편은 지나간다, 패널티는 한 번만)
+const PIERCE_MOVES = [63, 307, 308, 338, 459, 711, 795, 315, 437, 354, 705, 796];   // 용성군(434)은 범위기 (아래)
+rule(PIERCE_MOVES, { pierce: true });
+for (const id of PIERCE_MOVES) if (MOVE_RULES[id]) MOVE_RULES[id].text = (MOVE_RULES[id].text ? MOVE_RULES[id].text + ' ' : '') + L(`앞 직선 ${PROJ_RANGE}칸 안의 모든 적에게 맞는다 (관통).`, `Hits all foes within ${PROJ_RANGE} tiles in a straight line (piercing).`);
+// 모으기 기술 (1턴째 준비, 다음 행동 때 발사)
+rule([76, 669], { charge: '빛을 모으고 있다!', sunNoCharge: true });
+rule([311], { weatherBall: true, text: '날씨에 따라 타입이 바뀌고 위력이 100이 된다 (쾌청 불꽃, 비 물, 모래바람 바위, 설경 얼음).' });
+rule([143], { charge: '거센 공기에 휩싸였다!' });
+rule([130], { charge: '머리를 움츠렸다!', chargeSc: [[3, 1]] });
+rule([601], { charge: '파워를 모으고 있다!' });
+rule([19, 340], { charge: '하늘 높이 날아올랐다!', invuln: true });
+rule([91], { charge: '땅속으로 파고들었다!', invuln: true });
+rule([291], { charge: '물속으로 잠수했다!', invuln: true });
+rule([467, 566], { charge: '모습을 감췄다!', invuln: true });
+// 난동: 2~3턴 동안 자동으로 공격, 끝나면 혼란
+// 플래시 (v0.102 보강): 탐험대가 쓰면 그 층의 지도를 모두 밝힌다 (층마다 한 번)
+rule([148], { mapAll: true, text: '탐험대가 쓰면 주변 10칸 안의 지도를 밝힌다 (층마다 처음 한 번). 앞의 상대의 명중률을 떨어뜨린다.' });
+// 소란피기 (v0.102 보강): 3턴 동안 계속 공격하고(PP는 처음에만), 그동안은 층의 누구도 잠들지 않는다. 끝나도 혼란에 빠지지 않는다
+// 가두는 기술 (v0.102 보강): 김밥말이·조이기·회오리불꽃·모래지옥·바다회오리·껍질끼우기·마그마스톰·엉겨붙기·썬더프리즌
+rule([35, 20, 83, 328, 250, 128, 463, 611, 819], { bind: true, text: '바로 옆 칸에서 맞은 상대는 4~5턴 동안 그 자리에 갇혀 걷지 못하고(공격은 할 수 있다), 턴마다 최대 HP의 1/16 데미지를 입는다. 가둔 쪽이 쓰러지거나 옆 칸에서 멀어지면 풀린다.' });
+rule([253], { rampage: true, rampTurns: 2, noConfuse: true, uproar: true, text: '3턴 동안 계속 직선 위의 적을 공격한다 (PP는 처음에만 소모). 그동안은 층의 누구도 잠들지 않는다. 끝나도 혼란에 빠지지 않는다.' });
+// 스케일샷: 다 맞힌 뒤 자신의 방어가 1단계 떨어지고 스피드가 1단계 오른다 (PokeAPI에 능력 변화가 빠져 있었다)
+if (DATA.moves[799] && !DATA.moves[799].sc) Object.assign(DATA.moves[799], { sc: [[3, -1], [6, 1]], scc: 100, ss: 1 });
+rule([37, 80, 200], { rampage: true, text: '2~3턴 동안 가까운 적을 자동으로 공격하고, 끝나면 혼란에 빠진다. (PP는 처음에만 소모)' });
+// 지연 공격
+rule([248, 353], { delay: 2, text: '2턴 뒤에 앞의 적에게 공격이 떨어진다.' });
+// 자폭 계열 (완화: 기절 대신 HP가 1 남음)
+// 자폭·대폭발: HP가 SELF_KO_MIN 미만이면 쓸 수 없다 (HP 1로 연속해서 터뜨리지 못하게)
+const SELF_KO_MIN = 0.5;
+// 같은 기술을 연속으로 쓸 수 없다 (거대해머·블러드문, v0.102): 바로 앞 턴(또는 같은 턴)에 쓴 기술이면 막힌다. c.lastUse = { id, turn }
+rule([893, 901], { noRepeat: true, text: '같은 기술을 연속으로 쓸 수 없다 (쓴 다음 턴에는 다른 행동을 해야 한다).' });
+const repeatBlocked = (c, mid, turn) => !!(MOVE_RULES[mid] && MOVE_RULES[mid].noRepeat && c.lastUse && c.lastUse.id === mid && turn - c.lastUse.turn <= 1);
+const selfKOBlocked = (c, mid) => !!(MOVE_RULES[mid] && MOVE_RULES[mid].selfKO && c.hp < c.maxhp * SELF_KO_MIN);
+rule([120, 153], { selfKO: true, text: '사용하면 자신의 HP가 1만 남는다. (원작은 기절) HP가 절반보다 적으면 쓸 수 없다.' });
+rule([720], { selfDmgPct: 25, text: '사용하면 최대 HP의 25%만큼 데미지를 입는다. HP가 1 아래로는 떨어지지 않는다. (원작 50%)' });
+// HP를 깎는 변화 기술
+rule([775], { hpCostPct: 33, text: '최대 HP의 1/3을 깎아서 사용한다. HP가 부족하면 실패한다.' });
+// 혼자 탐험하므로 상대 회복 기술은 자기 회복으로
+// 치유파동·플라워힐: 원작처럼 같은 편 하나를 회복한다 (v0.47~0.79에는 혼자 탐험이라 자신을 회복했다). 자신은 회복하지 못한다
+rule([74], { sunSc: true, text: '쾌청(아주 강한 햇살 포함)이면 공격과 특수공격이 2랭크씩 오른다.' });   // 성장
+rule([505, 666], { allyHeal: true, text: '같은 편 하나의 HP를 회복한다. 바로 앞의 같은 편, 없으면 주변(3칸 안)에서 HP 비율이 가장 낮은 같은 편. 같은 편이 없으면 실패한다.' });
+// 회복할 같은 편 (바로 앞이 같은 편이면 그쪽, 아니면 주변에서 HP 비율이 가장 낮은 쪽). 없으면 null
+function allyHealTarget(user, mons, isAlly, inRange, front) {
+  if (front && front !== user && front.hp > 0 && isAlly(front)) return front;
+  return mons.filter(t => t && t !== user && t.hp > 0 && isAlly(t) && inRange(t)).sort((a, b) => a.hp / a.maxhp - b.hp / b.maxhp)[0] || null;
+}
+// 칼등치기
+rule([206], { falseSwipe: true, text: '상대의 HP를 반드시 1 남긴다.' });
+// 조건부 위력
+rule([263], { pow: 'guts', text: '자신이 독·마비·화상 상태이면 위력이 2배.' });
+rule([474], { pow: 'venom', text: '상대가 독 상태이면 위력이 2배.' });
+rule([362], { pow: 'brine', text: '상대의 HP가 절반 이하이면 위력이 2배.' });
+rule([284, 323, 820], { pow: 'eruption', text: '자신의 HP가 적을수록 위력이 떨어진다.' });
+rule([500, 681], { pow: 'stored', text: '자신의 능력이 올라간 단계만큼 위력이 20씩 오른다.' });
+rule([279, 419], { pow: 'revenge', text: '지난 행동 이후 그 상대에게 공격받았다면 위력이 2배.' });
+rule([371], { pow: 'payback', text: '지난 행동 이후 공격을 받았다면 위력이 2배.' });
+rule([372], { pow: 'assurance', text: '지난 행동 이후 상대가 이미 데미지를 입었다면 위력이 2배.' });
+rule([754, 755], { pow: 'firstStrike', text: '그 적에게 하는 첫 공격이면 위력이 2배.' });
+rule([707], { pow: 'stomp', text: '지난번 기술이 빗나갔다면 위력이 2배.' });
+rule([205], { chain: 3, text: '연속으로 쓸 때마다 위력이 2배 (최대 8배). 다른 행동을 하면 초기화.' });
+rule([210], { chain: 2, text: '연속으로 쓸 때마다 위력이 2배 (최대 4배). 다른 행동을 하면 초기화.' });
+rule([497], { chain: 4, text: '연속으로 쓸 때마다 위력이 40씩 오른다 (최대 200). 다른 행동을 하면 초기화.', chainAdd: true });
+rule([167], { escalate: true, text: '맞을 때마다 위력이 10씩 오른다 (10 → 20 → 30).' });
+// 교체 기술: 던전에서는 교체 없음
+rule([369, 521, 812], { pivot: true, text: '던전에서는 맞히면 바로 뒤에 있는 같은 편과 자리를 바꾼다. 뒤가 비었거나 적이면 공격만 한다.' });
+rule([575], { text: '던전에서는 교체 효과 없이 능력만 떨어뜨린다.' });
+
+function moveRuleText(mid) {
+  const r = MOVE_RULES[mid]; if (!r) return '';
+  if (r.text) return r.text;
+  if (r.charge && LANG === 'en') return `Prepares on turn 1 and fires on the next action.${r.invuln ? " Can't be hit while preparing." : ''}${r.chargeSc ? ' Defense rises while preparing.' : ''}${r.sunNoCharge ? ' Fires at once in harsh sunlight.' : ''} (press any key to fire)`;
+  if (r.charge) return `1턴째에 준비하고 다음 행동 때 발사한다.${r.invuln ? ' 준비하는 동안에는 공격을 받지 않는다.' : ''}${r.chargeSc ? ' 준비할 때 방어가 오른다.' : ''}${r.sunNoCharge ? ' 쾌청일 때는 바로 발사한다.' : ''} (아무 키나 누르면 발사)`;
+  return '';
+}
+
+// 연속 기술: PokeAPI에 횟수가 비어 있는 최신 기술 보완
+[[865, [3, 3]], [888, [2, 2]], [860, [1, 10]]].forEach(([id, h]) => { if (DATA.moves[id] && !DATA.moves[id].hits) DATA.moves[id].hits = h; });
+rule([813], { escalate: true, text: '맞을 때마다 위력이 20씩 오른다 (20 → 40 → 60).' });
+rule([860], { popBomb: true, text: '한 번 맞을 때마다 90% 확률로 다음 공격이 이어진다 (최대 10회, 평균 약 6회). 스킬링크면 항상 10회.' });
+
+// ── 원본 데이터(PokeAPI)에 표시가 빠진 8·9세대 기술 바로잡기 ──
+// 접촉 표시가 없으면 원거리(직선) 기술로 분류되어 바로 앞의 적도 제대로 맞히지 못했다 (예: 찍찍베기, 제트펀치)
+// 1 접촉, 8 펀치, 9 소리, 16 물기, 17 파동, 18 탄환
+const MOVE_FLAG_FIX = {
+  1: [827, 828, 830, 834, 838, 845, 853, 857, 859, 860, 861, 862, 865, 866, 869, 872, 873, 875, 878, 879, 884, 885, 887, 889, 891, 892, 894, 910, 912, 915, 916, 918],
+  8: [857, 889],
+  9: [871, 914, 917],
+  16: [746, 755],
+  17: [805],
+  18: [780, 903],
+};
+for (const [flag, ids] of Object.entries(MOVE_FLAG_FIX)) {
+  for (const id of ids) {
+    const m = DATA.moves[id]; if (!m) continue;
+    m.fg = [...new Set([...(m.fg || []), +flag])].sort((a, b) => a - b);
+    if (+flag === 1 && m.c !== 1 && m.r === 'p') m.r = 'f';   // 접촉 기술은 바로 앞 칸
+  }
+}
+// ── 원본 데이터에 추가 효과가 빠져 있던 8·9세대 기술 (원작 수치) ──
+// ail: 1 마비 2 잠듦 3 얼음 4 화상 5 독 6 혼란 / ac: 그 확률 / sc: [[능력, 단계]] (2 공격 3 방어 4 특공 5 특방 6 스피드), scc: 확률, ss: 자신에게
+// fl: 풀죽음 확률 / cr: 급소 단계 (3이면 반드시) / dr: 흡수(+)·반동(−) % / hits: 연속 횟수 / ailPick: 상태 이상을 이 중에서 하나
+const MOVE_EFFECT_FIX = {
+  827: { ail: 5, ac: 50, ailPick: ['psn', 'par', 'slp'] },   // 페이탈클로
+  828: { sc: [[3, 1]], scc: 100 },               // 배리어러시
+  831: { sc: [[2, -1]], scc: 30 },               // 봄의폭풍
+  832: { sc: [[4, 1]], scc: 100 },               // 신비의힘
+  834: { dr: -33 },                              // 웨이브태클
+  836: { fl: 30 },                               // 빙산바람
+  838: { sc: [[3, -1], [5, -1]], scc: 100, ss: 1 },   // 들이받기
+  839: { ail: 5, ac: 30 },                       // 독침천발
+  840: { cr: 1, sc: [[6, 1]], scc: 100 },        // 오라윙
+  841: { sc: [[2, -1]], scc: 100 },              // 천추지한
+  843: { cr: 1, sc: [[3, -1]], scc: 50, fl: 30 },   // 3연화살
+  844: { ail: 4, ac: 30 },                       // 백귀야행
+  846: { sc: [[6, -1]], scc: 30 },               // 찬바람폭풍
+  847: { ail: 1, ac: 20 },                       // 번개폭풍
+  848: { ail: 4, ac: 20 },                       // 열사의폭풍
+  853: { ail: 6, ac: 30 },                       // 발꿈치찍기
+  859: { ss: 1 },                                // 휠스핀: 자신의 스피드가 떨어진다
+  865: { hits: [3, 3] },                         // 트리플다이브
+  866: { ail: 5, ac: 100 },                      // 킬러스핀
+  870: { cr: 3 },                                // 트릭플라워: 반드시 급소
+  874: { ss: 1 },                                // 골드러시: 자신의 특공이 떨어진다
+  888: { hits: [2, 2] },                         // 트윈빔
+  890: { ss: 1 },                                // 아머캐논: 자신의 방어·특방이 떨어진다
+  891: { dr: 50 },                               // 원념의칼
+  895: { cr: 1 },                                // 아쿠아커터
+  902: { dr: 50, ail: 4, ac: 20 },               // 휘적휘적포
+  904: { cr: 1 },                                // 덩굴방망이
+  919: { ail: 5, ac: 50 },                       // 악독사슬
+};
+for (const [id, fx] of Object.entries(MOVE_EFFECT_FIX)) if (DATA.moves[id]) Object.assign(DATA.moves[id], fx);
+rule([839], { pow: 'venom', text: '상대가 독 상태이면 위력이 2배.' });
+rule([506, 844], { pow: 'hex', text: '상대가 상태 이상이면 위력이 2배.' });
+rule([835], { selfDmgPct: 25, text: '사용하면 최대 HP의 25%만큼 데미지를 입는다. HP가 1 아래로는 떨어지지 않는다. (원작 50%)' });
+rule([833], { rampage: true, text: '2~3턴 동안 가까운 적을 자동으로 공격하고, 끝나면 혼란에 빠진다. (PP는 처음에만 소모)' });
+rule([915], { pow: 'stomp', text: '지난번 기술이 빗나갔으면 위력이 2배.' });
+// 예리함: 베는 기술 (원작 목록)
+const SLICING_MOVES = new Set([15, 75, 163, 210, 314, 332, 348, 400, 403, 404, 427, 440, 533, 534, 548, 669, 781, 830, 845, 860, 869, 875, 891, 895]);
+// 선공기(원작에서 먼저 나가는 기술): 앞 2칸까지 닿는다 (바로 앞이 비었으면 한 칸 너머의 적). 원거리 선공기(진공파·얼음뭉치 등)는 그대로
+const PRIORITY_MOVES = [98, 245, 183, 252, 389, 453, 425, 418, 709, 660, 803, 857, 918, 729];
+for (const id of PRIORITY_MOVES) if (DATA.moves[id] && DATA.moves[id].r === 'f') rule([id], { reach: 2 });
+if (DATA.moves[904]) DATA.moves[904].ivy = true;   // 덩굴방망이: 가면에 따라 타입이 바뀐다 (js/mechanics.js ivyType)
+// ── 전설 포켓몬 전용기 ──
+// 원작 전용기인데 원본 데이터에 빠져 있던 기술 (자시안·자마젠타·레지기가스·카푸·크레세리아)
+const LEGEND_NEW_MOVES = {
+  781: { n: '거수참', t: 9, p: 100, a: 100, pp: 5, c: 2, r: 'f', d: '전설의 검을 크게 휘둘러 상대를 벤다.' },
+  782: { n: '거수탄', t: 9, p: 100, a: 100, pp: 5, c: 2, r: 'f', d: '방패가 된 몸으로 상대에게 부딪친다.' },
+  462: { n: '묵사발', t: 1, p: 120, a: 100, pp: 5, c: 2, r: 'f', fg: [1], d: '엄청난 힘으로 상대를 꽉 쥐어 공격한다. 상대의 HP가 많이 남았을수록 위력이 높다.' },
+  717: { n: '자연의분노', t: 18, p: 90, a: 90, pp: 10, c: 3, r: 'p', d: '자연의 분노를 퍼부어 상대의 HP를 절반으로 줄인다.' },
+  849: { n: '초승달축복', t: 14, p: 0, a: 0, pp: 5, c: 1, r: 's', h: 25, d: '초승달의 빛으로 자신과 같은 편의 HP를 회복하고 상태 이상을 고친다.' },
+};
+for (const [id, m] of Object.entries(LEGEND_NEW_MOVES)) if (!DATA.moves[id]) DATA.moves[id] = { ...m, id: +id };
+// 레벨업으로 배운다 (Lv40). 자시안·자마젠타는 검왕·방패왕 모습도
+for (const [mid, sps] of [[781, [888, 1237]], [782, [889, 1238]], [462, [486]], [717, [785, 786, 787, 788]], [849, [488]]]) {
+  for (const sp of sps) { const s = DATA.species[sp]; if (s && !s.l.some(x => x[1] === mid)) { s.l.push([40, mid]); s.l.sort((a, b) => a[0] - b[0]); } }
+}
+// 승리의춤 (v0.102 보강): 히스이 드레디어가 진화할 때(Lv1) 배운다. 자신의 공격·방어·스피드 +1
+if (!DATA.moves[837]) DATA.moves[837] = { id: 837, n: '승리의춤', t: 2, p: 0, a: 0, pp: 10, c: 1, r: 's', sc: [[2, 1], [3, 1], [6, 1]], scc: 100, d: '격렬하게 춤을 춰서 승리를 불러들인다. 자신의 공격과 방어와 스피드를 올린다.' };
+if (DATA.species[1146] && !DATA.species[1146].l.some(x => x[1] === 837)) DATA.species[1146].l.unshift([1, 837]);
+// 버드렉스 기수 모습 전용기 (v0.86): 주변 범위
+const RIDER_MOVES = {
+  824: { n: '블리자드랜스', t: 15, p: 120, a: 100, pp: 5, c: 2, r: 'r', d: '블리자포스가 얼음 창을 내던져 상대를 공격한다.' },
+  825: { n: '아스트랄비트', t: 8, p: 120, a: 100, pp: 5, c: 3, r: 'r', d: '수많은 유령을 상대에게 부딪쳐서 공격한다.' },
+};
+for (const [id, m] of Object.entries(RIDER_MOVES)) if (!DATA.moves[id]) DATA.moves[id] = { ...m, id: +id };
+// 버드렉스 기수 모습: SpriteCollab에 던전 그림이 없어서 노멀폼 그림을 빌린다 (sb, 초상화도 원래 모습). 마을에서 고르는 모습 (블리자포스·레이스포스를 영입해야, js/forms.js FORM_NEEDS)
+// 번호는 tools/form_ids.json에도 적어 둔다 (세이브·구조 코드가 깨지지 않게)
+const CALYREX_RIDERS = [
+  [1244, 'calyrex-ice', '버드렉스 (백마 탄 모습)', 'Calyrex (Ice Rider)', [14, 15], [100, 165, 150, 85, 130, 50], 266, 824, '0001'],
+  [1245, 'calyrex-shadow', '버드렉스 (흑마 탄 모습)', 'Calyrex (Shadow Rider)', [14, 8], [100, 85, 80, 165, 100, 150], 267, 825, '0002'],
+];
+for (const [id, fi, n, e, t, b, ab, sig, path] of CALYREX_RIDERS) {
+  const base = DATA.species[898];
+  if (!base || DATA.species[id]) continue;
+  // 기술: 버드렉스의 기술 + 함께 탄 말(블리자포스·레이스포스)의 레벨업 기술 + 전용기 (원작 기수 모습처럼)
+  // 백마 탄 모습은 고드름침(333)도 배운다 (v0.91)
+  const steed = DATA.species[ab === 266 ? 896 : 897], seen = new Set(), l = [], extra = ab === 266 ? [[1, 333]] : [];
+  for (const x of [[1, sig], ...extra, ...base.l, ...(steed ? steed.l : [])]) if (!seen.has(x[1])) { seen.add(x[1]); l.push(x); }
+  l.sort((a, c) => a[0] - c[0]);
+  DATA.species[id] = { ...base, n, e, t, b, x: 340, l, v: [], ab: [[ab, 0]], em: '', sem: '', f: [898, path], fc: 'select', fi, sb: 898 };
+}
+// 스케치 (v0.99): 루브도 전용. 앞의 상대가 가진 기술 중 하나를 골라 영구히 배운다 (js/dungeon.js sketchFrom)
+//  쓸 수 있는 횟수: Lv1·11·21…91이 될 때마다 1번 (원작처럼 최대 10번). 배운 기술은 save.sketched[번호]에 남는다
+const SKETCH = 166, SKETCH_LEVELS = [1, 11, 21, 31, 41, 51, 61, 71, 81, 91];
+if (!DATA.moves[SKETCH]) DATA.moves[SKETCH] = { id: SKETCH, n: '스케치', t: 1, p: 0, a: 0, pp: 1, c: 1, r: 'f', d: '상대가 가진 기술 하나를 베껴서 영구히 자신의 기술로 만든다.' };
+rule([SKETCH], { sketch: true, text: '바로 앞의 상대가 가진 기술 중 하나를 골라 영구히 배운다. 스케치 칸이 그 기술로 바뀐다. Lv1·11·21…91이 될 때마다 한 번씩 쓸 수 있다 (최대 10번).' });
+if (DATA.species[235] && !DATA.species[235].l.some(x => x[1] === SKETCH)) { DATA.species[235].l.unshift([1, SKETCH]); DATA.species[235].l.sort((a, b) => a[0] - b[0]); }
+function sketchLeft(c) {
+  const key = c.rsp || c.sp, used = ((typeof Game !== 'undefined' && Game.save && Game.save.sketched) || {})[key] || [];
+  return SKETCH_LEVELS.filter(l => l <= c.lv).length - used.length;
+}
+// 따라큐 (탈이 벗겨진 모습)·울트라네크로즈마 (v0.99). 번호는 tools/form_ids.json
+if (DATA.species[778] && !DATA.species[1247]) {
+  DATA.species[1247] = { ...DATA.species[778], n: '따라큐 (탈이 벗겨진 모습)', e: 'Mimikyu (Busted Form)', v: [], f: [778, '0001'], fc: 'battle', fi: 'mimikyu-busted',
+    cr: ['baronessfaron', 'Emmuffin'], em: 'NPCZ', sem: 'NPCZ' };
+}
+if (!DATA.abilities[233]) DATA.abilities[233] = { n: '브레인포스', d: '효과가 굉장한 기술의 위력이 더욱 올라간다.' };
+if (DATA.species[800] && !DATA.species[1248]) {
+  DATA.species[1248] = { ...DATA.species[800], n: '울트라네크로즈마', e: 'Ultra Necrozma', t: [14, 16], b: [97, 167, 97, 167, 97, 129], ab: [[233, 0]], v: [],
+    f: [800, '0003'], fc: 'item', fi: 'necrozma-ultra', cr: ['baronessfaron', 'baronessfaron'], em: 'NJSDPCZUAWH', sem: 'JSDPCNZUAWH' };
+}
+// 체리꼬 포지폼 (v0.99): 쾌청이면 바뀐다 (js/forms.js BATTLE_FORMS). 능력치·타입·특성은 원래 모습과 같다. 번호는 tools/form_ids.json
+if (DATA.species[421] && !DATA.species[1246]) {
+  DATA.species[1246] = { ...DATA.species[421], n: '체리꼬 (포지폼)', e: 'Cherrim (Sunshine Form)', v: [], f: [421, '0001'], fc: 'battle', fi: 'cherrim-sunshine',
+    cr: ['CHUNSOFT, Caitemis', 'CHUNSOFT, Emmuffin'], em: 'NACDZHJPSUW', sem: 'NACDZHJPSUW' };
+}
+// 테라파고스 스텔라폼 (v0.100): 스텔라결정을 지니면. 번호는 tools/form_ids.json
+//  던전 그림 (v1.12): GitHub 익명 제보로 받은 대기 동작만 저장소에 있다 (sprites/1249/, LOCAL_SPRITES, 테라스탈폼 도트를 바탕으로). 이로치 그림은 없다
+if (!DATA.abilities[306]) DATA.abilities[306] = { n: '제로포밍', d: '테라파고스가 스텔라폼이 되었을 때 숨겨진 힘으로 날씨와 필드의 영향을 모두 없앤다.' };
+if (DATA.species[1024] && !DATA.species[1249]) {
+  DATA.species[1249] = { ...DATA.species[1024], n: '테라파고스 (스텔라폼)', e: 'Terapagos (Stellar Form)', t: [1], b: [160, 105, 110, 130, 110, 85], ab: [[306, 0]], v: [],
+    f: [1024, '0002'], fc: 'item', fi: 'terapagos-stellar', sh: 0, cr: ['익명 제보 (AI 보조, 원본: G〜, JFain)', 'G〜'], em: 'N', sem: '' };
+}
+rule([462], { pow: 'crush', text: '위력 = 120 × 상대의 남은 HP 비율 (HP가 가득이면 120).' });
+rule([717], { text: '던전에서는 상대 HP를 절반으로 줄이는 대신 위력 90으로 공격한다.' });
+rule([849], { team: true, cure: true, text: '자신과 주변(3칸 안)의 같은 편 모두의 HP를 최대 HP의 1/4 회복하고 상태 이상을 고친다.' });
+// 전설 전용기는 주변(3칸 안)의 모든 적에게 닿는다 (위력은 그대로). 가이오가·그란돈의 근원의파동·단애의칼처럼
+const LEGEND_SIG = [540, 177, 221, 296, 295, 620, 353, 459, 460, 463, 467, 465, 449, 557, 558, 559, 551, 550, 548, 546, 613, 593, 592, 718,
+  713, 714, 722, 711, 705, 712, 721, 742, 744, 795, 817, 818, 819, 878, 919, 821, 823, 354, 832, 877, 904, 781, 782, 462, 717, 621];
+for (const id of LEGEND_SIG) if (DATA.moves[id] && DATA.moves[id].c !== 1) DATA.moves[id].r = 'r';
+// 악의파동: 주변(3칸 안)의 모든 적에게 (v0.91)
+if (DATA.moves[399]) DATA.moves[399].r = 'r';
+// 수평베기 (v0.102 보강): 앞과 앞 양옆 대각선 3칸
+rule([2001], { wide: true, text: '앞 칸과 그 양옆 대각선 칸(3칸)의 상대를 모두 공격한다. 무속성이라 상성·자속 보정이 없다.' });
+rule([2002], { text: '주변(3칸 안)의 모든 상대를 공격한다. 무속성이라 상성·자속 보정이 없다.' });
+// 대지의힘: 주변(3칸 안)의 모든 적에게 (v0.102 보강)
+if (DATA.moves[414]) DATA.moves[414].r = 'r';
+if (DATA.moves[434]) DATA.moves[434].r = 'r';   // 용성군 (v1.03): 하늘에서 운석이 쏟아지니 주변(3칸 안)의 모든 적에게
+// 벌레의야단법석: 벌레 타입에 쓸 만한 범위기가 없어서 하이퍼보이스처럼 주변 범위로 (원작은 상대 하나, v0.77)
+if (DATA.moves[405]) DATA.moves[405].r = 'r';
+// 은빛바람·괴상한바람: 상징적인 바람 기술이라 주변 범위로 (원작은 상대 하나, v0.98)
+for (const id of [318, 466]) if (DATA.moves[id]) DATA.moves[id].r = 'r';
+// 물리 범위기가 지진 말고는 쓸 만한 것이 적어서 (v0.92): 눈사태·고속스핀·아이스스피너·휠스핀·암석액스·비검천중파를 주변(3칸 안) 범위로
+for (const id of [419, 229, 861, 859, 830, 845]) if (DATA.moves[id]) DATA.moves[id].r = 'r';
+// 범위 이름 (선공기는 '앞 2칸')
+const RANGE_SHORT_N = L({ f: '앞', p: '원거리', r: '주변', s: '자신' }, { f: 'Front', p: 'Ranged', r: 'Around', s: 'Self' });
+const rangeShort = id => (MOVE_RULES[id] && MOVE_RULES[id].reach ? L(`앞 ${MOVE_RULES[id].reach}칸`, `Front ${MOVE_RULES[id].reach}`) : RANGE_SHORT_N[DATA.moves[id].r]);
+// 기본 PP가 5인 공격 기술은 10으로 (v1.03): 전용기·대기술을 PP가 모자라 거의 못 쓰던 문제. 회복·날씨·잠자기 같은 변화 기술은 5 그대로
+const PP5_UP = 10;
+for (const m of Object.values(DATA.moves)) if (m.pp === 5 && m.c !== 1) m.pp = PP5_UP;

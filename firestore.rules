@@ -1,0 +1,261 @@
+rules_version = '2';
+// 불가사의 던전 웹: Firestore 보안 규칙
+// Firebase 콘솔 → Firestore Database → 규칙 탭에 붙여 넣고 "게시"한다 (개발용·서비스용 프로젝트 둘 다)
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function shortName(n) { return n is string && n.size() > 0 && n.size() <= 16; }
+    // 닉네임은 names/{소문자 닉네임} 문서로 먼저 차지한 사람만 쓸 수 있다 (겹치기·사칭 방지)
+    function ownsName(n) {
+      return shortName(n) && get(/databases/$(database)/documents/names/$(n.lower())).data.uid == request.auth.uid;
+    }
+
+    // 읽기는 로그인한 사람만 (v0.97: 로그인 없이 스크립트로 읽어 요금을 올리지 못하게. 가입은 계정을 만든 뒤 닉네임을 확인한다)
+    match /names/{name} {
+      allow read: if signedIn();
+      allow create: if signedIn() && name.size() <= 16
+        && request.resource.data.keys().hasOnly(['uid']) && request.resource.data.uid == request.auth.uid;
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    // 계정별 정보와 클라우드 세이브: 본인만 읽고 쓴다
+    // 세이브는 upAt(서버 시각)을 함께 써야 하고, 20초에 한 번까지만 바꿀 수 있다 (도배 방지)
+    function saveThrottled() {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(['save'])
+        || (request.resource.data.upAt == request.time
+            && (resource.data.get('upAt', null) == null || resource.data.upAt < request.time - duration.value(20, 's')));
+    }
+    // base (v1.11): 올리는 쪽이 알고 있던 클라우드 세이브의 savedAt. 그 사이 다른 기기가 더 새 세이브를 올렸으면 거절한다
+    //  (아이폰은 홈 화면 앱과 사파리의 저장 공간이 따로라, 옛 쪽이 새 쪽의 클라우드 세이브를 덮을 수 있었다). base를 안 보내는 옛 버전은 그대로 받는다
+    //  base = [알고 있던 클라우드 savedAt, 이번에 올리는 savedAt]: 올릴 때마다 값이 바뀌어서 두 기기가 같은 값을 보내도 검사를 건너뛰지 않는다
+    function baseOk() {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(['base'])
+        || request.resource.data.base == [resource.data.get('savedAt', null), request.resource.data.get('savedAt', null)];
+    }
+    // sosAt: 마지막으로 구조 요청을 올린 서버 시각 (구조 요청 간격 제한, v0.97). 바꿀 때는 지금 시각으로만
+    function sosAtOk() {
+      return !('sosAt' in request.resource.data) || request.resource.data.sosAt == request.time
+        || (resource != null && resource.data.get('sosAt', null) == request.resource.data.sosAt);
+    }
+    match /users/{uid} {
+      allow read, delete: if signedIn() && request.auth.uid == uid;
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name', 'id', 'created', 'save', 'savedAt', 'ver', 'upAt', 'sosAt', 'base'])
+        && sosAtOk()
+        && (!('name' in request.resource.data) || ownsName(request.resource.data.name))
+        && (!('save' in request.resource.data) || (request.resource.data.save is string && request.resource.data.save.size() < 900000));
+      allow update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name', 'id', 'created', 'save', 'savedAt', 'ver', 'upAt', 'sosAt', 'base'])
+        && sosAtOk()
+        && baseOk()
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['name']) || ownsName(request.resource.data.name))
+        && (!('save' in request.resource.data) || (request.resource.data.save is string && request.resource.data.save.size() < 900000))
+        && saveThrottled();
+    }
+
+    // 접속자 수: 로그인한 사람이 자기 문서에 서버 시각만 남긴다 (1분에 한 번까지). 수는 로그인한 사람이 센다
+    match /presence/{uid} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['at']) && request.resource.data.at == request.time
+        && (resource == null || resource.data.at < request.time - duration.value(60, 's'));
+      allow delete: if signedIn() && request.auth.uid == uid;   // 계정 삭제
+    }
+
+    // 진단 기록: 어떤 기능이 몇 번 거절됐는지만 (본인만 쓰고, 읽기는 콘솔에서만). 30분에 한 번까지
+    match /diag/{uid} {
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['day', 'ver', 'c', 'at'])
+        && request.resource.data.at == request.time
+        && request.resource.data.day is string && request.resource.data.day.size() <= 10
+        && request.resource.data.ver is string && request.resource.data.ver.size() <= 8
+        && request.resource.data.c is map && request.resource.data.c.size() <= 30
+        && (resource == null || resource.data.at < request.time - duration.value(30, 'm'));
+      allow delete: if signedIn() && request.auth.uid == uid;   // 계정 삭제
+    }
+
+    // 운영자: admins/{uid} 문서가 있는 계정 (콘솔에서만 만든다). 본인 문서만 읽을 수 있다
+    function isAdmin() { return signedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)); }
+    match /admins/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+    }
+
+    // 끝없는 던전 랭킹 (v1.06): 본인 문서만, 닉네임은 본인 것(없어도 됨), 최고 층이 오를 때만 (1분에 한 번까지). 읽기는 로그인한 사람
+    //  층당 최소 10턴 (대충 고친 기록 막기). 요약(lv·kills·gum·ft)은 운영자가 보고 판단한다. 운영자는 기록을 지울 수 있다
+    function rankOk() {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['name', 'floor', 'turns', 'lead', 'party', 'sh', 'lv', 'kills', 'gum', 'ft', 'at', 'ver'])
+        && (!('name' in d) || ownsName(d.name)) && d.floor is int && d.floor >= 1 && d.floor <= 999 && d.turns is int && d.turns >= d.floor * 10 && d.turns <= 10000000
+        && d.lv is int && d.lv >= 1 && d.lv <= 999 && d.kills is int && d.kills >= 0 && d.kills <= 1000000
+        && d.gum is int && d.gum >= 0 && d.gum <= 100000 && d.ft is list && d.ft.size() <= 100
+        && d.lead is int && d.lead > 0 && d.lead < 5000
+        && d.party is list && d.party.size() <= 3
+        && d.sh is bool && d.at == request.time && d.ver is string && d.ver.size() <= 8;
+    }
+    match /endlessRank/{uid} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.auth.uid == uid && rankOk();
+      allow update: if signedIn() && request.auth.uid == uid && rankOk()
+        && request.resource.data.floor > resource.data.floor && resource.data.at < request.time - duration.value(60, 's');
+      allow delete: if signedIn() && (request.auth.uid == uid || isAdmin());   // 계정 삭제 · 운영자
+    }
+
+    // 스타팅 순위: 계정마다 한 번 starterVotes/{uid}를 만들면서, 같은 요청에서 집계 문서의 그 포켓몬 수를 정확히 1 올린다
+    // 처음에 고를 수 있는 포켓몬 434종 (v1.11, 게임의 starterIds()와 같아야 한다. 세이브를 고쳐 아르세우스 등을 넣은 표를 막는다)
+    function starterList() {
+      return [
+        1, 4, 7, 10, 13, 16, 19, 21, 23, 25, 27, 29, 32, 37, 41, 43, 46, 48, 50, 52, 54, 56, 58, 60, 63, 66, 69, 72, 74, 77,
+        79, 81, 83, 84, 86, 88, 90, 92, 95, 96, 98, 100, 102, 104, 108, 109, 111, 114, 115, 116, 118, 120, 123, 127, 128, 129, 131, 132, 133, 137,
+        138, 140, 142, 147, 152, 155, 158, 161, 163, 165, 167, 170, 172, 173, 174, 175, 177, 179, 187, 190, 191, 193, 194, 198, 200, 201, 203, 204, 206, 207,
+        209, 211, 213, 214, 215, 216, 218, 220, 222, 223, 225, 227, 228, 231, 234, 235, 236, 238, 239, 240, 241, 246, 252, 255, 258, 261, 263, 265, 270, 273,
+        276, 278, 280, 283, 285, 287, 290, 293, 296, 298, 299, 300, 302, 303, 304, 307, 309, 311, 312, 313, 314, 316, 318, 320, 322, 324, 325, 327, 328, 331,
+        333, 335, 336, 337, 338, 339, 341, 343, 345, 347, 349, 351, 352, 353, 355, 357, 359, 360, 361, 363, 366, 369, 370, 371, 374, 387, 390, 393, 396, 399,
+        401, 403, 406, 408, 410, 412, 415, 417, 418, 420, 422, 425, 427, 431, 433, 434, 436, 438, 439, 440, 441, 442, 443, 446, 447, 449, 451, 453, 455, 456,
+        458, 459, 479, 495, 498, 501, 504, 506, 509, 511, 513, 515, 517, 519, 524, 527, 529, 531, 532, 535, 539, 540, 543, 546, 548, 550, 551, 554, 556, 557,
+        559, 561, 562, 566, 568, 570, 572, 574, 577, 580, 582, 585, 587, 588, 590, 593, 594, 595, 597, 599, 602, 605, 607, 610, 613, 615, 617, 619, 621, 622,
+        624, 627, 629, 631, 632, 633, 636, 650, 653, 656, 659, 661, 664, 667, 669, 672, 674, 676, 677, 679, 682, 684, 686, 688, 690, 692, 694, 696, 698, 701,
+        702, 703, 704, 707, 708, 710, 712, 714, 722, 725, 728, 731, 734, 736, 739, 741, 742, 744, 746, 747, 749, 751, 753, 755, 757, 759, 761, 764, 766, 767,
+        769, 771, 774, 775, 776, 777, 778, 779, 780, 781, 782, 810, 813, 816, 819, 821, 824, 827, 829, 831, 833, 835, 840, 843, 845, 846, 848, 850, 852, 854,
+        856, 859, 868, 871, 872, 874, 875, 876, 877, 879, 880, 881, 882, 883, 884, 885, 906, 909, 912, 915, 917, 919, 921, 924, 926, 928, 932, 935, 938, 940,
+        946, 948, 951, 953, 955, 957, 960, 963, 965, 967, 968, 969, 971, 974, 976, 977, 978, 996, 1000, 1012, 1101, 1104, 1106, 1108, 1110, 1111, 1113, 1115, 1118, 1120,
+        1122, 1123, 1125, 1131, 1132, 1133, 1138, 1140, 1141, 1142, 1143, 1147, 1149, 1150];
+    }
+    function voteDoc() { return /databases/$(database)/documents/starterVotes/$(request.auth.uid); }
+    function statsDoc() { return /databases/$(database)/documents/stats/starters; }
+    match /starterVotes/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['sp', 'at'])
+        && request.resource.data.sp is int && request.resource.data.sp in starterList()
+        && request.resource.data.at == request.time
+        && getAfter(statsDoc()).data.c.get(string(request.resource.data.sp), 0)
+           == (exists(statsDoc()) ? get(statsDoc()).data.c.get(string(request.resource.data.sp), 0) : 0) + 1;
+    }
+    match /stats/starters {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && !exists(voteDoc()) && existsAfter(voteDoc())
+        && request.resource.data.keys().hasOnly(['c'])
+        && request.resource.data.c.diff(resource == null ? {} : resource.data.c).affectedKeys()
+             .hasOnly([string(getAfter(voteDoc()).data.sp)]);
+    }
+
+    // 엔딩 통계: 엔딩을 처음 본 탐험대가 계정마다 한 번 endingVotes/{uid}를 만들면서, 같은 요청에서 집계 문서 stats/endings를 그 기록만큼 올린다
+    // 누가 무엇을 냈는지는 집계에 남지 않고 숫자만 쌓인다. 값의 형식은 여기서 확인한다
+    function endVote() { return /databases/$(database)/documents/endingVotes/$(request.auth.uid); }
+    function endStats() { return /databases/$(database)/documents/stats/endings; }
+    function spOk(x) { return x == null || (x is int && x > 0 && x < 5000); }
+    function dgOk(x) { return x == null || (x is string && x.matches('^[a-z]{1,16}$')); }
+    function numOk(x) { return x is int && x >= 0 && x <= 100000000; }
+    function endVoteOk(v) {
+      return v.keys().hasOnly(['starter', 'shiny', 'ultra', 'legend', 'lead', 'faint', 'most', 'days', 'sec', 'kills', 'floors', 'bosses', 'clears', 'missions', 'rescues', 'faints', 'ver', 'at'])
+        && (v.starter == null || v.starter in starterList()) && spOk(v.shiny) && spOk(v.ultra) && spOk(v.legend) && spOk(v.lead) && dgOk(v.faint) && dgOk(v.most)
+        && numOk(v.days) && numOk(v.sec) && numOk(v.kills) && numOk(v.floors) && numOk(v.bosses) && numOk(v.clears)
+        && numOk(v.missions) && numOk(v.rescues) && numOk(v.faints)
+        && v.ver is string && v.ver.size() <= 8 && v.at == request.time;
+    }
+    // 순위 맵 cat: 낸 값 v가 없으면 그대로, 있으면 그 칸만 정확히 1 오른다
+    function cntOk(o, d, cat, v) {
+      let a = o.get(cat, {});
+      let b = d.get(cat, {});
+      return v == null ? b == a : (b.diff(a).affectedKeys().hasOnly([string(v)]) && b.get(string(v), 0) == a.get(string(v), 0) + 1);
+    }
+    // 합계 k: 낸 값만큼 오른다 (평균 = 합계 / 인원)
+    function sumOk(o, d, k, v) { return d.get('sum', {}).get(k, 0) == o.get('sum', {}).get(k, 0) + v; }
+    function endStatsOk(v) {
+      let o = resource == null ? {} : resource.data;
+      let d = request.resource.data;
+      return d.keys().hasOnly(['n', 'starter', 'shiny', 'ultra', 'legend', 'lead', 'faint', 'most', 'sum', 'minDays'])
+        && d.get('sum', {}).keys().hasOnly(['days', 'sec', 'kills', 'floors', 'bosses', 'clears', 'missions', 'rescues', 'faints'])
+        && d.n == o.get('n', 0) + 1
+        && cntOk(o, d, 'starter', v.starter) && cntOk(o, d, 'shiny', v.shiny) && cntOk(o, d, 'ultra', v.ultra) && cntOk(o, d, 'legend', v.legend)
+        && cntOk(o, d, 'lead', v.lead) && cntOk(o, d, 'faint', v.faint) && cntOk(o, d, 'most', v.most)
+        && sumOk(o, d, 'days', v.days) && sumOk(o, d, 'sec', v.sec) && sumOk(o, d, 'kills', v.kills) && sumOk(o, d, 'floors', v.floors)
+        && sumOk(o, d, 'bosses', v.bosses) && sumOk(o, d, 'clears', v.clears) && sumOk(o, d, 'missions', v.missions)
+        && sumOk(o, d, 'rescues', v.rescues) && sumOk(o, d, 'faints', v.faints)
+        // 가장 빨리 엔딩을 본 날: 더 빠르면 그 값, 아니면 그대로
+        && (v.days < o.get('minDays', 1000000) ? d.get('minDays', null) == v.days : d.get('minDays', null) == o.get('minDays', null));
+    }
+    match /endingVotes/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create: if signedIn() && request.auth.uid == uid && endVoteOk(request.resource.data)
+        && existsAfter(endStats()) && getAfter(endStats()).data.n == (exists(endStats()) ? get(endStats()).data.n : 0) + 1;
+      allow delete: if signedIn() && request.auth.uid == uid;   // 계정 삭제 (집계에 더한 숫자는 남는다)
+    }
+    match /stats/endings {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && !exists(endVote()) && existsAfter(endVote()) && endStatsOk(getAfter(endVote()).data);
+    }
+
+    // 구조 게시판
+    // 구조 요청 간격 (v0.97): 같은 요청에서 users/{내 uid}.sosAt을 지금 시각으로 남겨야 하고, 지난 요청에서 2분이 지나야 한다 (스크립트 도배 방지)
+    function myUser() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function sosGapOk() {
+      return existsAfter(myUser()) && getAfter(myUser()).data.get('sosAt', null) == request.time
+        && (!exists(myUser()) || get(myUser()).data.get('sosAt', null) == null
+            || get(myUser()).data.sosAt < request.time - duration.value(2, 'm'));
+    }
+    match /sos/{id} {
+      allow read: if signedIn();
+      // 요청 올리기: 본인 이름으로, 열린 상태로만
+      // 값의 형식도 확인한다: 다른 사람 화면에 그대로 보이는 값이라 조작된 값(HTML 등)을 받지 않는다
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['owner', 'name', 'dungeon', 'floor', 'sp', 'lv', 'shiny', 'ver', 'key', 'status', 'created', 'sid', 'exp'])
+        // exp: 자동 삭제 시각 (TTL, v0.98). 올린 시각 + 7일이어야 한다 (예전 게임은 보내지 않는다)
+        && (!('exp' in request.resource.data) || (request.resource.data.exp is timestamp
+            && request.resource.data.exp.toMillis() == request.resource.data.created + 604800000))
+        // sid: 요청 번호 (SOS 코드로 들어온 구조가 이 요청의 상태를 찾을 수 있게). 문서 이름의 번호와 같아야 한다
+        && (!('sid' in request.resource.data) || (request.resource.data.sid is int && request.resource.data.sid == int(id.split('_')[1])))
+        && request.resource.data.owner == request.auth.uid
+        && request.resource.data.status == 'open'
+        && ownsName(request.resource.data.name)
+        && request.resource.data.floor is int && request.resource.data.floor >= 1 && request.resource.data.floor <= 99
+        && request.resource.data.sp is int && request.resource.data.sp > 0 && request.resource.data.sp < 5000
+        && request.resource.data.lv is int && request.resource.data.lv >= 1 && request.resource.data.lv <= 100
+        && request.resource.data.shiny is bool && request.resource.data.created is int
+        // 문서 이름은 "올린 시각_요청 번호"이고 그 시각은 지금이어야 한다 (게시판 순서를 속여 맨 앞에 오지 못하게)
+        && id.matches('^[0-9]{14}_[0-9]{1,12}$') && int(id.split('_')[0]) == request.resource.data.created
+        && request.resource.data.created > request.time.toMillis() - 300000 && request.resource.data.created < request.time.toMillis() + 300000
+        && request.resource.data.dungeon is string && request.resource.data.dungeon.matches('^[a-z]{1,16}$')
+        && request.resource.data.ver is string && request.resource.data.ver.size() <= 8
+        && request.resource.data.key == request.resource.data.ver + '|open'
+        && sosGapOk();
+      allow update: if signedIn() && (
+        // 구조: 다른 사람이, 열린 요청을 구조됨으로 (한 번만)
+        (resource.data.status == 'open' && resource.data.owner != request.auth.uid
+          && request.resource.data.status == 'rescued'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'key', 'rescuer'])
+          && request.resource.data.rescuer.keys().hasOnly(['uid', 'name', 'sp', 'lv', 'shiny', 'noGift'])
+          && (!('noGift' in request.resource.data.rescuer) || request.resource.data.rescuer.noGift is bool)
+          && request.resource.data.rescuer.uid == request.auth.uid
+          && ownsName(request.resource.data.rescuer.name)
+          && request.resource.data.rescuer.sp is int && request.resource.data.rescuer.sp > 0 && request.resource.data.rescuer.sp < 5000
+          && request.resource.data.rescuer.lv is int && request.resource.data.rescuer.lv >= 1 && request.resource.data.rescuer.lv <= 100
+          && request.resource.data.rescuer.shiny is bool
+          && request.resource.data.key == resource.data.ver + '|done')
+        ||
+        // 구조하러 간다: 다른 사람이, 열린 요청을 30분 동안 맡는다 (아무도 안 맡았거나, 맡은 지 30분이 지났거나, 내가 맡은 것 = 연장)
+        (resource.data.status == 'open' && resource.data.owner != request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['takenBy', 'takenAt'])
+          && request.resource.data.takenBy == request.auth.uid && request.resource.data.takenAt == request.time
+          && (resource.data.get('takenBy', null) == null || resource.data.takenBy == request.auth.uid
+              || resource.data.takenAt < request.time - duration.value(30, 'm')))
+        ||
+        // 맡은 구조를 취소: 맡은 사람이 풀어 준다
+        (resource.data.status == 'open' && resource.data.get('takenBy', null) == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['takenBy', 'takenAt'])
+          && request.resource.data.takenBy == null && request.resource.data.takenAt == null)
+        ||
+        // 감사 편지: 요청자가, 구조된 요청에 한 번만
+        (resource.data.status == 'rescued' && resource.data.owner == request.auth.uid
+          && request.resource.data.status == 'thanked'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'thx'])
+          && (request.resource.data.thx == null || (request.resource.data.thx is string && request.resource.data.thx.size() <= 24)))
+      );
+      // 지우기: 요청자는 아직 아무도 구조하지 않았을 때 (포기), 구조한 사람은 감사 편지를 받은 뒤 (정리)
+      allow delete: if signedIn() && (
+        (resource.data.owner == request.auth.uid && resource.data.status == 'open')
+        || (resource.data.status == 'thanked' && resource.data.rescuer.uid == request.auth.uid)
+      );
+    }
+  }
+}
