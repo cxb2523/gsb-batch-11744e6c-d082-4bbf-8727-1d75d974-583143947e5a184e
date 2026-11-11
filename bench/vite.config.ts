@@ -1,0 +1,44 @@
+import { fileURLToPath } from 'node:url';
+
+import { defineConfig } from 'vite';
+import { loadProfilePlugin } from './load-profile-plugin';
+
+/**
+ * The benchmark page is its own vite project, not a third entry in the root
+ * config: `vite.config.ts` at the root builds what gets deployed — the demo,
+ * plus the test harness — and a page nobody deploys should cost the deploy
+ * nothing, so `bun run build` emits exactly what it emits without it.
+ *
+ * Run it with `bun run bench:dev`, or let `scripts/bench.mjs` start it.
+ */
+const here = fileURLToPath(new URL('.', import.meta.url));
+
+export default defineConfig({
+  plugins: process.env.LOAD_PROFILE === '1' ? [loadProfilePlugin()] : [],
+  optimizeDeps: {
+    // The normal benchmark must not scan the optional reference install.
+    entries: [fileURLToPath(new URL(process.env.LOAD_PROFILE === '1' ? './load.html' : './index.html', import.meta.url))],
+    // A missing optional sets.json falls back to index.html in Vite. Its
+    // normal-bench module can be transformed speculatively, but must not
+    // rebuild the load page's optimized reference chunks during a sample.
+    exclude: process.env.LOAD_PROFILE === '1' ? ['@rig-c/core/core', '@esotericsoftware/spine-webgl'] : [],
+  },
+  root: here,
+  // The rigc builds live in the repository's own public/rigs/ (built by
+  // scripts/fetch-assets.sh), shared with the demo rather than copied.
+  // `BENCH_CORPUS` swaps that directory for a local one holding rigc builds of
+  // real-world rigs (`scripts/bench.mjs --corpus`), which is the whole of the
+  // corpus mechanism: the page takes a model URL by query and needs to know
+  // nothing else.
+  publicDir: process.env.BENCH_CORPUS || fileURLToPath(new URL('../public', import.meta.url)),
+  server: {
+    fs: {
+      // The page imports the library from ../src, which is outside this root.
+      allow: [fileURLToPath(new URL('..', import.meta.url))],
+    },
+  },
+  build: {
+    outDir: fileURLToPath(new URL('../dist-bench', import.meta.url)),
+    emptyOutDir: true,
+  },
+});

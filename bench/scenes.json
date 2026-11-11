@@ -1,0 +1,146 @@
+{
+  "comment": [
+    "Scenes driven once per runtime: dom, canvas and official. Each row is an independent page load; simultaneous display has one document rAF cadence.",
+    "Every public rig is built by scripts/fetch-assets.sh as a matched skeleton.model.json, skeleton.json, skeleton.atlas and original PNGs.",
+    "Grid scenes share one official canvas/context, while many deliberately uses one per independent player and reports lost contexts and actually drawn players.",
+    "Headless output has deterministic counters only, every timing null and measurement unavailable labelled explicitly. No headless result belongs in README Measured.",
+    "--corpus DIR preserves local scenes.json and paired builds outside this repository; query model may name a model URL and query json/atlas overrides a nonstandard pair."
+  ],
+  "scenes": [
+    {
+      "name": "1 meshed rig animating",
+      "query": {
+        "scene": "mesh",
+        "count": 1,
+        "backend": "webgl"
+      },
+      "why": "the deform tier working every frame against the canvas mode's one-pass draw"
+    },
+    {
+      "name": "4 meshed rigs animating",
+      "query": {
+        "scene": "mesh",
+        "count": 4,
+        "backend": "webgl"
+      },
+      "why": "the first grid step"
+    },
+    {
+      "name": "16 meshed rigs animating",
+      "query": {
+        "scene": "mesh",
+        "count": 16,
+        "backend": "webgl"
+      },
+      "why": "an all-mesh grid \u2014 the canvas mode's home ground"
+    },
+    {
+      "name": "36 meshed rigs animating",
+      "query": {
+        "scene": "mesh",
+        "count": 36,
+        "backend": "webgl"
+      },
+      "why": "between 16 and 64, so a crossover has somewhere to be seen rather than jumped over"
+    },
+    {
+      "name": "64 meshed rigs animating",
+      "query": {
+        "scene": "mesh",
+        "count": 64,
+        "backend": "webgl"
+      },
+      "why": "the page's cap: the heaviest deform load either mode is asked for here"
+    },
+    {
+      "name": "1 meshed rig animating (canvas2d)",
+      "query": {
+        "scene": "mesh",
+        "count": 1,
+        "backend": "canvas2d"
+      },
+      "why": "the DOM tier's canvas2d mesh backend, and the one real Safari struggles with"
+    },
+    {
+      "name": "16 meshed rigs animating (canvas2d)",
+      "query": {
+        "scene": "mesh",
+        "count": 16,
+        "backend": "canvas2d"
+      },
+      "why": "the canvas2d backend under a grid \u2014 the per-triangle path's own scaling"
+    },
+    {
+      "name": "1 held pose",
+      "query": {
+        "scene": "held",
+        "count": 1,
+        "backend": "webgl"
+      },
+      "why": "dirty-skip home ground: unchanged meshes reuse their raster, an unchanged frame is reused"
+    },
+    {
+      "name": "16 held poses",
+      "query": {
+        "scene": "held",
+        "count": 16,
+        "backend": "webgl"
+      },
+      "why": "the same multiplied by 16"
+    },
+    {
+      "name": "64 held poses",
+      "query": {
+        "scene": "held",
+        "count": 64,
+        "backend": "webgl"
+      },
+      "why": "the same at the cap"
+    },
+    {
+      "name": "1 rigid rig animating",
+      "query": {
+        "scene": "rigid",
+        "count": 1,
+        "backend": "webgl"
+      },
+      "why": "region attachments only \u2014 pure <img> and one CSS matrix per slot on the DOM side"
+    },
+    {
+      "name": "16 rigid rigs animating",
+      "query": {
+        "scene": "rigid",
+        "count": 16,
+        "backend": "webgl"
+      },
+      "why": "a grid of rigid rigs: element count and compositing against one canvas per rig"
+    },
+    {
+      "name": "64 rigid rigs animating",
+      "query": {
+        "scene": "rigid",
+        "count": 64,
+        "backend": "webgl"
+      },
+      "why": "the cap, where the DOM side holds one element per drawn slot of 64 rigs (walk declares 15 slots)"
+    },
+    {
+      "name": "8 small players",
+      "query": {
+        "scene": "many",
+        "count": 8,
+        "backend": "webgl"
+      },
+      "why": "independent players, each clipped to its own cell"
+    },
+    {
+      "name": "20 small players",
+      "query": {
+        "scene": "many",
+        "count": 20,
+        "backend": "webgl"
+      },
+      "why": "past the browser's ~16-context cap: the package shares one context; official players have independent contexts and report actual survivors"
+    }
+  ]
+}

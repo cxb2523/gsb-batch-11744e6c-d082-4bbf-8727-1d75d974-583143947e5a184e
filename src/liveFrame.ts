@@ -1,0 +1,299 @@
+import { liveDrawings as drawings } from './liveFrameSource.js';
+import { poseRawSetup } from '@rig-c/core/core';
+import { compileRuntime, RuntimePose, type RuntimeAttachment, type RuntimeModel } from '@rig-c/core/runtime';
+import { frameOf, type BlendMode, type FrameSource, type PosedClip, type PosedFrame, type PosedSlot } from './posedFrame.js';
+
+/** An indexed, read-only buffer. Buffer mutation methods are deliberately absent. */
+export interface LiveNumbers {
+  readonly length: number;
+  readonly [index: number]: number;
+}
+
+/** A borrowed clipping polygon, shared by the slots it covers. */
+export interface LiveClip {
+  readonly polygon: LiveNumbers;
+  readonly inverse: boolean;
+  readonly convex: boolean;
+}
+
+/** Attachment metadata resolved once; dark and clip borrow the current pose. */
+export interface LiveAttachment {
+  readonly slot: string;
+  readonly slotIndex: number;
+  readonly attachment: string | null;
+  readonly skin: string | null;
+  /** Exact table key on the runtime path; unavailable on an oracle snapshot. */
+  readonly placeholder: string | null;
+  readonly kind: 'region' | 'mesh' | 'none';
+  readonly region: string | null;
+  readonly page: string | null;
+  readonly pma: boolean;
+  readonly blend: BlendMode;
+  readonly offset: number;
+  readonly count: number;
+  readonly uvs: LiveNumbers;
+  readonly triangles: LiveNumbers;
+  readonly dark: LiveNumbers | null;
+  readonly clip: LiveClip | null;
+}
+
+/**
+ * A borrowed frame, valid only until the player's next pose mutation.
+ * `drawOrder[0..count)` contains indices into `attachments`; vertices use each
+ * attachment's offset/count, and tint uses slotIndex * 4. Production reuses the
+ * buffers. Development leases detect stale reads, including held nested views.
+ */
+export interface LiveFrame {
+  readonly generation: number;
+  readonly count: number;
+  readonly drawOrder: LiveNumbers;
+  readonly vertices: LiveNumbers;
+  readonly tint: LiveNumbers;
+  readonly attachments: readonly LiveAttachment[];
+}
+
+/** @internal A stable array facade for the existing renderer interface, without vertex copies. */
+function numbers(buffer: Float64Array, offset: number, count: number): number[] {
+  const result = new Array<number>(count);
+  for (let i = 0; i < count; i++) Object.defineProperty(result, i, {
+    enumerable: true, get: () => buffer[offset + i],
+  });
+  return Object.freeze(result) as number[];
+}
+
+/** @internal Deep development lease. No typed-array method can expose writable backing storage. */
+export function checkedLiveFrame(frame: LiveFrame, current: () => number): LiveFrame {
+  const generation = current();
+  const frameGeneration = frame.generation;
+  const proxies = new WeakMap<object, object>();
+  const check = (): void => {
+    if (current() !== generation) throw new Error(`LIVE_FRAME_STALE: borrowed generation ${frameGeneration} was invalidated; call liveFrame() again`);
+  };
+  const wrap = <T extends object>(value: T): T => {
+    const found = proxies.get(value);
+    if (found) return found as T;
+    // A separate extensible target avoids proxy invariants on frozen metadata.
+    const proxy = new Proxy(Array.isArray(value) ? [] : {}, {
+      get(_target, property) {
+        check();
+        if (property === 'buffer' || property === 'set' || property === 'fill' || property === 'copyWithin' || property === 'reverse' || property === 'sort') {
+          throw new Error(`LIVE_FRAME_READONLY: ${String(property)} does not expose the live backing store`);
+        }
+        const item: unknown = Reflect.get(value, property, value);
+        if (typeof item === 'function') {
+          if (ArrayBuffer.isView(value) && property !== Symbol.iterator) throw new Error(`LIVE_FRAME_READONLY: ${String(property)} is not part of the indexed live buffer interface`);
+          return (...args: unknown[]) => {
+            check();
+            const returned: unknown = Reflect.apply(item, Array.isArray(value) ? proxy : value, args);
+            return returned !== null && typeof returned === 'object' ? wrap(returned) : returned;
+          };
+        }
+        return item !== null && typeof item === 'object' ? wrap(item) : item;
+      },
+      set() { check(); throw new Error('LIVE_FRAME_READONLY: live frame values cannot be assigned'); },
+      defineProperty() { check(); throw new Error('LIVE_FRAME_READONLY: live frame values cannot be redefined'); },
+      deleteProperty() { check(); throw new Error('LIVE_FRAME_READONLY: live frame values cannot be deleted'); },
+      preventExtensions() { check(); throw new Error('LIVE_FRAME_READONLY: live frame objects cannot be reconfigured'); },
+      setPrototypeOf() { check(); throw new Error('LIVE_FRAME_READONLY: live frame prototypes cannot be changed'); },
+      has(_target, property) { check(); return Reflect.has(value, property); },
+      ownKeys() { check(); return Reflect.ownKeys(value); },
+      getOwnPropertyDescriptor(_target, property) {
+        check();
+        if (property === 'length' && Array.isArray(value)) return { value: value.length, writable: true, configurable: false, enumerable: false };
+        const descriptor = Reflect.getOwnPropertyDescriptor(value, property);
+        return descriptor ? { configurable: true, enumerable: descriptor.enumerable, get: () => Reflect.get(proxy, property) } : undefined;
+      },
+    });
+    proxies.set(value, proxy);
+    return proxy as T;
+  };
+  const lease = wrap(frame);
+  const drawing = drawings.get(frame);
+  if (drawing) drawings.set(lease, drawing);
+  return lease;
+}
+
+/** Keep the optional accessor's capture out of data-only attachment creation. */
+function withLiveClip(metadata: LiveAttachment, template: PosedSlot | null): LiveAttachment {
+  Object.defineProperty(metadata, 'clip', { get: () => template?.clip ?? null });
+  return metadata;
+}
+
+/** @internal Runtime draw state. Constructed once per document view. */
+export class RuntimeFrames {
+  readonly model: RuntimeModel;
+  readonly pose: RuntimePose;
+  readonly renderFrame: PosedFrame = { order: [] };
+  readonly live: LiveFrame;
+  private readonly order: Int32Array;
+  private readonly tint: Float64Array;
+  private readonly templates: Array<PosedSlot | null>;
+  private readonly clips: Array<PosedClip | null>;
+  private readonly colours: ReadonlyArray<readonly number[]>;
+  /** Incremented when a draw refresh changes colour without a pose step. */
+  revision = 0;
+  private readonly previousColor = new Float64Array(4).fill(Number.NaN);
+  private drawn = 0;
+  private epoch = 0;
+
+  constructor(source: FrameSource, model?: RuntimeModel) {
+    this.model = model ?? compileRuntime(source.doc);
+    this.pose = new RuntimePose(this.model);
+    this.order = new Int32Array(this.model.slots.length);
+    this.tint = new Float64Array(this.model.slots.length * 4);
+    const colours: number[][] = [];
+    const metadata: LiveAttachment[] = [];
+    this.clips = this.model.attachments.map(attachment => attachment.clip === undefined ? null : {
+      polygon: numbers(this.pose.vertices, attachment.offset, attachment.count),
+      inverse: attachment.clip.inverse, convex: attachment.clip.convex,
+    });
+    this.templates = this.model.attachments.map((attachment, index) => {
+      const identity = attachment as RuntimeAttachment & { readonly skin?: string; readonly placeholder?: string };
+      if (identity.skin === undefined || identity.placeholder === undefined) {
+        throw new Error(`RUNTIME_DRAW_IDENTITY: attachment ${index} on slot "${this.model.slots[attachment.slot].name}" needs resolved skin and placeholder from rig-c/runtime`);
+      }
+      const slot = this.model.slots[attachment.slot];
+      // This is a load-time oracle read, never a per-frame lookup or poser.
+      const doc = { ...source.doc, slots: source.doc.slots.map((value, si) => ({ ...value, setup: si === attachment.slot ? identity.placeholder! : null })) };
+      const setup = poseRawSetup(doc);
+      const raw = setup.drawn.find(value => value.slot === slot.name);
+      const template = frameOf(source, setup).order.find(value => value.slot === slot.name) ?? null;
+      const colour = raw?.colour ?? [1, 1, 1, 1];
+      colours.push(colour);
+      if (template) {
+        const vertices = numbers(this.pose.vertices, attachment.offset, attachment.count);
+        if (template.kind === 'region') template.corners = vertices;
+        else template.vertices = vertices;
+        template.tint = numbers(this.tint, attachment.slot * 4, 4) as [number, number, number, number];
+        if (slot.dark !== null) template.dark = numbers(this.pose.dark, attachment.slot * 3, 3) as [number, number, number];
+      }
+      const item = {
+        slot: slot.name, slotIndex: attachment.slot, attachment: attachment.name,
+        skin: identity.skin, placeholder: identity.placeholder,
+        kind: template?.kind ?? 'none' as const, region: template?.kind === 'region' ? template.region : null,
+        page: template?.page ?? null, pma: template?.pma ?? false, blend: slot.blend,
+        offset: attachment.offset, count: attachment.count,
+        uvs: Object.freeze(template?.uvs ?? []), triangles: Object.freeze(template?.kind === 'mesh' ? template.triangles : []),
+        dark: template?.dark ?? null,
+        clip: null,
+      };
+      // Keep data-only metadata for a model with no clips. Besides being
+      // unnecessary there, the accessor changes JSC's allocation behavior
+      // when callers read the attachment's offset on the loose path fixture.
+      metadata.push(Object.freeze(this.pose.clipping === null ? item : withLiveClip(item, template)));
+      return template;
+    });
+    this.colours = colours;
+    const owner = this;
+    this.live = Object.freeze({
+      get generation() { return owner.epoch; }, get count() { return owner.drawn; },
+      drawOrder: this.order, vertices: this.pose.vertices, tint: this.tint, attachments: Object.freeze(metadata),
+    });
+    drawings.set(this.live, this.renderFrame);
+  }
+
+  update(generation: number, color: readonly number[], draws: (slot: string) => boolean, poseChanged = true): void {
+    if (poseChanged) this.pose.computeVertices();
+    let colorChanged = false;
+    for (let c = 0; c < 4; c++) {
+      if (!Object.is(this.previousColor[c], color[c])) colorChanged = true;
+      this.previousColor[c] = color[c];
+    }
+    if (colorChanged) this.revision++;
+    let count = 0;
+    let clip: PosedClip | null = null;
+    let end: string | null = null;
+    for (let z = 0; z < this.pose.drawOrder.length; z++) {
+      const si = this.pose.drawOrder[z];
+      const ai = this.pose.shown[si];
+      const slot = this.model.slots[si];
+      const attachment = ai < 0 ? null : this.model.attachments[ai];
+      if (attachment?.clip !== undefined) {
+        if (clip !== null && end === slot.name) clip = null;
+        if (clip === null && this.model.active[attachment.bone] && draws(slot.name)) {
+          clip = this.clips[ai]; end = attachment.clip.end;
+        }
+        continue;
+      }
+      const template = ai < 0 ? null : this.templates[ai];
+      if (template && this.model.active[slot.bone]) {
+        template.z = z;
+        if (clip === null) { if (template.clip !== undefined) delete template.clip; }
+        else template.clip = clip;
+        const offset = si * 4;
+        const colour = this.colours[ai];
+        for (let c = 0; c < 4; c++) this.tint[offset + c] = this.pose.light[offset + c] * colour[c] * color[c];
+        if (draws(template.slot)) {
+          this.order[count] = ai;
+          this.renderFrame.order[count++] = template;
+        }
+      }
+      if (clip !== null && end === slot.name) clip = null;
+    }
+    this.renderFrame.order.length = count;
+    this.drawn = count;
+    this.epoch = generation;
+  }
+
+  snapshot(draws?: (slot: string) => boolean): PosedFrame {
+    const order: PosedSlot[] = [];
+    const copies = new Map<PosedClip, PosedClip>();
+    let clip: PosedClip | null = null;
+    let end: string | null = null;
+    for (let z = 0; z < this.pose.drawOrder.length; z++) {
+      const si = this.pose.drawOrder[z];
+      const ai = this.pose.shown[si];
+      const attachment = ai < 0 ? null : this.model.attachments[ai];
+      const name = this.model.slots[si].name;
+      if (attachment?.clip !== undefined) {
+        if (clip !== null && end === name) clip = null;
+        if (clip === null && this.model.active[attachment.bone] && (draws === undefined || draws(name))) {
+          clip = this.clips[ai]; end = attachment.clip.end;
+        }
+        continue;
+      }
+      const slot = ai < 0 ? null : this.templates[ai];
+      if (slot && this.model.active[this.model.slots[si].bone] && (draws === undefined || draws(name))) {
+        const common = { ...slot, z, tint: slot.tint.slice() as [number, number, number, number] };
+        if (slot.dark) common.dark = slot.dark.slice() as [number, number, number];
+        delete common.clip;
+        if (clip !== null) {
+          let copy = copies.get(clip);
+          if (!copy) { copy = { ...clip, polygon: clip.polygon.slice() }; copies.set(clip, copy); }
+          common.clip = copy;
+        }
+        order.push(slot.kind === 'region'
+          ? { ...common, kind: 'region' as const, region: slot.region, corners: slot.corners.slice(), page: slot.page, pma: slot.pma, uvs: slot.uvs }
+          : { ...common, kind: 'mesh' as const, vertices: slot.vertices.slice(), page: slot.page, pma: slot.pma, uvs: slot.uvs, triangles: slot.triangles, sequence: slot.sequence });
+      }
+      if (clip !== null && end === name) clip = null;
+    }
+    return { order };
+  }
+}
+
+/** @internal Oracle fallback keeps the same borrowed-buffer layout, without a zero-allocation claim. */
+export function oracleLiveFrame(frame: PosedFrame, identities: ReadonlyMap<string, { attachment: string | null; skin: string | null }>, indices: ReadonlyMap<string, number>): LiveFrame {
+  let size = 0;
+  for (const slot of frame.order) size += (slot.kind === 'region' ? slot.corners : slot.vertices).length;
+  const vertices = new Float64Array(size);
+  const tint = new Float64Array(indices.size * 4);
+  const drawOrder = new Int32Array(frame.order.length);
+  let offset = 0;
+  const attachments = frame.order.map((slot, index): LiveAttachment => {
+    const points = slot.kind === 'region' ? slot.corners : slot.vertices;
+    const slotIndex = indices.get(slot.slot);
+    if (slotIndex === undefined) throw new Error(`LIVE_FRAME_SLOT: drawn slot "${slot.slot}" has no setup index`);
+    vertices.set(points, offset); tint.set(slot.tint, slotIndex * 4); drawOrder[index] = index;
+    const identity = identities.get(slot.slot);
+    if (!identity) throw new Error(`LIVE_FRAME_IDENTITY: drawn slot "${slot.slot}" has no coherent identity`);
+    const metadata: LiveAttachment = { slot: slot.slot, slotIndex, attachment: identity.attachment, skin: identity.skin, placeholder: null, kind: slot.kind,
+      region: slot.kind === 'region' ? slot.region : null, page: slot.page, pma: slot.pma, blend: slot.blend, offset, count: points.length,
+      uvs: slot.uvs, triangles: slot.kind === 'mesh' ? slot.triangles : [], dark: slot.dark ?? null, clip: slot.clip ?? null };
+    offset += points.length;
+    return metadata;
+  });
+  const live = { generation: frame.generation ?? 0, count: attachments.length, drawOrder, vertices, tint, attachments };
+  drawings.set(live, frame);
+  return live;
+}

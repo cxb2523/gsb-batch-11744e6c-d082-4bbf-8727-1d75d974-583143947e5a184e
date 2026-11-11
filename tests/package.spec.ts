@@ -1,0 +1,721 @@
+import { spawn, spawnSync } from 'node:child_process';
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, relative, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { expect, test } from '@playwright/test';
+import { parseConfigFileTextToJson } from 'typescript';
+
+/**
+ * What npm ships, checked the way a consumer meets it — node-side, no browser.
+ *
+ * The package is DOM-only at *run* time, but an *import* must succeed outside
+ * a browser: anything that leaves @rig-c/play external and hands it to Node (a
+ * server-side render pass importing a module that imports it, a test runner in
+ * a node environment, a plain script) resolves it with Node's ESM resolver,
+ * which — unlike every bundler — requires an explicit file extension on a
+ * relative specifier. That is issue #16: `dist/*.js` carried extensionless
+ * specifiers and an `import()` of the package by name died with ERR_MODULE_NOT_FOUND, while
+ * the demo, the harness and every browser build resolved it fine.
+ *
+ * ⚠️ This spec must NEVER build into the repository's own `dist/`. During a
+ * Playwright run `vite preview` is serving the demo out of `dist/`, and
+ * `build:lib` starts with `rm -rf dist` — a lib build here would pull the
+ * ground out from under every other spec in the same run. So the library is
+ * built to a temp directory instead, and assembled there into a throwaway
+ * installed-package layout (`node_modules/@rig-c/play`, alone), which is
+ * also the only way to exercise the `exports` map: resolution by *package
+ * name* is the thing under test, and a relative import of `../dist/index.js`
+ * would not touch `exports` at all.
+ *
+ * ## Self-contained, by construction and by test
+ *
+ * The package poses through `rig-c/core`, whose entry is TypeScript source — a
+ * devDependency that no consumer has installed and no node would load from
+ * `node_modules` if they had. So the build (`scripts/build-lib.mjs`) bundles
+ * that closure into one `index.js`, and the sandbox below installs the built
+ * package and **nothing else**: no rig-c, no peer. Every assertion that
+ * imports or typechecks the package by name is therefore also the assertion
+ * that it needs nothing beside it.
+ */
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const tscBin = resolve(repoRoot, 'node_modules', 'typescript', 'bin', 'tsc');
+
+/** The throwaway consumer directory; `node_modules/@rig-c/play` lives under it. */
+let sandbox = '';
+/** The built package's `dist` inside that sandbox. */
+let pkgDist = '';
+/**
+ * `process.execPath` is the node that runs the Playwright worker — real node
+ * even when the suite was launched through `bunx`, which only resolves the
+ * CLI. It matters: bun's resolver accepts extensionless specifiers, so
+ * spawning bun here would make every assertion below vacuous.
+ */
+function node(args: string[], cwd: string) {
+  return spawnSync(process.execPath, args, { cwd, encoding: 'utf8' });
+}
+
+/**
+ * Same, but concurrent — the two typecheck passes below are the slow part of
+ * this file and they do not touch each other, so they run side by side.
+ */
+function nodeAsync(args: string[], cwd: string): Promise<{ status: number | null; output: string }> {
+  return new Promise((settle) => {
+    const child = spawn(process.execPath, args, { cwd });
+    let output = '';
+    const collect = (chunk: unknown) => {
+      output += String(chunk);
+    };
+    child.stdout.on('data', collect);
+    child.stderr.on('data', collect);
+    child.on('close', (status) => settle({ status, output }));
+  });
+}
+
+/** Writes a probe module into the sandbox and runs it there. */
+function probe(name: string, source: string) {
+  const file = resolve(sandbox, name);
+  writeFileSync(file, source);
+  return node([file], sandbox);
+}
+
+/** The two resolution modes a consumer can meet the shipped types through. */
+const MODULE_MODES = {
+  bundler: 'ESNext',
+  nodenext: 'NodeNext',
+} as const;
+type ModuleMode = keyof typeof MODULE_MODES;
+
+/** Writes `<name>.ts` plus a tsconfig for it in the sandbox and returns the path of the tsconfig. */
+function writeConsumer(name: string, source: string, mode: ModuleMode): string {
+  writeFileSync(resolve(sandbox, `${name}.ts`), source);
+  const config = resolve(sandbox, `tsconfig.${name}.${mode}.json`);
+  writeFileSync(
+    config,
+    JSON.stringify(
+      {
+        compilerOptions: {
+          target: 'ES2022',
+          module: MODULE_MODES[mode],
+          moduleResolution: mode,
+          lib: ['ES2022', 'DOM', 'DOM.Iterable'],
+          strict: true,
+          noEmit: true,
+          // Deliberately NOT skipped. Measured: with skipLibCheck on, a
+          // fully extensionless dist/ typechecks clean under nodenext too —
+          // the TS2835s are raised inside the shipped .d.ts, and that is
+          // precisely the file skipLibCheck stops reading. Turning it on
+          // here would cost ~3× less time and catch nothing.
+          skipLibCheck: false,
+        },
+        files: [`${name}.ts`],
+      },
+      null,
+      2,
+    ),
+  );
+  return config;
+}
+
+test.beforeAll(() => {
+  sandbox = mkdtempSync(resolve(tmpdir(), 'play-pkg-'));
+  const pkgRoot = resolve(sandbox, 'node_modules', '@rig-c', 'play');
+  pkgDist = resolve(pkgRoot, 'dist');
+  mkdirSync(pkgRoot, { recursive: true });
+
+  // One build, shared by every assertion in this file — the same script
+  // `bun run build:lib` runs, into the sandbox instead of `dist/`.
+  const built = node([resolve(repoRoot, 'scripts', 'build-lib.mjs'), pkgDist], repoRoot);
+  expect(built.status, `scripts/build-lib.mjs failed:\n${built.stdout}${built.stderr}`).toBe(0);
+
+  // The repository's real manifest, so the `exports` map under test is the
+  // shipped one rather than a copy that can drift from it.
+  cpSync(resolve(repoRoot, 'package.json'), resolve(pkgRoot, 'package.json'));
+
+  // Makes the sandbox an ESM package of its own, so nothing above the temp
+  // directory can decide how these probes are parsed.
+  writeFileSync(
+    resolve(sandbox, 'package.json'),
+    `${JSON.stringify({ name: 'play-consumer', private: true, type: 'module' }, null, 2)}\n`,
+  );
+
+  // Nothing but the package is installed: the claim every import below rests on.
+  expect(readdirSync(resolve(sandbox, 'node_modules'))).toEqual(['@rig-c']);
+  expect(readdirSync(resolve(sandbox, 'node_modules', '@rig-c'))).toEqual(['play']);
+});
+
+test.afterAll(() => {
+  if (sandbox) rmSync(sandbox, { recursive: true, force: true });
+});
+
+test('the package entry resolves by name in node and exposes its public API', () => {
+  const run = probe(
+    'probe-index.mjs',
+    "const m = await import('@rig-c/play');\nfor (const name of ['setPhysicsParameters', 'readPhysicsParameters', 'clearPhysicsParameters', 'physicsMoved']) { if (typeof m.RigPlayer.prototype[name] !== 'function') throw new Error(name); }\nconsole.log(JSON.stringify(Object.keys(m).sort()));\n",
+  );
+  expect(run.status, `import('@rig-c/play') failed:\n${run.stderr}`).toBe(0);
+  // Exhaustive on purpose: what the root entry exports is the package's API.
+  expect(JSON.parse(run.stdout)).toEqual([
+    'CanvasRenderer',
+    'DomRenderer',
+    'RigPlayer',
+    'createAtlasRegions',
+    'loadModel',
+    'readSetupMesh',
+    'revokeRegions',
+    'unpackRegions',
+  ]);
+});
+
+test('the binary subpath is gone: the package reads compiled models, not Spine exports', () => {
+  const run = probe(
+    'probe-binary.mjs',
+    "try {\n  await import('@rig-c/play/binary');\n  console.log(JSON.stringify({ code: 'RESOLVED' }));\n} catch (error) {\n  console.log(JSON.stringify({ code: error.code }));\n}\n",
+  );
+  expect(run.status, `probe crashed:\n${run.stderr}`).toBe(0);
+  expect(JSON.parse(run.stdout).code).toBe('ERR_PACKAGE_PATH_NOT_EXPORTED');
+});
+
+test('an unlisted subpath is refused by the exports map', () => {
+  // The control for the two tests above: it is the `exports` map they are
+  // going through, not a bare directory walk that would resolve anything.
+  const run = probe(
+    'probe-subpath.mjs',
+    "try {\n  await import('@rig-c/play/dist/index.js');\n  console.log(JSON.stringify({ code: 'RESOLVED' }));\n} catch (error) {\n  console.log(JSON.stringify({ code: error.code }));\n}\n",
+  );
+  expect(run.status, `probe crashed:\n${run.stderr}`).toBe(0);
+  expect(JSON.parse(run.stdout).code).toBe('ERR_PACKAGE_PATH_NOT_EXPORTED');
+});
+
+/**
+ * What the library build is supposed to emit — the complete library allowlist,
+ * even when a checkout's `dist/` also holds demo/test assets: one bundled module
+ * (with its map), and one declaration file (with its map) per source module.
+ */
+const EMITTED_BUNDLE = ['index.js', 'index.js.map'];
+const DECLARED_MODULES = ['CanvasRenderer', 'DomRenderer', 'DomTexture', 'MeshGlBlitter', 'index', 'liveFrame', 'liveFrameSource', 'loadModel', 'pixelRatio', 'player', 'posedFrame'];
+
+test('the library build emits those modules and nothing else', () => {
+  /**
+   * Issue #24: `tsconfig.build.json` compiles `src/**` and the demo's entry
+   * point lives there too, so `dist/main.js` (11 kB) + `.d.ts` + both maps
+   * rode into the published 0.4.1 and 0.5.0 tarballs. Nothing could reach
+   * them — `main` is not a key in the `exports` map and no shipped module
+   * imports it — which is exactly why every other assertion in this file
+   * stayed green over two releases while 11 kB of the 76 kB of JavaScript in
+   * the tarball was dead weight, and the one file in `dist/` whose top level
+   * touched the DOM. Unreachable is not a signature, so the guard has to be
+   * the emitted list itself, not anything a resolver or an import walk sees.
+   *
+   * Recursive, so a stray that lands in a subdirectory is caught too — `dist/`
+   * being flat is part of what ships.
+   */
+  const emitted = readdirSync(pkgDist, { recursive: true })
+    .map((entry) => String(entry).split(sep).join('/'))
+    .sort();
+
+  // The defect itself, named first, so its return reds out on the assertion
+  // that explains it rather than on the set comparison below.
+  expect(emitted.filter((file) => /(^|\/)main\./.test(file))).toEqual([]);
+
+  // The payload, as an explicit set: the next file to wander in fails here
+  // instead of shipping unnoticed for two more releases. One module — the
+  // bundle — and types plus their maps for every source module, which also
+  // pins `declaration` / `declarationMap` / `sourcemap` staying on.
+  expect(emitted.filter((file) => file.endsWith('.js'))).toEqual(['index.js']);
+  expect(emitted).toEqual(
+    [...EMITTED_BUNDLE, ...DECLARED_MODULES.flatMap((name) => [`${name}.d.ts`, `${name}.d.ts.map`])].sort(),
+  );
+});
+
+test('nothing the package ships names a Spine runtime', () => {
+  /**
+   * The package reads no Spine runtime: it poses through `rig-c/core`, and
+   * #39 adds an official WebGL oracle as a dev-only test dependency. It must
+   * never enter the shipped library. The assertion is the claim the package
+   * makes and it costs one read per emitted file: an import of a runtime written into `src/` would
+   * ride into `index.js` with no other signature — vite inlines it, and the
+   * emitted file set above does not change. Every module and every `.d.ts`,
+   * comments stripped so a mention in prose is not a false red.
+   */
+  const emitted = readdirSync(pkgDist, { recursive: true })
+    .map((entry) => String(entry).split(sep).join('/'))
+    .filter((file) => file.endsWith('.js') || file.endsWith('.d.ts'));
+  const naming = emitted.filter((file) =>
+    /@esotericsoftware\//.test(stripComments(readFileSync(resolve(pkgDist, file), 'utf8'))),
+  );
+  expect(naming).toEqual([]);
+  // A class the runtime defines and nothing here does, in case a bundler ever
+  // inlined the code without its package name.
+  const runtimeCode = emitted.filter((file) =>
+    /\bSkeletonJson\b|\bAnimationStateData\b/.test(stripComments(readFileSync(resolve(pkgDist, file), 'utf8'))),
+  );
+  expect(runtimeCode).toEqual([]);
+});
+
+const ORACLE = '@esotericsoftware/spine-webgl';
+const ORACLE_CORE = '@esotericsoftware/spine-core';
+const ORACLE_VERSION = '4.3.13';
+const isEsoteric = (name: string): boolean => name.startsWith('@esotericsoftware/');
+type DependencyField = 'dependencies' | 'devDependencies' | 'peerDependencies' | 'optionalDependencies';
+type DependencyManifest = Partial<Record<DependencyField, Record<string, string>>>;
+interface OracleLock {
+  workspaces: Record<string, DependencyManifest>;
+  packages: Record<string, [string, string, DependencyManifest, ...unknown[]]>;
+}
+
+/** The test-only oracle is the complete exception, never a scope-wide allowlist. */
+function oracleBoundaryErrors(manifest: DependencyManifest, lock: OracleLock): string[] {
+  const errors: string[] = [];
+  for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies'] as const) {
+    if (Object.keys(manifest[field] ?? {}).length !== 0) errors.push(`${field}: consumer dependency list must be empty`);
+    for (const name of Object.keys(manifest[field] ?? {}).filter(isEsoteric)) errors.push(`${field}: ${name} is not dev-only`);
+  }
+  const dev = Object.keys(manifest.devDependencies ?? {}).filter(isEsoteric).sort();
+  if (dev.length !== 1 || dev[0] !== ORACLE || manifest.devDependencies?.[ORACLE] !== ORACLE_VERSION) {
+    errors.push(`devDependencies: only ${ORACLE}@${ORACLE_VERSION} is the oracle`);
+  }
+  const locked = Object.entries(lock.packages).filter(([name, entry]) => isEsoteric(name) || isEsoteric(entry[0]));
+  if (locked.length !== 2 || !locked.some(([name]) => name === ORACLE) || !locked.some(([name]) => name === ORACLE_CORE)) {
+    errors.push('lockfile: only spine-webgl and its spine-core dependency may resolve');
+  }
+  for (const [name, entry] of locked) {
+    if ((name !== ORACLE && name !== ORACLE_CORE) || entry[0] !== `${name}@${ORACLE_VERSION}`) {
+      errors.push(`lockfile: unexpected oracle resolution ${name}: ${entry[0]}`);
+    }
+    const runtimeDeps = Object.keys(entry[2].dependencies ?? {}).sort();
+    const expectedDeps = name === ORACLE ? [ORACLE_CORE] : [];
+    if (JSON.stringify(runtimeDeps) !== JSON.stringify(expectedDeps) || (name === ORACLE && entry[2].dependencies?.[ORACLE_CORE] !== ORACLE_VERSION)) {
+      errors.push(`lockfile: ${name} must retain the matching oracle dependency graph`);
+    }
+    for (const field of ['peerDependencies', 'optionalDependencies'] as const) {
+      if (Object.keys(entry[2][field] ?? {}).some(isEsoteric)) errors.push(`lockfile: ${name} has an unexpected ${field} runtime`);
+    }
+  }
+  for (const [workspace, declared] of Object.entries(lock.workspaces)) {
+    for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'] as const) {
+      const names = Object.keys(declared[field] ?? {}).filter(isEsoteric);
+      const allowed = workspace === '' && field === 'devDependencies' ? [ORACLE] : [];
+      if (JSON.stringify(names.sort()) !== JSON.stringify(allowed) || (allowed.length && declared[field]?.[ORACLE] !== ORACLE_VERSION)) {
+        errors.push(`lockfile workspace ${JSON.stringify(workspace)} ${field}: unexpected oracle declaration`);
+      }
+    }
+  }
+  return errors;
+}
+
+function packageInputs(): { manifest: DependencyManifest; lock: OracleLock } {
+  const parsed = parseConfigFileTextToJson('bun.lock', readFileSync(resolve(repoRoot, 'bun.lock'), 'utf8'));
+  expect(parsed.error, 'bun.lock must parse as JSON with comments/trailing commas').toBeUndefined();
+  return { manifest: JSON.parse(readFileSync(resolve(repoRoot, 'package.json'), 'utf8')) as DependencyManifest, lock: parsed.config as OracleLock };
+}
+
+test('the manifest keeps Spine dev-only, declares no peer, and pins @rig-c/core, @rig-c/parts and the oracle exactly', () => {
+  const { manifest, lock } = packageInputs();
+  // No peer at all: the package needs nothing installed beside it (the
+  // sandbox above installs it alone), so a consumer is told to install nothing.
+  expect(manifest.peerDependencies).toBeUndefined();
+  expect(oracleBoundaryErrors(manifest, lock)).toEqual([]);
+  // The poser is @rig-c/core, bundled into `index.js` at the version this names — a
+  // bare version, never a range, so a build is a function of one @rig-c/core and a
+  // pose doubt is a rigc issue against that version.
+  const rigcPin = manifest.devDependencies?.['@rig-c/core'];
+  expect(typeof rigcPin).toBe('string');
+  expect(rigcPin).toMatch(/^\d+\.\d+\.\d+$/);
+  expect(lock.workspaces[''].devDependencies?.['@rig-c/core']).toBe(rigcPin);
+  expect(lock.packages['@rig-c/core'][0]).toBe(`@rig-c/core@${rigcPin}`);
+  const partsPin = manifest.devDependencies?.['@rig-c/parts'];
+  expect(typeof partsPin).toBe('string');
+  expect(partsPin).toMatch(/^\d+\.\d+\.\d+$/);
+  expect(lock.workspaces[''].devDependencies?.['@rig-c/parts']).toBe(partsPin);
+  expect(lock.packages['@rig-c/parts'][0]).toBe(`@rig-c/parts@${partsPin}`);
+  expect(lock.packages['@rig-c/parts'][2].dependencies?.['@rig-c/core']).toBe(rigcPin);
+  expect(lock.packages['@rig-c/parts'][2].dependencies?.['rig-c']).toBeUndefined();
+  expect(lock.packages['rig-c']).toBeUndefined();
+  const rigcBins = Object.entries(lock.packages)
+    .filter(([, entry]) => {
+      const bin = (entry[2] as { bin?: Record<string, string> | string } | undefined)?.bin;
+      return typeof bin === 'object' && bin !== null && 'rigc' in bin;
+    })
+    .map(([name]) => name);
+  expect(rigcBins).toEqual(['@rig-c/core']);
+  expect(existsSync(resolve(repoRoot, 'node_modules', 'rig-c'))).toBe(false);
+  expect(realpathSync(resolve(repoRoot, 'node_modules/.bin/rigc'))).toBe(
+    realpathSync(resolve(repoRoot, 'node_modules/@rig-c/core/bin/rigc.cjs')),
+  );
+  const fetchAssets = readFileSync(resolve(repoRoot, 'scripts/fetch-assets.sh'), 'utf8');
+  const rigcTag = fetchAssets.match(/^RIGC_TAG="([^"]+)"$/m)?.[1];
+  expect(rigcTag, 'scripts/fetch-assets.sh RIGC_TAG must match the manifest @rig-c/core pin').toBe(`v${rigcPin}`);
+  const partsTag = fetchAssets.match(/^PARTS_TAG="([^"]+)"$/m)?.[1];
+  expect(partsTag, 'scripts/fetch-assets.sh PARTS_TAG must match the manifest @rig-c/parts pin').toBe(`v${partsPin}`);
+  expect(fetchAssets).toContain("require('$ROOT/node_modules/@rig-c/core/package.json').version");
+  expect(fetchAssets).toContain("require('$ROOT/package.json').devDependencies['@rig-c/core']");
+  expect(Object.keys(manifest.dependencies ?? {})).not.toContain('@rig-c/core');
+  expect(Object.keys(manifest.dependencies ?? {})).not.toContain('rig-c');
+  expect(Object.keys(manifest.devDependencies ?? {})).not.toContain('rig-c');
+  const rawManifest = JSON.parse(readFileSync(resolve(repoRoot, 'package.json'), 'utf8')) as {
+    exports?: Record<string, Record<string, string>>;
+  };
+  expect(rawManifest.exports).toEqual({
+    '.': {
+      '@rig-c/source': './src/index.ts',
+      types: './dist/index.d.ts',
+      import: './dist/index.js',
+    },
+  });
+});
+
+test('source, test, script and bench files use @rig-c/core and never legacy rig-c paths', () => {
+  const legacyPathLiteral = /['"`](?:rig-c\/(?:core|runtime|plate|cli)|[^'"`\n]*node_modules\/rig-c(?:\/|['"`])|[^'"`\n]*\/rig-c\/src\/)/;
+  for (const dir of ['src', 'tests', 'scripts', 'bench'] as const) {
+    const files = readdirSync(resolve(repoRoot, dir), { recursive: true })
+      .map((entry) => String(entry).split(sep).join('/'))
+      .filter(
+        (file) =>
+          (file.endsWith('.ts') || file.endsWith('.mjs') || file.endsWith('.py')) &&
+          !file.startsWith('base.generated/') &&
+          file !== 'load-base.generated.ts',
+      );
+    const legacy = files.filter((file) => {
+      const raw = readFileSync(resolve(repoRoot, dir, file), 'utf8');
+      if (file.endsWith('.py')) {
+        const pyCode = raw
+          .split('\n')
+          .filter((line) => !line.trimStart().startsWith('#'))
+          .join('\n');
+        return legacyPathLiteral.test(pyCode);
+      }
+      const code = stripComments(raw);
+      const allSpecs = [
+        ...specifiers(code),
+        ...[...code.matchAll(/\bimport\.meta\.resolve\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1] as string),
+      ];
+      return allSpecs.some((spec) => /^rig-c(\/|$)/.test(spec)) || legacyPathLiteral.test(code);
+    });
+    expect(legacy, `legacy rig-c references in ${dir}`).toEqual([]);
+  }
+  const srcFiles = readdirSync(resolve(repoRoot, 'src'), { recursive: true })
+    .map(String)
+    .filter((file) => file.endsWith('.ts'));
+  const coreSpecs = new Set(
+    srcFiles.flatMap((file) =>
+      specifiers(stripComments(readFileSync(resolve(repoRoot, 'src', file), 'utf8'))).filter((spec) =>
+        !spec.startsWith('.'),
+      ),
+    ),
+  );
+  expect([...coreSpecs].sort()).toEqual(['@rig-c/core/core', '@rig-c/core/runtime']);
+});
+
+test('the oracle exception refuses runtime promotion, extra runtimes and mismatched pins', () => {
+  const original = packageInputs();
+  for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies'] as const) {
+    const { manifest, lock } = structuredClone(original);
+    manifest[field] = { ...manifest[field], [ORACLE]: ORACLE_VERSION };
+    expect(oracleBoundaryErrors(manifest, lock)).toContain(`${field}: ${ORACLE} is not dev-only`);
+    // A differently named consumer dependency could reach the already allowed
+    // runtime nodes transitively. Self-contained means no consumer deps at all.
+    const wrapper = structuredClone(original);
+    wrapper.manifest[field] = { ...wrapper.manifest[field], 'oracle-wrapper': '1.0.0' };
+    expect(oracleBoundaryErrors(wrapper.manifest, wrapper.lock)).toContain(`${field}: consumer dependency list must be empty`);
+  }
+  const extra = structuredClone(original);
+  extra.manifest.devDependencies = { ...extra.manifest.devDependencies, '@esotericsoftware/spine-canvas': ORACLE_VERSION };
+  extra.lock.packages['@esotericsoftware/spine-canvas'] = [`@esotericsoftware/spine-canvas@${ORACLE_VERSION}`, '', {}];
+  expect(oracleBoundaryErrors(extra.manifest, extra.lock)).toContain(`devDependencies: only ${ORACLE}@${ORACLE_VERSION} is the oracle`);
+  expect(oracleBoundaryErrors(extra.manifest, extra.lock)).toContain('lockfile: only spine-webgl and its spine-core dependency may resolve');
+  const mismatch = structuredClone(original);
+  mismatch.manifest.devDependencies = { ...mismatch.manifest.devDependencies, [ORACLE]: `^${ORACLE_VERSION}` };
+  mismatch.lock.packages[ORACLE_CORE][0] = `${ORACLE_CORE}@4.3.12`;
+  expect(oracleBoundaryErrors(mismatch.manifest, mismatch.lock)).toContain(`devDependencies: only ${ORACLE}@${ORACLE_VERSION} is the oracle`);
+  expect(oracleBoundaryErrors(mismatch.manifest, mismatch.lock)).toContain(`lockfile: unexpected oracle resolution ${ORACLE_CORE}: ${ORACLE_CORE}@4.3.12`);
+});
+
+test('library source keeps the official oracle outside the shipped import graph', () => {
+  const files = readdirSync(resolve(repoRoot, 'src'), { recursive: true }).map(String).filter((file) => file.endsWith('.ts'));
+  const imports = files.filter((file) => /@esotericsoftware\//.test(stripComments(readFileSync(resolve(repoRoot, 'src', file), 'utf8'))));
+  expect(imports).toEqual([]);
+});
+
+/**
+ * The registry names the package shipped under before, kept as aliases (#65,
+ * #98): every version of `@rig-c/play` is published again as `rig-play` and as
+ * `spine-html`, and each must carry the same files, byte for byte, but for the
+ * `name` line of `package.json`. `scripts/alias-tarball.mjs` makes those
+ * tarballs and holds each to the package's before `release.yml` publishes it;
+ * this runs the script over the temp build for each alias, then reads the
+ * tarballs itself rather than taking the script's word, and plants a
+ * difference the script has to name.
+ */
+const ALIASES = ['rig-play', 'spine-html'];
+const aliasScript = resolve(repoRoot, 'scripts', 'alias-tarball.mjs');
+
+/** What `tar -xzf` puts in `into`, as sorted relative file paths. */
+function unpack(tgz: string, into: string): string[] {
+  mkdirSync(into, { recursive: true });
+  const r = spawnSync('tar', ['-xzf', tgz, '-C', into], { encoding: 'utf8' });
+  expect(r.status, `tar -xzf ${tgz}: ${r.stderr}`).toBe(0);
+  return readdirSync(into, { recursive: true })
+    .map((entry) => String(entry).split(sep).join('/'))
+    .filter((path) => !statSync(resolve(into, path)).isDirectory())
+    .sort();
+}
+
+test('the real tarball includes every library output but excludes planted dev assets in dist', () => {
+  const source = resolve(sandbox, 'contaminated-package');
+  mkdirSync(source, { recursive: true });
+  cpSync(pkgDist, resolve(source, 'dist'), { recursive: true });
+  cpSync(resolve(repoRoot, 'skills'), resolve(source, 'skills'), { recursive: true });
+  for (const file of ['package.json', 'NOTICE.md', 'README.md', 'LICENSE']) cpSync(resolve(repoRoot, file), resolve(source, file));
+  // A clean build alone cannot hold the npm allowlist: the checkout can have
+  // a Vite demo build, whose official oracle bundle must never be published.
+  // Plant both bundled JS and declarations outside the library's exact set.
+  for (const [file, content] of [
+    ['dist/assets/official-runtime.js', "export class SkeletonJson {} // dev oracle sentinel\n"],
+    ['dist/officialOracle.d.ts', "export { SkeletonJson } from '@esotericsoftware/spine-webgl';\n"],
+    ['dist/main.d.ts', 'export declare const demo: true;\n'],
+    ['dist/oracle.html', '<script src="assets/official-runtime.js"></script>\n'],
+    ['dist/rigs/fixture/skeleton.json', '{"skeleton":{"spine":"4.3.13"}}\n'],
+  ]) {
+    const path = resolve(source, file);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, content);
+  }
+  const destination = resolve(sandbox, 'contaminated-tarball');
+  mkdirSync(destination, { recursive: true });
+  const packed = spawnSync('npm', ['pack', source, '--ignore-scripts', '--pack-destination', destination, '--json'], { cwd: sandbox, encoding: 'utf8' });
+  expect(packed.status, `${packed.stdout}${packed.stderr}`).toBe(0);
+  const result = JSON.parse(packed.stdout) as Array<{ filename: string; files: Array<{ path: string }> }>;
+  const libraryFiles = readdirSync(pkgDist).map(String).sort();
+  const expected = ['LICENSE', 'NOTICE.md', 'README.md', 'package.json', 'skills/rig-play/SKILL.md', ...libraryFiles.map((file) => `dist/${file}`)].sort();
+  expect(result[0].files.map(({ path }) => path).sort()).toEqual(expected);
+  const extracted = resolve(sandbox, 'contaminated-read');
+  const actual = unpack(resolve(destination, result[0].filename), extracted);
+  expect(actual).toEqual(expected.map((file) => `package/${file}`));
+  for (const file of libraryFiles) {
+    expect(readFileSync(resolve(extracted, 'package/dist', file)).equals(readFileSync(resolve(pkgDist, file))), file).toBe(true);
+  }
+});
+
+for (const ALIAS of ALIASES) test(`the ${ALIAS} tarball is the package tarball under that earlier name, and nothing else`, () => {
+  // The package directory npm would pack, from the temp build: the real
+  // manifest and the files its `files` list and npm's own rules take.
+  const src = resolve(sandbox, `alias-src-${ALIAS}`);
+  mkdirSync(src, { recursive: true });
+  cpSync(pkgDist, resolve(src, 'dist'), { recursive: true });
+  cpSync(resolve(repoRoot, 'skills'), resolve(src, 'skills'), { recursive: true });
+  for (const file of ['package.json', 'NOTICE.md', 'README.md', 'LICENSE']) {
+    cpSync(resolve(repoRoot, file), resolve(src, file));
+  }
+  const primaryDir = resolve(sandbox, `alias-primary-${ALIAS}`);
+  mkdirSync(primaryDir, { recursive: true });
+  const packed = spawnSync(
+    'npm',
+    ['pack', src, '--ignore-scripts', '--pack-destination', primaryDir, '--loglevel=error'],
+    { cwd: sandbox, encoding: 'utf8' },
+  );
+  expect(packed.status, `npm pack failed:\n${packed.stdout}${packed.stderr}`).toBe(0);
+  const primary = resolve(primaryDir, readdirSync(primaryDir).find((file) => file.endsWith('.tgz')) as string);
+
+  const made = node([aliasScript, 'pack', '--alias', ALIAS, '--tarball', primary, '--out', resolve(sandbox, `alias-out-${ALIAS}`)], sandbox);
+  expect(made.status, `alias-tarball pack failed:\n${made.stdout}${made.stderr}`).toBe(0);
+  expect(made.stderr).toContain(`PASS  ALIAS_SAME_CONTENT: ${ALIAS} carries the`);
+  const aliasTgz = made.stdout.trim().split('\n').pop() as string;
+  expect(existsSync(aliasTgz), aliasTgz).toBe(true);
+
+  // Read independently of the script: the same paths, every file the same
+  // bytes, and in the manifest exactly one line apart — the name.
+  const a = resolve(sandbox, `alias-read-${ALIAS}`, 'package');
+  const b = resolve(sandbox, `alias-read-${ALIAS}`, 'alias');
+  const left = unpack(primary, a);
+  const right = unpack(aliasTgz, b);
+  expect(right).toEqual(left);
+  expect(left).toContain('package/NOTICE.md');
+  expect(left).toContain('package/dist/index.js');
+  for (const path of left) {
+    if (path === 'package/package.json') continue;
+    expect(readFileSync(resolve(b, path)).equals(readFileSync(resolve(a, path))), path).toBe(true);
+  }
+  const mine = readFileSync(resolve(a, 'package/package.json'), 'utf8').split('\n');
+  const theirs = readFileSync(resolve(b, 'package/package.json'), 'utf8').split('\n');
+  expect(theirs.length).toBe(mine.length);
+  const differing = mine.flatMap((line, i) => (line === theirs[i] ? [] : [[line, theirs[i]]]));
+  expect(differing).toEqual([['  "name": "@rig-c/play",', `  "name": "${ALIAS}",`]]);
+
+  // The comparison can fail: one byte changed in the bundle is named by path.
+  const planted = resolve(sandbox, `alias-planted-${ALIAS}`);
+  unpack(aliasTgz, planted);
+  const bundle = resolve(planted, 'package/dist/index.js');
+  const bytes = readFileSync(bundle);
+  bytes[bytes.length - 2] ^= 1;
+  writeFileSync(bundle, bytes);
+  const plantedTgz = resolve(sandbox, `alias-planted-${ALIAS}.tgz`);
+  expect(spawnSync('tar', ['-czf', plantedTgz, '-C', planted, 'package']).status).toBe(0);
+  const caught = node([aliasScript, 'compare', primary, plantedTgz], sandbox);
+  expect(caught.status, caught.stdout + caught.stderr).toBe(1);
+  expect(caught.stdout).toContain('package/dist/index.js differs');
+
+  // And a tarball under the package's own name is not an alias of it.
+  const self = node([aliasScript, 'compare', primary, primary], sandbox);
+  expect(self.status, self.stdout + self.stderr).toBe(1);
+});
+
+/** Strips `//` and `/* *\/` comments without eating string or template contents. */
+function stripComments(source: string): string {
+  let out = '';
+  let i = 0;
+  let quote: string | null = null;
+  while (i < source.length) {
+    const c = source[i] as string;
+    const next = source[i + 1];
+    if (quote) {
+      if (c === '\\') {
+        out += c + (next ?? '');
+        i += 2;
+        continue;
+      }
+      if (c === quote) quote = null;
+      out += c;
+      i += 1;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      quote = c;
+      out += c;
+      i += 1;
+      continue;
+    }
+    if (c === '/' && next === '/') {
+      while (i < source.length && source[i] !== '\n') i += 1;
+      continue;
+    }
+    if (c === '/' && next === '*') {
+      i += 2;
+      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) i += 1;
+      i += 2;
+      continue;
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
+/** Module specifiers of every static import / re-export in `code`. */
+function specifiers(code: string): string[] {
+  const pattern =
+    /(?:\bimport\b|\bexport\b)[^;'"]*?\bfrom\s*['"]([^'"]+)['"]|\bimport\s*['"]([^'"]+)['"]/g;
+  return [...code.matchAll(pattern)].map((match) => (match[1] ?? match[2]) as string);
+}
+
+interface GraphNode {
+  file: string;
+  /** Comment-stripped source: what the bundler sees, not what a grep sees. */
+  code: string;
+  relative: { spec: string; target: string | null }[];
+}
+
+/**
+ * Transitive relative-import graph of `entry`, resolved the way node's ESM
+ * resolver does it: a relative specifier is a path, taken literally, with no
+ * extension guessing. So an extensionless specifier shows up here as
+ * unresolved — the same fact node reports as ERR_MODULE_NOT_FOUND.
+ */
+function walkGraph(entry: string): Map<string, GraphNode> {
+  const seen = new Map<string, GraphNode>();
+  const queue = [entry];
+  while (queue.length) {
+    const file = queue.shift() as string;
+    if (seen.has(file)) continue;
+    const code = stripComments(readFileSync(file, 'utf8'));
+    const graphNode: GraphNode = { file, code, relative: [] };
+    for (const spec of specifiers(code)) {
+      if (!spec.startsWith('.')) continue;
+      const path = resolve(dirname(file), spec);
+      const target = existsSync(path) ? path : null;
+      graphNode.relative.push({ spec, target });
+      if (target) queue.push(target);
+    }
+    seen.set(file, graphNode);
+  }
+  return seen;
+}
+
+test('the bundle imports nothing: rig-c/core is inside it, and no node built-in is reached', () => {
+  // rig-c's `./core` entry is TypeScript source in a devDependency — a
+  // consumer has neither. So the bundle must carry the core's closure rather
+  // than import it, and must import nothing else either: a bare specifier left
+  // in `index.js` is a package the consumer was never told to install.
+  const graph = walkGraph(resolve(pkgDist, 'index.js'));
+  const name = (file: string) => relative(pkgDist, file);
+  expect([...graph.keys()].map(name)).toEqual(['index.js']);
+  const code = (graph.values().next().value as GraphNode).code;
+  expect(specifiers(code)).toEqual([]);
+  expect(/\bimport\s*\(/.test(code)).toBe(false);
+  // rig-c states its core links no `node:` module; a browser bundle is held to it.
+  expect(code).not.toMatch(/['"]node:/);
+  // And the core really is inside: `openTrack` is what the player steps.
+  expect(code).toContain('function openTrack');
+  // The shipped types name nothing a consumer does not have — the adapter's
+  // rig-c types are `@internal` and stripped (tsconfig.build.json).
+  const declarations = readdirSync(pkgDist).filter((file) => file.endsWith('.d.ts'));
+  const namingRigc = declarations.filter((file) => /rig-c/.test(stripComments(readFileSync(resolve(pkgDist, file), 'utf8'))));
+  expect(namingRigc).toEqual([]);
+});
+
+/**
+ * The consumer both typecheck modes compile: every name the `exports` map
+ * offers, reached by package name through the shipped `.d.ts`.
+ */
+const CONSUMER_SOURCE = [
+  "import { CanvasRenderer, DomRenderer, loadModel, readSetupMesh, revokeRegions, RigPlayer, unpackRegions } from '@rig-c/play';",
+  "import type { ModelAssets, PosedFrame, PosedSlot, RigPlayerOptions, SlotIdentity, SlotIdentityReason, SlotIdentitySnapshot } from '@rig-c/play';",
+  "import type { BoneAdjust, BoneAdjustContext, PhysicsParameters, PhysicsParameterPatch, PhysicsParameterRead } from '@rig-c/play';",
+  "export const unaryAdjust: BoneAdjust = bones => { bones.bone('root').rotation = 3; };",
+  "export const contextualAdjust: BoneAdjust = (bones, ctx: BoneAdjustContext) => { const time: number | null = ctx.trackTime; const animation: string | null = ctx.animation; const global: number = ctx.globalTime; bones.bone('root').rotation = time ?? global; void animation; };",
+  "export function physics(p: RigPlayer): PhysicsParameterRead { const patch: PhysicsParameterPatch = { strength: 2, damping: 0.4, inertia: 1, wind: 0, gravity: 3, mix: 0.5 }; p.setPhysicsParameters('cloth', patch); const read: PhysicsParameterRead = p.readPhysicsParameters('cloth'); const effective: PhysicsParameters | null = read.effective; p.clearPhysicsParameters('cloth'); void effective; return read; }",
+  '// @ts-expect-error public parameter fields are readonly',
+  'export function readonlyParameters(p: PhysicsParameters): void { p.damping = 1; }',
+  '// @ts-expect-error public context fields are readonly',
+  'export function readonlyContext(c: BoneAdjustContext): void { c.trackTime = 1; }',
+  'export const surface = [CanvasRenderer, DomRenderer, RigPlayer, loadModel, unpackRegions, revokeRegions];',
+  "import type { SetupMesh, SetupMeshTarget } from '@rig-c/play';",
+  'export function setup(assets: ModelAssets, target: SetupMeshTarget): SetupMesh { const m = readSetupMesh(assets, target); const xy: number[] = m.vertices; const triangles: number[] = m.triangles; const hull: number | null = m.hull; return { ...m, vertices: xy, triangles, hull }; }',
+  "export const targets: SetupMeshTarget[] = [{ slot: 's', attachment: 'm' }, { slot: 's', attachment: 'm', skin: null }, { slot: 's', attachment: 'm', skin: 'all' }];",
+  'export function drawCanvas(renderer: CanvasRenderer, frame: PosedFrame): number { renderer.render(frame); return renderer.drawCalls; }',
+  'export function draw(renderer: DomRenderer, frame: PosedFrame): PosedSlot[] { renderer.render(frame); return frame.order; }',
+  'export function play(root: HTMLElement, assets: ModelAssets, options: RigPlayerOptions): RigPlayer { const p = new RigPlayer(root, assets, options); p.play(assets.animations[0].name, { loop: true }); return p; }',
+  'export function inspectSlots(player: RigPlayer): { snap: SlotIdentitySnapshot; first: SlotIdentity | undefined; reason: SlotIdentityReason | null | undefined } { const snap = player.slotIdentity(); return { snap, first: snap.slots[0], reason: snap.slots[0]?.reason }; }',
+  '',
+].join('\n');
+
+test('the emitted types resolve under bundler', async () => {
+  const result = await nodeAsync(
+    [tscBin, '--noEmit', '-p', writeConsumer('consumer', CONSUMER_SOURCE, 'bundler')],
+    sandbox,
+  );
+  expect(result.status, `tsc under moduleResolution=bundler failed:\n${result.output}`).toBe(0);
+});
+
+test('the emitted types resolve under nodenext', async () => {
+  // The .js in the source specifiers has to survive into the .d.ts too: a
+  // node16/nodenext consumer resolves `./DomTexture.js` to `./DomTexture.d.ts`
+  // and rejects the extensionless form with TS2835.
+  const result = await nodeAsync(
+    [tscBin, '--noEmit', '-p', writeConsumer('consumer', CONSUMER_SOURCE, 'nodenext')],
+    sandbox,
+  );
+  expect(result.status, `tsc under moduleResolution=nodenext failed:\n${result.output}`).toBe(0);
+});

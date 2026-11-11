@@ -1,0 +1,119 @@
+# CI: the playwright suite (chromium + webkit), one job.
+#
+# Captures are A/B within a run and engine, with no snapshot golden files.
+# Residue limits are measured per engine/case/mode; that design does not make
+# a macOS calibration automatically valid on this Ubuntu runner. Linux pixel
+# evidence must settle a differing floor before a limit changes.
+# Headless results are visual/counter evidence, never performance evidence.
+#
+# The package poses a rig's compiled model document through `rig-c/core` (a
+# devDependency pinned to one version and bundled into the build). Internal
+# parity and counters remain, while #39 adds an independent official WebGL
+# pixel oracle as dev-only tooling on both browser projects. There is no old
+# spine-core generation matrix: the official reader matches the paired fixture
+# export, and a pose doubt remains a rigc issue answered by rig-c's own gate.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # A pull request opened by GITHUB_TOKEN — release-please's — gets its run
+  # created and then held at `action_required` (nothing executes until a
+  # maintainer approves it), so the release branch is tested on demand from
+  # here instead. See RELEASING.md.
+  workflow_dispatch:
+    inputs:
+      parity_dump:
+        # The parity diff counts bad pixels but cannot say where they are, and
+        # the one platform whose residue is unexplained (linux WebKit) exists
+        # only on this runner. With this on, every parity cell also writes the
+        # two captures, a red/yellow diff mask and metrics.json, and the run
+        # uploads them green or red. See the header of tests/parity.spec.ts.
+        description: 'Dump parity captures + diff masks as an artifact'
+        type: boolean
+        default: false
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - name: Check README scope and planted failures (offline)
+        run: |
+          node scripts/check-readme.mjs
+          node --test scripts/check-readme.test.mjs
+      - name: Check release workflow decisions (offline)
+        timeout-minutes: 2
+        run: |
+          bun test scripts/release-workflow.test.ts
+          bun test tests/source-resolution.unit.test.ts
+      - name: Identify Playwright browser cache
+        id: playwright
+        run: |
+          version=$(bunx playwright --version)
+          echo "$version; runner image ${ImageOS:?} ${ImageVersion:?}"
+          printf 'version=%s\nimage=%s-%s\n' "${version#Version }" "$ImageOS" "$ImageVersion" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          # No partial restore: match the installed CLI, architecture and image.
+          key: playwright-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright.outputs.image }}-${{ steps.playwright.outputs.version }}-chromium-webkit
+      - name: Install Playwright system dependencies
+        timeout-minutes: 10
+        run: |
+          # apt logs the requested and newly-installed packages; browser cache
+          # hits do not cache system packages. Do not gate apt on --dry-run:
+          # that diagnostic can exit nonzero when packages are missing.
+          /usr/bin/time -p bunx playwright install-deps chromium webkit
+      - name: Install Playwright browsers
+        timeout-minutes: 10
+        run: |
+          echo "Browser cache hit: ${{ steps.playwright-cache.outputs.cache-hit }}"
+          /usr/bin/time -p bunx playwright install chromium webkit
+      - run: bun run test
+        env:
+          # Empty on push / pull_request — the spec only dumps on the exact
+          # string "1", so those runs are the unchanged default path.
+          PARITY_DUMP: ${{ github.event_name == 'workflow_dispatch' && inputs.parity_dump && '1' || '' }}
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results/
+          if-no-files-found: ignore
+      # Retain the measured Linux raster/counter evidence on green runs too.
+      # A passing macOS-derived budget alone is not a Linux calibration record.
+      - if: ${{ success() || failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-oracle-evidence
+          path: |
+            test-results/oracle-*/
+            test-results/bench-oracle-*/
+          if-no-files-found: error
+      # The dump is the point of such a run, so it must be uploaded whether the
+      # suite ends green or red. Two Actions rules shape the condition:
+      #   1. a step `if:` with no status function means `success() && <expr>`,
+      #      so the dispatch clause alone would skip the upload exactly when
+      #      the suite failed — the run most worth looking at;
+      #   2. ANY status function in the expression removes that implicit
+      #      success(), so the outcome guard has to be spelled out — hence
+      #      `(success() || failure())`.
+      # It is ANDed with the dispatch clause rather than written as
+      # `failure() || <dispatch clause>` so that ordinary push/pull_request
+      # failures do not also upload under a name promising a dump they do not
+      # contain. Those events keep exactly today's behaviour: the
+      # `test-results` upload above, on failure only.
+      - if: ${{ (success() || failure()) && github.event_name == 'workflow_dispatch' && inputs.parity_dump }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-dump
+          path: test-results/
+          if-no-files-found: ignore

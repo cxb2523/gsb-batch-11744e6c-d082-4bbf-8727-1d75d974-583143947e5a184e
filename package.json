@@ -1,0 +1,91 @@
+{
+  "name": "@rig-c/play",
+  "version": "1.24.0",
+  "description": "Plays skeleton.model.json written by rigc build as plain DOM elements \u2014 rigid slots as <img> posed by CSS matrix, deform meshes on small per-part canvases \u2014 or as one canvas.",
+  "type": "module",
+  "license": "MIT",
+  "author": "firejune",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rig-c/play.git"
+  },
+  "homepage": "https://github.com/rig-c/play#readme",
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/firejune"
+  },
+  "bugs": "https://github.com/rig-c/play/issues",
+  "keywords": [
+    "rigc",
+    "rig-c",
+    "skeletal-animation",
+    "mesh-deformation",
+    "dom",
+    "css-transform",
+    "renderer",
+    "2d",
+    "animation",
+    "character-animation"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "@rig-c/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/index.js",
+    "dist/index.js.map",
+    "dist/CanvasRenderer.d.ts",
+    "dist/CanvasRenderer.d.ts.map",
+    "dist/DomRenderer.d.ts",
+    "dist/DomRenderer.d.ts.map",
+    "dist/DomTexture.d.ts",
+    "dist/DomTexture.d.ts.map",
+    "dist/MeshGlBlitter.d.ts",
+    "dist/MeshGlBlitter.d.ts.map",
+    "dist/index.d.ts",
+    "dist/index.d.ts.map",
+    "dist/loadModel.d.ts",
+    "dist/loadModel.d.ts.map",
+    "dist/pixelRatio.d.ts",
+    "dist/pixelRatio.d.ts.map",
+    "dist/player.d.ts",
+    "dist/player.d.ts.map",
+    "dist/posedFrame.d.ts",
+    "dist/posedFrame.d.ts.map",
+    "NOTICE.md",
+    "dist/liveFrame.d.ts",
+    "dist/liveFrame.d.ts.map",
+    "dist/liveFrameSource.d.ts",
+    "dist/liveFrameSource.d.ts.map",
+    "skills"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "predev": "bash scripts/fetch-assets.sh",
+    "dev": "vite",
+    "prebuild": "bash scripts/fetch-assets.sh",
+    "build": "tsc --noEmit && vite build",
+    "build:lib": "rm -rf dist && node scripts/build-lib.mjs dist",
+    "prepublishOnly": "npm run build:lib",
+    "preview": "vite preview",
+    "test": "playwright test",
+    "bench": "bash scripts/fetch-assets.sh && node scripts/bench.mjs",
+    "bench:dev": "bash scripts/fetch-assets.sh && vite --config bench/vite.config.ts",
+    "bench:build": "bash scripts/fetch-assets.sh && vite build --config bench/vite.config.ts",
+    "fetch-assets": "bash scripts/fetch-assets.sh"
+  },
+  "devDependencies": {
+    "@esotericsoftware/spine-webgl": "4.3.13",
+    "@playwright/test": "1.62.1",
+    "@rig-c/core": "3.7.0",
+    "@rig-c/parts": "2.37.0",
+    "@types/node": "^22",
+    "typescript": "^5.6.0",
+    "vite": "^6.0.0"
+  }
+}

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+dist-bench/
+test-results/
+playwright-report/
+# Benchmark output: numbers belong in a PR with their conditions, never
+# committed as a file (scripts/bench.mjs).
+bench-results/
+.DS_Store
+# rigc builds — the gallery from a pinned rigc tag and tests/rigs/, by scripts/fetch-assets.sh
+public/rigs/
+bench/load-base.generated.ts
+bench/base.generated/
+public/bench/
