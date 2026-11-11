@@ -115,6 +115,47 @@ export function composeScore(
 	opts?: { name?: string; loop?: boolean; effort?: string },
 ): { score: MotionScore | null; matched: string | null; reason: string | null };
 
+export interface ComposeAuditCheck {
+	name: string;
+	passed: boolean;
+	reason: string | null;
+}
+
+export interface ComposeAudit {
+	prompt: string;
+	text: string;
+	matched: string | null;
+	matchedPhrase: string | null;
+	matchSource: 'synonym' | 'action' | null;
+	side: 'left' | 'right' | null;
+	direction: 'down' | 'up' | 'left' | 'right' | 'forward' | null;
+	manner: { word: string | null; effort: string | null };
+	effort: string | null;
+	effortSource: 'opts' | 'manner' | 'default' | null;
+	repeats: number | null;
+	repeatsExpression: string | null;
+	seed: string | null;
+	loop: boolean;
+	factor: number | null;
+	beats: Array<{
+		index: number;
+		label: string | null;
+		in: { raw: number | null; scaled: number | null };
+		hold: { raw: number | null; scaled: number | null };
+		factor: number;
+	}>;
+	reason: string | null;
+	degraded: boolean;
+	degradation: 'empty input' | 'unrecognized action' | null;
+	checks: ComposeAuditCheck[];
+	passed: boolean;
+}
+
+export function auditCompose(
+	prompt: string,
+	opts?: { name?: string; loop?: boolean; effort?: string },
+): ComposeAudit;
+
 export declare class Pose {
 	constructor(from?: Pose | null);
 	local: Map<string, Quat>;

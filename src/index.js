@@ -11,6 +11,7 @@
 
 import { buildClip, restClip, stableUuid, MOTION_BONES } from './clip.js';
 import { composeScore, ACTION_NAMES } from './compose.js';
+import { auditCompose } from './audit-compose.js';
 import { describeScore, normalizeScore, scoreSchema, validateScore, MOTION_SCORE_VERSION, LIMITS } from './score.js';
 import { solveBeat, solveScorePoses, expressionWeights } from './solve.js';
 
@@ -24,6 +25,7 @@ export {
 	scoreSchema,
 	describeScore,
 	composeScore,
+	auditCompose,
 	solveBeat,
 	solveScorePoses,
 	expressionWeights,
