@@ -1,0 +1,96 @@
+import type { YuKumo } from "../YuKumo.ts";
+import { isVoicePacket } from "./RawGatewayAdapter.ts";
+
+export interface MinimalErisClient {
+  on(event: "rawWS", listener: (packet: { t: string; d: Record<string, unknown> }) => void): unknown;
+  off?(event: "rawWS", listener: (packet: { t: string; d: Record<string, unknown> }) => void): unknown;
+  getGuildShard(guildId: string): { sendWS(op: number, data: unknown): void } | undefined;
+}
+
+/**
+ * First-class adapter connecting Yukumo with Eris Discord client.
+ */
+export class ErisAdapter {
+  private readonly client: MinimalErisClient;
+  private readonly kumo: YuKumo;
+
+  /**
+   * Surfaces rejected manager pipelines (voice teardown, plugin hooks) as debug
+   * events instead of letting them become unhandled rejections.
+   */
+  private readonly reportManagerError = (err: unknown): void => {
+    this.kumo.events.emit(
+      "debug",
+      `Eris adapter pipeline error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  };
+
+  private readonly rawListener = (packet: { t: string; d: Record<string, unknown> }): void => {
+    if (!isVoicePacket(packet)) return;
+
+    if (packet.t === "VOICE_STATE_UPDATE") {
+      const d = packet.d;
+      // Identity (bot vs member) is enforced once, in YuKumo.handleVoiceStateUpdate.
+      void this.kumo
+        .handleVoiceStateUpdate({
+          guildId: String(d.guild_id ?? ""),
+          sessionId: String(d.session_id ?? ""),
+          channelId: d.channel_id != null ? String(d.channel_id) : null,
+          userId: String(d.user_id ?? ""),
+        })
+        .catch(this.reportManagerError);
+    } else if (packet.t === "VOICE_SERVER_UPDATE") {
+      const d = packet.d;
+      void this.kumo
+        .handleVoiceServerUpdate(String(d.guild_id ?? ""), {
+          token: String(d.token ?? ""),
+          endpoint: d.endpoint != null ? String(d.endpoint) : null,
+        })
+        .catch(this.reportManagerError);
+    } else if (packet.t === "CHANNEL_DELETE") {
+      const d = packet.d;
+      if (d.guild_id != null && d.id != null) {
+        void this.kumo.handleChannelDelete(String(d.guild_id), String(d.id)).catch(this.reportManagerError);
+      }
+    }
+  };
+
+  public constructor(client: MinimalErisClient, kumo: YuKumo) {
+    this.client = client;
+    this.kumo = kumo;
+
+    this.client.on("rawWS", this.rawListener);
+    this.kumo.registerAdapter(this);
+  }
+
+  /** Detaches the rawWS gateway listener; called automatically by YuKumo.destroy() */
+  public destroy(): void {
+    this.client.off?.("rawWS", this.rawListener);
+  }
+
+  /**
+   * Sends voice state update payload to Discord via Eris shard WS
+   */
+  public sendVoiceStateUpdate(
+    guildId: string,
+    channelId: string | null,
+    selfDeaf: boolean = true,
+    selfMute: boolean = false,
+  ): void {
+    const shard = this.client.getGuildShard(guildId);
+    if (!shard) {
+      this.kumo.events.emit(
+        "debug",
+        `Eris: no shard found for guild ${guildId}; cannot send voice state update`,
+      );
+      return;
+    }
+
+    shard.sendWS(4, {
+      guild_id: guildId,
+      channel_id: channelId,
+      self_deaf: selfDeaf,
+      self_mute: selfMute,
+    });
+  }
+}

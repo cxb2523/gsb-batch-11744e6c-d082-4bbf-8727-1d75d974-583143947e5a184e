@@ -1,0 +1,303 @@
+import type { LoadResult, TrackData } from "./protocol.ts";
+
+export interface NodeConfig {
+  host: string;
+  port: number;
+  password: string;
+  name?: string;
+  secure?: boolean;
+  region?: string;
+  resumeTimeout?: number;
+  resumeKey?: string;
+  /** Enable Lavalink session resuming for this node (implied when resumeKey is set) */
+  resuming?: boolean;
+  /**
+   * Server family for this node. `"auto"` (default) detects the type from
+   * `/v4/info` on connect; `"nodelink"`/`"lavalink"` force it. Resolved to a
+   * concrete type after `ready` and exposed as `node.type`.
+   */
+  type?: "lavalink" | "nodelink" | "auto";
+  /**
+   * Marks this node as NodeLink (PerformanC's Lavalink alternative).
+   * Auto-detected from /v4/info (`isNodelink`) when omitted. NodeLink v3+
+   * supports session resuming just like Lavalink.
+   *
+   * @deprecated Prefer `type: "nodelink"`. Still honored for back-compat.
+   */
+  isNodeLink?: boolean;
+  maxRetries?: number;
+  retryDelay?: number;
+  retryDelayMax?: number;
+  /** Milliseconds to wait for the WebSocket handshake before failing connect() (default 15000) */
+  connectTimeout?: number;
+  /** Custom HTTP headers sent with every REST request and the WS handshake to this node */
+  httpHeaders?: Record<string, string>;
+  /** Whether to send WS heartbeat pings to detect dead connections (default true) */
+  enableHeartbeat?: boolean;
+  /** Interval between WS heartbeat pings in milliseconds (default 30000) */
+  heartbeatIntervalMs?: number;
+  /** Time to wait for a pong before declaring the connection dead (default 10000) */
+  heartbeatTimeoutMs?: number;
+}
+
+export interface NodeStats {
+  players: number;
+  playingPlayers: number;
+  uptime: number;
+  memory: {
+    free: number;
+    used: number;
+    allocated: number;
+    reservable: number;
+  };
+  cpu: {
+    cores: number;
+    systemLoad: number;
+    /** Lavalink v4 load metric */
+    lavalinkLoad?: number;
+    /** NodeLink's name for the same metric */
+    nodelinkLoad?: number;
+  };
+  frameStats: {
+    sent: number;
+    nulled: number;
+    deficit: number;
+    /** NodeLink only */
+    expected?: number;
+  } | null;
+}
+
+export type NodeState = "disconnected" | "connecting" | "connected" | "destroyed";
+
+/** Discord gateway OP4 voice state payload, dispatched through the user-provided `send` function */
+export interface VoiceGatewayPayload {
+  op: 4;
+  d: {
+    guild_id: string;
+    channel_id: string | null;
+    self_mute: boolean;
+    self_deaf: boolean;
+  };
+}
+
+export interface ManagerOptions {
+  nodes: NodeConfig[];
+  userId?: string;
+  /** Custom logger for internal diagnostics; defaults to a no-op logger */
+  logger?: import("../utils/Logger.ts").Logger;
+  /** Minimum level passed through to the logger (default "warn"; "silent" disables) */
+  logLevel?: import("../utils/Logger.ts").LogLevel;
+  /**
+   * Sends a raw payload to the Discord gateway for the shard handling the guild.
+   * Required for player.connect()/disconnect()/setVoiceChannel() to actually join
+   * or leave voice channels. Example (discord.js):
+   * `send: (guildId, payload) => client.guilds.cache.get(guildId)?.shard.send(payload)`
+   */
+  send?: (guildId: string, payload: VoiceGatewayPayload) => void;
+  /**
+   * What to do when the bot is disconnected from a voice channel
+   * (VOICE_STATE_UPDATE with channel_id null).
+   * - destroyPlayer (default true): destroy the player.
+   * - autoReconnect: re-send OP4 to rejoin the last channel and resume the
+   *   current track at its saved position. Takes precedence over destroyPlayer.
+   */
+  onDisconnect?: {
+    destroyPlayer?: boolean;
+    autoReconnect?: boolean;
+  };
+  defaultSearchSource?: string;
+  /**
+   * Session + player resuming across bot restarts.
+   * - enabled: turn on Lavalink session resuming for all nodes and persist
+   *   session IDs to the storage adapter so a restarted process reclaims its
+   *   sessions (audio keeps playing on the node during the restart window).
+   * - timeout: seconds Lavalink keeps the session (and playback) alive after
+   *   the WS drops (default 60).
+   * - persistPlayers: persist full player state (queue, position, volume,
+   *   filters, repeat/autoplay flags) and restore players automatically on
+   *   init() (default true when enabled).
+   */
+  resuming?: {
+    enabled?: boolean;
+    timeout?: number;
+    persistPlayers?: boolean;
+  };
+  defaultNodeSelector?: import("../node/NodeSelector.ts").NodeSelector;
+  storageAdapter?: StorageAdapter;
+  plugins?: Array<{
+    name: string;
+    version: string;
+    init?(manager: unknown): void | Promise<void>;
+    start?(): void | Promise<void>;
+    destroy?(): void | Promise<void>;
+  }>;
+  /** Voice connection timeout in milliseconds (default 15000) */
+  voiceConnectionTimeout?: number;
+  /** Number of voice connection retry attempts before throwing (default 0) */
+  voiceConnectionRetries?: number;
+  /** If false, URL queries are rejected with an error load result (default true) */
+  linksAllowed?: boolean;
+  /** When non-empty, URL queries must match at least one entry (string substring or RegExp) */
+  linksWhitelist?: (RegExp | string)[];
+  /** URL queries matching any entry are rejected, even if whitelisted */
+  linksBlacklist?: (RegExp | string)[];
+  /** Custom HTTP headers applied to every node's REST requests and WS handshake */
+  httpHeaders?: Record<string, string>;
+  /** Queue behavior applied to every player's queue */
+  queueOptions?: {
+    /** Persist queues to the configured storage adapter and restore them on player create (default false) */
+    persist?: boolean;
+    /** Maximum number of history entries per queue (default 50) */
+    maxHistorySize?: number;
+  };
+  /** Custom Player subclass instantiated by PlayerManager.create (extendable player) */
+  playerClass?: new (
+    options: import("../player/Player.ts").PlayerOptions,
+  ) => import("../player/Player.ts").Player;
+  /** Default per-player protection/behavior options applied on player create */
+  playerDefaults?: {
+    /** Destroy the player when more than maxAmount track errors occur within threshold ms (default { threshold: 35000, maxAmount: 3 }; set null to disable) */
+    maxErrorsPerTime?: { threshold: number; maxAmount: number } | null;
+    /** Minimum ms the last track must have played before autoplay runs — prevents error spam (default 10000, 0 disables) */
+    minAutoPlayMs?: number;
+    /** Destroy the player this many ms after the queue ends (0/undefined disables; stayInVc overrides) */
+    queueEmptyDestroyMs?: number;
+    /** Enable autoplay on every created player (source-aware recommendations when the queue ends) */
+    autoplay?: boolean;
+  };
+}
+
+export type RepeatMode = "none" | "track" | "queue";
+
+export interface InternalVoiceState {
+  sessionId: string | null;
+  channelId: string | null;
+  endpoint: string | null;
+  token: string | null;
+}
+
+export interface VoiceServerUpdate {
+  token: string;
+  /** Null while Discord allocates a new voice region — hold until a real endpoint arrives */
+  endpoint: string | null;
+}
+
+export interface VoiceStateUpdate {
+  sessionId: string;
+  channelId: string | null;
+  guildId: string;
+  userId: string;
+}
+
+export interface SearchOptions {
+  query: string;
+  source?: string;
+  nodeName?: string;
+  requester?: unknown;
+}
+
+export interface SearchResult {
+  loadType: LoadResult["loadType"];
+  /** Uppercase loadType alias for migration compat (e.g. "TRACK_LOADED", "SEARCH_RESULT") */
+  type?: string;
+  tracks: TrackData[];
+  playlistInfo?: {
+    name: string;
+    selectedTrack: number;
+  };
+  exception?: {
+    message: string | null;
+    severity: string;
+    cause: string;
+  } | null;
+  pluginInfo?: Record<string, unknown>;
+}
+
+export interface StorageAdapter {
+  get(key: string): Promise<unknown | null>;
+  set(key: string, value: unknown): Promise<void>;
+  delete(key: string): Promise<boolean>;
+  has(key: string): Promise<boolean>;
+  clear(): Promise<void>;
+  /** Optional startup hook; called by YuKumo.init() so backends can initialize connections */
+  connect?(): Promise<void>;
+  /** Optional teardown hook; called by YuKumo.destroy() so backends can release connections */
+  disconnect?(): Promise<void>;
+}
+
+export type EventMap = {
+  nodeReady: (nodeId: string) => void;
+  nodeDisconnected: (nodeId: string, code: number, reason: string) => void;
+  nodeReconnected: (nodeId: string) => void;
+  nodeError: (nodeId: string, error: Error) => void;
+  playerCreate: (guildId: string) => void;
+  playerDestroy: (guildId: string, reason?: string) => void;
+  playerMove: (guildId: string, fromNode: string, toNode: string) => void;
+  /** Emitted when the bot disconnects from a voice channel */
+  playerDisconnect: (guildId: string, reason: string) => void;
+  /** Emitted when queue empties and playback stops — alias for queueEnd */
+  playerEmpty: (guildId: string) => void;
+  /** Emitted when the bot is moved between voice channels */
+  playerMoved: (guildId: string, oldChannel: string, newChannel: string) => void;
+  trackStart: (guildId: string, track: TrackData) => void;
+  trackEnd: (guildId: string, track: TrackData, reason: string) => void;
+  trackStuck: (guildId: string, track: TrackData, thresholdMs: number) => void;
+  trackException: (guildId: string, track: TrackData, exception: unknown) => void;
+  queueEnd: (guildId: string) => void;
+  playerUpdate: (
+    guildId: string,
+    state: { time: number; position: number; connected: boolean; ping: number },
+  ) => void;
+  stats: (nodeId: string, stats: NodeStats) => void;
+  debug: (message: string) => void;
+  /** Discord voice WebSocket closed on the Lavalink side (codes 4xxx are Discord voice close codes) */
+  socketClosed: (guildId: string, code: number, reason: string, byRemote: boolean) => void;
+  voiceReady: (guildId: string) => void;
+  voiceDisconnected: (guildId: string) => void;
+  voiceReconnecting: (guildId: string) => void;
+  /** Emitted when a voice connection times out */
+  voiceConnectionTimeout: (guildId: string) => void;
+  autoplayTrackAdded: (guildId: string, track: TrackData) => void;
+  playerAutoPaused: (guildId: string) => void;
+  playerAutoDisconnected: (guildId: string) => void;
+  /** SponsorBlock plugin: segments for the current track were loaded */
+  segmentsLoaded: (guildId: string, segments: unknown[]) => void;
+  /** SponsorBlock plugin: a segment was skipped */
+  segmentSkipped: (guildId: string, segment: unknown) => void;
+  /** SponsorBlock plugin: chapters for the current track were loaded */
+  chaptersLoaded: (guildId: string, chapters: unknown[]) => void;
+  /** SponsorBlock plugin: a chapter started */
+  chapterStarted: (guildId: string, chapter: unknown) => void;
+  /** Lyrics plugin: lyrics were found for the current track */
+  lyricsFound: (guildId: string, lyrics: unknown) => void;
+  /** Lyrics plugin: no lyrics were found for the current track */
+  lyricsNotFound: (guildId: string) => void;
+  /** Lyrics plugin: a live lyrics line was emitted */
+  lyricsLine: (guildId: string, line: unknown) => void;
+  /** Emitted after a player was rebuilt from persisted state on startup; resumedLive is true when the node session survived and audio never stopped */
+  playerRestored: (guildId: string, resumedLive: boolean) => void;
+  /** NodeLink mixer: a mix layer started */
+  mixStarted: (guildId: string, mix: unknown) => void;
+  /** NodeLink mixer: a mix layer ended */
+  mixEnded: (guildId: string, mix: unknown) => void;
+  /** NodeLink: player volume changed */
+  volumeChanged: (guildId: string, volume: number) => void;
+  /** NodeLink: player seeked */
+  playerSeek: (guildId: string, position: number) => void;
+  /** NodeLink: player pause state changed */
+  playerPause: (guildId: string, paused: boolean) => void;
+  /** NodeLink: player filters changed */
+  filtersChanged: (guildId: string, filters: unknown) => void;
+  /** NodeLink: stream metadata (thumbnail/views) for the current track */
+  streamMetadata: (guildId: string, metadata: unknown) => void;
+  /** NodeLink: a worker failed, affecting guilds */
+  workerFailed: (guildId: string, message: string) => void;
+  /** NodeLink: player voice connection status changed */
+  playerConnected: (guildId: string) => void;
+  /** NodeLink: player voice connection is reconnecting */
+  playerReconnecting: (guildId: string) => void;
+};
+
+export type EventName = keyof EventMap;
+
+export type EventCallback<E extends EventName> = EventMap[E];

@@ -1,0 +1,16 @@
+{
+  "name": "yukumo-example-discordjs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/index.ts"
+  },
+  "dependencies": {
+    "discord.js": "^14.0.0",
+    "yukumo": "file:../.."
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

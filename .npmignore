@@ -1,0 +1,15 @@
+src/
+node_modules/
+tsconfig.json
+tsup.config.ts
+eslint.config.js
+.prettierrc
+vitest.config.ts
+.gitignore
+.npmignore
+.editorconfig
+.github/
+coverage/
+examples/
+*.test.ts
+*.spec.ts

@@ -1,0 +1,385 @@
+import { WebSocketClient } from "../ws/WebSocketClient.ts";
+import { NodeLinkVoiceReceiver } from "./NodeLinkVoiceReceiver.ts";
+import { RestClient } from "../rest/RestClient.ts";
+import type { NodeConfig, NodeState, NodeStats } from "../types/internal.ts";
+import { EventDispatcher } from "../ws/EventDispatcher.ts";
+import type { EventName, EventCallback } from "../types/internal.ts";
+import { NodeStateCode } from "../types/constants.ts";
+import { YukumoUnsupportedFeatureError } from "../errors/index.ts";
+import { buildCapabilities, type NodeCapabilities, type NodeFeature, type NodeType } from "./capabilities.ts";
+
+export type { NodeState };
+export type { NodeCapabilities, NodeFeature, NodeType };
+
+/**
+ * Calculated penalty score metrics for node load balancing.
+ */
+export interface PenaltyScore {
+  total: number;
+  playerPenalty: number;
+  cpuPenalty: number;
+  deficitPenalty: number;
+  nullPenalty: number;
+}
+
+/**
+ * Represents a single Lavalink v4 node connection, providing WS event subscriptions,
+ * REST API client, and penalty score metrics.
+ */
+export class Node {
+  public readonly config: NodeConfig;
+  public readonly ws: WebSocketClient;
+  public readonly rest: RestClient;
+  private readonly events: EventDispatcher;
+  private _stats: NodeStats | null = null;
+  private _ping: number | null = null;
+  private _penalties: PenaltyScore = {
+    total: 0,
+    playerPenalty: 0,
+    cpuPenalty: 0,
+    deficitPenalty: 0,
+    nullPenalty: 0,
+  };
+  private _playerCount: number = 0;
+  /** null = not yet detected; resolved from config.type/isNodeLink or /v4/info on ready */
+  private _isNodeLink: boolean | null = null;
+  /** Resolved capabilities; null until the first `ready` completes detection */
+  private _capabilities: NodeCapabilities | null = null;
+  private _version: string | null = null;
+  private _maintenance: boolean = false;
+
+  private _userId: string;
+
+  public constructor(config: NodeConfig, userId: string) {
+    this.config = config;
+    this._userId = userId;
+    // `type` takes precedence over the legacy `isNodeLink` flag; "auto" defers to detection.
+    const configuredType = config.type ?? (config.isNodeLink === true ? "nodelink" : "auto");
+    this._isNodeLink = configuredType === "nodelink" ? true : configuredType === "lavalink" ? false : null;
+    this.events = new EventDispatcher();
+
+    this.rest = new RestClient({
+      host: config.host,
+      port: config.port,
+      password: config.password,
+      secure: config.secure,
+      sessionId: config.resumeKey,
+      httpHeaders: config.httpHeaders,
+      isNodeLink: config.isNodeLink ?? false,
+      retryOptions: {
+        maxRetries: config.maxRetries ?? 3,
+        baseDelay: config.retryDelay ?? 1000,
+        maxDelay: config.retryDelayMax ?? 15000,
+      },
+    });
+
+    this.ws = new WebSocketClient({
+      nodeConfig: config,
+      userId,
+      clientName: "YuKumo/0.0.1",
+    });
+
+    this.ws.eventDispatcher.on("stats", (_nodeId: string, stats: NodeStats) => {
+      this._stats = stats;
+      this.updatePenalties();
+    });
+
+    this.ws.eventDispatcher.on("nodeReady", () => {
+      if (this.ws.sessionId != null && this.ws.sessionId.length > 0) {
+        this.rest.sessionId = this.ws.sessionId;
+        void this.onSessionReady(config);
+      }
+    });
+
+    this.ws.eventDispatcher.on("playerUpdate", (_guildId: string, state: { ping?: number }) => {
+      if (state.ping != null && state.ping >= 0) {
+        this._ping = state.ping;
+      }
+    });
+
+    this.ws.eventDispatcher.on("debug", (message: string) => {
+      this.events.emit("debug", message);
+    });
+  }
+
+  /**
+   * Post-ready session setup: detect NodeLink (once), then enable Lavalink
+   * session resuming when configured. NodeLink v3+ supports resuming via
+   * PATCH /v4/sessions/:id + the Session-Id header, so it is enabled there
+   * too. Reconnects without a resumed session re-send player state via resync.
+   */
+  private async onSessionReady(config: NodeConfig): Promise<void> {
+    // Resolve type + capabilities once, from /v4/info. When the type was forced
+    // via config we still fetch info to populate the enabled filter/source lists.
+    let info = null;
+    try {
+      info = await this.rest.getInfo();
+    } catch {
+      info = null;
+    }
+
+    if (this._isNodeLink === null) {
+      this._isNodeLink = info?.isNodelink === true;
+      if (this._isNodeLink) {
+        this.events.emit("debug", `Node ${this.id} detected as NodeLink`);
+      }
+    }
+    this.rest.isNodeLink = this._isNodeLink === true;
+
+    const type: NodeType = this._isNodeLink ? "nodelink" : "lavalink";
+    this._capabilities = buildCapabilities(type, info);
+    this._version = this._capabilities.version;
+
+    const wantsResuming = config.resuming === true || config.resumeKey != null;
+    if (!wantsResuming || this.ws.sessionId == null) return;
+
+    try {
+      // Lavalink only honors Session-Id on reconnect if resuming was enabled beforehand
+      await this.rest.updateSession(this.ws.sessionId, {
+        resuming: true,
+        timeout: config.resumeTimeout ?? 60,
+      });
+    } catch (error: unknown) {
+      this.events.emit(
+        "debug",
+        `Failed to enable session resuming on ${this.id}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /** True when the node was detected (or configured) as NodeLink */
+  public get isNodeLink(): boolean {
+    return this._isNodeLink === true;
+  }
+
+  /**
+   * Resolved server family. Before the first `ready` completes it reflects the
+   * configured type (or `"lavalink"` when set to auto and not yet detected).
+   */
+  public get type(): NodeType {
+    return this._isNodeLink === true ? "nodelink" : "lavalink";
+  }
+
+  /** Server version string once known (from `/v4/info`), else null. */
+  public get version(): string | null {
+    return this._version;
+  }
+
+  /**
+   * Resolved node capabilities (filters, sources, features). Null until the
+   * first `ready` completes detection.
+   */
+  public get capabilities(): NodeCapabilities | null {
+    return this._capabilities;
+  }
+
+  /** Enabled source manager names reported by the node (empty before ready). */
+  public get sourceManagers(): readonly string[] {
+    return this._capabilities != null ? [...this._capabilities.sourceManagers] : [];
+  }
+
+  /**
+   * Whether the node supports a high-level feature. Before capabilities are
+   * resolved, NodeLink-only features fall back to the configured/detected type
+   * so a forced-type node behaves correctly even before its first `ready`.
+   */
+  public supports(feature: NodeFeature): boolean {
+    // Use resolved capabilities once available; otherwise fall back to a
+    // type-derived capability set so a forced-type node answers correctly.
+    const caps = this._capabilities ?? buildCapabilities(this.type, null);
+    return caps.features.has(feature);
+  }
+
+  /** Whether a specific audio filter is available on this node. */
+  public supportsFilter(name: string): boolean {
+    const caps = this._capabilities ?? buildCapabilities(this.type, null);
+    return caps.filters.has(name);
+  }
+
+  /** Throws {@link YukumoUnsupportedFeatureError} when the feature is unavailable. */
+  public assertSupports(feature: NodeFeature): void {
+    if (!this.supports(feature)) {
+      throw new YukumoUnsupportedFeatureError(feature, this.id, this.type);
+    }
+  }
+
+  /** True while the node is in maintenance mode (drained, no new players) */
+  public get maintenance(): boolean {
+    return this._maintenance;
+  }
+
+  /**
+   * Toggles maintenance mode. While enabled, load balancing assigns no new
+   * players to this node; existing players keep playing and the node drains
+   * naturally as they end — then it's safe to restart/update the node.
+   */
+  public setMaintenance(enabled: boolean): this {
+    if (this._maintenance === enabled) return this;
+    this._maintenance = enabled;
+    this.events.emit(
+      "debug",
+      `Node ${this.id} maintenance mode ${enabled ? "enabled — draining, no new players" : "disabled"}`,
+    );
+    return this;
+  }
+
+  /**
+   * Resolves once the node has no players left (drained). Typical flow:
+   * `node.setMaintenance(true); await node.drain(); // restart node`
+   * Polls playerCount; rejects after `timeoutMs` when > 0 (0 = wait forever).
+   */
+  public drain(timeoutMs: number = 0, pollMs: number = 1000): Promise<void> {
+    if (this._playerCount <= 0) return Promise.resolve();
+    const startedAt = Date.now();
+    return new Promise<void>((resolve, reject) => {
+      const timer = setInterval(() => {
+        if (this._playerCount <= 0) {
+          clearInterval(timer);
+          resolve();
+        } else if (timeoutMs > 0 && Date.now() - startedAt >= timeoutMs) {
+          clearInterval(timer);
+          reject(
+            new Error(
+              `Node ${this.id} did not drain within ${timeoutMs}ms (${this._playerCount} players left)`,
+            ),
+          );
+        }
+      }, pollMs);
+      (timer as { unref?: () => void }).unref?.();
+    });
+  }
+
+  /** Gets the node unique name or identifier */
+  public get id(): string {
+    return this.config.name ?? `${this.config.host}:${this.config.port}`;
+  }
+
+  /** Gets the node name */
+  public get name(): string {
+    return this.id;
+  }
+
+  /** Sets the Discord bot User ID for WebSocket handshake */
+  public setUserId(userId: string): void {
+    this._userId = userId;
+    this.ws.setUserId(userId);
+  }
+
+  /**
+   * Creates a voice receiver for a guild via NodeLink's /connection/data
+   * WebSocket (NodeLink only — Lavalink has no voice receive). Call
+   * `connect()` on the returned receiver, then listen for `startSpeaking` /
+   * `endSpeaking` events carrying base64 opus/pcm audio.
+   */
+  public createVoiceReceiver(guildId: string): NodeLinkVoiceReceiver {
+    return new NodeLinkVoiceReceiver({
+      nodeConfig: this.config,
+      userId: this._userId,
+      guildId,
+      clientName: "YuKumo/0.0.1",
+    });
+  }
+
+  /**
+   * Gets the current connection state of the node.
+   * Delegates to the WebSocket so unexpected drops and auto-reconnects are reflected immediately.
+   */
+  public get state(): NodeState {
+    return this.ws.state;
+  }
+
+  /** Gets the latest node statistics */
+  public get stats(): NodeStats | null {
+    return this._stats;
+  }
+
+  /** Gets the latest round-trip WebSocket ping in ms if available */
+  public get ping(): number | null {
+    return this._ping;
+  }
+
+  /** Boolean shorthand — true when node WebSocket is connected */
+  public get connected(): boolean {
+    return this.state === "connected";
+  }
+
+  /** Integer state code for migration compat (see NodeStateCode enum) */
+  public get stateCode(): number {
+    const map: Record<string, number> = {
+      disconnected: NodeStateCode.DISCONNECTED,
+      connecting: NodeStateCode.CONNECTING,
+      connected: NodeStateCode.CONNECTED,
+      destroyed: NodeStateCode.DESTROYED,
+    };
+    return map[this.state] ?? 0;
+  }
+
+  /** Gets the calculated penalty score */
+  public get penalties(): PenaltyScore {
+    return this._penalties;
+  }
+
+  /** Gets the active player count on this node */
+  public get playerCount(): number {
+    return this._playerCount;
+  }
+
+  /** Sets the active player count on this node */
+  public set playerCount(count: number) {
+    this._playerCount = count;
+  }
+
+  /** Gets the event dispatcher for node level events */
+  public get eventDispatcher(): EventDispatcher {
+    return this.events;
+  }
+
+  /** Subscribes to node events */
+  public on<E extends EventName>(event: E, callback: EventCallback<E>): this {
+    this.events.on(event, callback);
+    return this;
+  }
+
+  private updatePenalties(): void {
+    const stats = this._stats;
+    if (stats === null) {
+      this._penalties = { total: 0, playerPenalty: 0, cpuPenalty: 0, deficitPenalty: 0, nullPenalty: 0 };
+      return;
+    }
+
+    const playerPenalty = stats.players;
+    // Lavalink reports cpu.lavalinkLoad; NodeLink reports cpu.nodelinkLoad.
+    // Fall back across both so the penalty stays finite for either server.
+    const cpuLoad = stats.cpu.lavalinkLoad ?? stats.cpu.nodelinkLoad ?? 0;
+    const safeCpuLoad = Number.isFinite(cpuLoad) && cpuLoad >= 0 ? cpuLoad : 0;
+    const cpuPenalty = Math.round(Math.pow(1.05, safeCpuLoad * 100) * 10 - 10);
+    const deficitPenalty =
+      stats.frameStats != null ? Math.round(Math.pow(1.03, stats.frameStats.deficit) * 10 - 10) * 2 : 0;
+    const nullPenalty =
+      stats.frameStats != null ? Math.round(Math.pow(1.03, stats.frameStats.nulled) * 10 - 10) * 3 : 0;
+
+    this._penalties = {
+      total: playerPenalty + cpuPenalty + deficitPenalty + nullPenalty,
+      playerPenalty,
+      cpuPenalty,
+      deficitPenalty,
+      nullPenalty,
+    };
+  }
+
+  /** Initiates WebSocket connection to the Lavalink node; resolves once the socket is open */
+  public async connect(): Promise<void> {
+    await this.ws.connect();
+  }
+
+  /** Closes the WebSocket connection */
+  public async close(): Promise<void> {
+    await this.ws.close();
+  }
+
+  /** Destroys the node instance and cleans up event listeners */
+  public destroy(): void {
+    this.ws.destroy();
+    this.events.removeAllListeners();
+  }
+}
