@@ -1,0 +1,262 @@
+export const articles = [
+  {
+    title: 'Necoz Has a New Home on DEV! 🐈🎉',
+    summary:
+      'Necoz now has its own organization on DEV, an open invitation to join the community and share what people build and learn, with no requirement to write articles or contribute code.',
+    url: 'https://dev.to/necoz/necoz-has-a-new-home-on-dev-3454',
+  },
+  {
+    title: 'Meet Necoz! 😸 Small. Simple. Useful.',
+    summary:
+      'Introducing Necoz, a welcoming open-source community building small, simple, and useful tools together, starting with is-kit and changelog-bot.',
+    url: 'https://dev.to/nyaomaru/meet-necoz-small-simple-useful-ppo',
+  },
+  {
+    title: 'I Compared 6 TypeScript Validation Libraries. Here’s What Surprised Me 🤔',
+    summary:
+      'A comparison of the same User validation across a handwritten type guard, is-kit, Runtypes, Valibot, Zod, ArkType, and typia, showing that string length, unknown keys, and coercion can describe different runtime contracts even when the TypeScript type looks the same.',
+    url: 'https://dev.to/nyaomaru/i-compared-6-typescript-validation-libraries-heres-what-surprised-me-325g',
+  },
+  {
+    title: 'is-kit Reached 100 Stars ⭐🎉 Here’s What Changed Since 50',
+    summary:
+      'A look at how is-kit evolved from 50 to 100 GitHub stars: property-refinement and exhaustive union APIs, stricter runtime behavior and package testing, wider OSS adoption, and an Effect type-inference edge case surfaced by real-world use.',
+    url: 'https://dev.to/nyaomaru/is-kit-reached-100-stars-heres-what-changed-since-50-49pf',
+  },
+  {
+    title: 'How Do You Validate `unknown` in TypeScript Without a Schema Library? 🛡️',
+    summary:
+      'Learn how small, composable type guards can validate unknown values at runtime while preserving TypeScript narrowing, including safe JSON parsing, optional and nullable properties, and exact object shapes with is-kit.',
+    url: 'https://dev.to/nyaomaru/how-do-you-validate-unknown-in-typescript-without-a-schema-library-1a11',
+  },
+  {
+    title: 'How Do We Extract the “Why” from a PR into a CHANGELOG with Jev? 🤔',
+    summary:
+      'Explore how changelog-bot finds explicit rationale in pull requests by extracting candidate text, using Jev to verify both its meaning and relevance, and preserving the author’s original words instead of generating a reason.',
+    url: 'https://dev.to/nyaomaru/how-do-we-extract-the-why-from-a-pr-into-a-changelog-with-jev-52pk',
+  },
+  {
+    title: 'Migrating a Real TypeScript OSS Library from tsup to tsdown 🔧',
+    summary:
+      'A practical migration of the is-kit TypeScript library from tsup to tsdown, focused on preserving its published package contract through stable output filenames, explicit exports, and packed-package consumer tests.',
+    url: 'https://dev.to/nyaomaru/migrating-a-real-typescript-oss-library-from-tsup-to-tsdown-5b80',
+  },
+  {
+    title: 'TypeScript Compiler API: Preserving Child Node Narrowing in Reusable Type Guards 🔧',
+    summary:
+      'Learn how to preserve both parent AST node narrowing and refined child property types in reusable TypeScript type guards, why this is really a general property refinement problem rather than a Compiler API-specific one, and how refineKey, refineDefinedKey, and refineIndex can keep runtime checks and narrowing aligned.',
+    url: 'https://dev.to/nyaomaru/typescript-compiler-api-preserving-child-node-narrowing-in-reusable-type-guards-4pgh',
+  },
+  {
+    title: 'Your Type Guard Can Silently Drift from Your TypeScript Type 🔧',
+    summary:
+      'Learn why TypeScript trusts user-defined type predicates without verifying their runtime logic, how hand-written guards can silently drift when types change, and how typedStruct keeps existing types and runtime validation aligned by turning forgotten updates into compile-time errors.',
+    url: 'https://dev.to/nyaomaru/your-type-guard-can-silently-drift-from-your-typescript-type-o57',
+  },
+  {
+    title: 'Why filter(Boolean) Is Not a Nullish Filter in TypeScript 🔧',
+    summary:
+      'Learn why filter(Boolean) removes all falsy values instead of only null and undefined, how that can silently drop valid data like 0, false, and empty strings, and how explicit type guards such as isNotNil preserve both runtime intent and TypeScript narrowing.',
+    url: 'https://dev.to/nyaomaru/why-filterboolean-is-not-a-nullish-filter-in-typescript-4m82',
+  },
+  {
+    title:
+      'Learn Trapping Rain Water, Top K Frequent and Selection Sort with Step-by-Step Visualization in DSA View View 👀👀',
+    summary:
+      'Learn Trapping Rain Water, Top K Frequent Elements, and Selection Sort by visualizing two pointers, frequency buckets, and in-place selection step by step with DSA View View, including time and space complexity.',
+    url: 'https://dev.to/nyaomaru/learn-trapping-rain-water-top-k-frequent-and-selection-sort-with-step-by-step-visualization-in-dsa-1flg',
+  },
+  {
+    title:
+      'Learn Number of Islands, Invert Binary Tree, and Course Schedule with Step-by-Step Visualization in DSA View View 👀👀',
+    summary:
+      'Learn Number of Islands, Invert Binary Tree, and Course Schedule by visualizing grid traversal, recursive tree transformation, and topological sorting step by step with DSA View View, including time and space complexity.',
+    url: 'https://dev.to/nyaomaru/learn-number-of-islands-invert-binary-tree-and-course-schedule-with-step-by-step-visualization-in-5947',
+  },
+  {
+    title:
+      'Learn Valid Parentheses, Reverse Linked List, and Tree Max Depth with Step-by-Step Visualization in DSA View View 👀👀',
+    summary:
+      'Learn Valid Parentheses, Reverse Linked List, and Maximum Depth of Binary Tree by visualizing stacks, pointer manipulation, and recursion step by step with DSA View View, including time and space complexity.',
+    url: 'https://dev.to/nyaomaru/learn-valid-parentheses-reverse-linked-list-and-tree-max-depth-with-step-by-step-visualization-in-3o09',
+  },
+  {
+    title:
+      "Is Learning DSA Boring? Let's Use DSA View View 👀👀 (Two Sum, Binary Search, and Bubble Sort)",
+    summary:
+      'Learn Two Sum, Binary Search, and Bubble Sort by tracing how their data changes step by step with DSA View View, including each algorithm’s core idea and time and space complexity.',
+    url: 'https://dev.to/nyaomaru/is-learning-dsa-boring-lets-use-dsa-view-view-two-sum-binary-search-and-bubble-sort-374o',
+  },
+  {
+    title: `is-kit Reached 50 Stars ⭐ Here’s How We Use It in Production`,
+    summary:
+      'A real-world look at how is-kit replaced repeated, assertion-heavy checks with composable type guards in a TypeScript application serving more than 100,000 users, improving reuse, consistency, and maintainability.',
+    url: 'https://dev.to/nyaomaru/is-kit-reached-50-stars-heres-how-we-use-it-in-production-2i5b',
+  },
+  {
+    title: 'Celebrating 10,000 Total Views on DEV! 🥳 Let’s Check the Stats 😸',
+    summary:
+      'A look back at reaching 10,000 total views on DEV, including average stats across 28 posts, rankings for the most-viewed and most-engaged articles, and a few personal recommendations.',
+    url: 'https://dev.to/nyaomaru/celebrating-10000-total-views-on-dev-lets-check-the-stats-224e',
+  },
+  {
+    title: `How I Made JavaScript Execution Visual and Rewindable (DSA View View)`,
+    summary:
+      'A deep dive into how DSA View View instruments JavaScript with Babel, records execution snapshots, replays them forward and backward, runs user code in a Web Worker, and selects the right visualization for each trace.',
+    url: 'https://dev.to/nyaomaru/how-i-made-javascript-execution-visual-and-rewindable-dsa-view-view--42k4',
+  },
+  {
+    title: `How I Built the Editor and Compile Pipeline for a TypeScript DSA Visualizer (DSA View View)`,
+    summary:
+      'Follow DSA View View’s editor and compile pipeline from Monaco input to a generated verification form, including FSD architecture, is-kit runtime guards, Babel compilation, AST-based signature extraction, and type-aware input generation.',
+    url: 'https://dev.to/nyaomaru/how-i-built-the-editor-and-compile-pipeline-for-a-typescript-dsa-visualizer-dsa-view-view--530f',
+  },
+  {
+    title: `I Built a Tool to Visualize DSA. Let’s Learn Together! (DSA View View)`,
+    summary:
+      'I built DSA View View, a free browser tool that turns TypeScript algorithms into step-by-step visual stories. Follow the runtime timeline and inspect how arrays, matrices, trees, linked lists, variables, and return values change as code executes.',
+    url: 'https://dev.to/nyaomaru/i-built-a-tool-to-visualize-dsa-lets-learn-together-dsa-view-view--djo',
+  },
+  {
+    title: 'Trying Declarative Partial Updates: A Future API for Replacing HTML Later',
+    summary:
+      'Declarative Partial Updates (DPU) is an experimental Chrome API for replacing parts of HTML later via streamed HTML. I tried <?start>, <?marker>, streamHTMLUnsafe(), and explored how this could open up new hybrid patterns for SPA-like apps.',
+    url: 'https://dev.to/nyaomaru/trying-declarative-partial-updates-a-future-api-for-replacing-html-later-2g43',
+  },
+  {
+    title: 'The Difference Between satisfies, as, and Generics in TypeScript',
+    summary:
+      'Type responsibility lives that `as` asks TypeScript to trust the developer 🙏 / `satisfies` asks TypeScript to check a value 🔍 / `generics` let API designers encapsulate that check inside an API 🎁',
+    url: 'https://dev.to/nyaomaru/the-difference-between-satisfies-as-and-generics-in-typescript-5f9f',
+  },
+  {
+    title: 'CHANGELOG.md is for Both Humans and AI Now, So Lets Automate It',
+    summary:
+      'I wrote about why CHANGELOG.md still matters in the AI era, and how changelog-bot helps automate it. It supports Git history, PRs, GitHub Release Notes, OpenAI, Anthropic, Gemini, and fallback generation without AI.',
+    url: 'https://dev.to/nyaomaru/changelogmd-is-for-both-humans-and-ai-now-so-lets-automate-it-18dp',
+  },
+  {
+    title:
+      'Which OpenAPI Codegen Should You Choose? openapi-typescript vs hey-api vs Orval vs Kubb',
+    summary:
+      'The difference is not huge enough to justify migration by itself. I would consider switching only when you start feeling pain around SDK functions, interceptors, result handling, mocks, generated hooks, or schema-driven tooling.',
+    url: 'https://dev.to/nyaomaru/which-openapi-codegen-should-you-choose-openapi-typescript-vs-hey-api-vs-orval-vs-kubb-100p',
+  },
+  {
+    title:
+      'Why I Didn’t Let AI Handle My Scroll Animation: Astro, React, and TypeScript Architecture',
+    summary:
+      'A deep dive into the architectural decisions behind Necoz B.V. official website, exploring the use of Astro, React, and TypeScript.',
+    url: 'https://dev.to/nyaomaru/why-i-didnt-let-ai-handle-my-scroll-animation-astro-react-and-typescript-architecture-37k2',
+  },
+  {
+    title: "Handling `unknown` in TypeScript… isn't it painful?",
+    summary:
+      'Handling the `unknown` type in TypeScript can be challenging. This article explores the difficulties and provides insights on how to effectively work with `unknown` using is-kit.',
+    url: 'https://dev.to/nyaomaru/handling-unknown-in-typescript-isnt-it-painful-4dec',
+  },
+  {
+    title: 'is-kit vs Zod: A Practical Comparison from 3 Perspectives',
+    summary:
+      'A practical comparison of is-kit and Zod from three different perspectives, highlighting their strengths and weaknesses. Where do you enforce type safety in your design?',
+    url: 'https://dev.to/nyaomaru/is-kit-vs-zod-a-practical-comparison-from-3-perspectives-21eh',
+  },
+  {
+    title: 'Building a Browser Game with React: What Doesn’t work well (Run Away From Work)',
+    summary:
+      'I built a browser game called “Run Away From Work” using React. In this article, I share the challenges I faced and what did not work well during the development process.',
+    url: 'https://dev.to/nyaomaru/building-a-browser-game-with-react-what-doesnt-work-well-run-away-from-work-1khf',
+  },
+  {
+    title: 'Run Away From Work — Stopped Using React for the Game Loop',
+    summary:
+      'Run Away From Work is a browser game built with React. This article shares the journey of optimizing the game loop by moving away from React, and the lessons learned along the way.',
+    url: 'https://dev.to/nyaomaru/run-away-from-work-stopped-using-react-for-the-game-loop-3e0k',
+  },
+  {
+    title: 'I Built a “Run Away From Work” Browser Game with React and TypeScript',
+    summary:
+      'A browser game where you play as a character trying to escape from work, built using React and TypeScript.',
+    url: 'https://dev.to/nyaomaru/i-built-a-run-away-from-work-browser-game-with-react-and-typescript-44ol',
+  },
+  {
+    title: 'Running a SPA inside ChatGPT using MCP Apps (Step-by-Step Guide)”',
+    summary:
+      'How to run a Single Page Application (SPA) inside ChatGPT using MCP Apps, with a step-by-step guide.',
+    url: 'https://dev.to/nyaomaru/running-a-spa-inside-chatgpt-using-mcp-apps-step-by-step-guide-o52',
+  },
+  {
+    title: '2025: I Shipped 3 OSS Projects — “This Was Actually Fine”',
+    summary: 'Introduce is-kit, changelog-bot, and divider as my open source projects in 2025.',
+    url: 'https://dev.to/nyaomaru/2025-i-shipped-3-oss-projects-this-was-actually-fine-3e0c',
+  },
+  {
+    title: `I Tried Reading React's Source Code and Flow Beat Me Up. So Let's Learn`,
+    summary:
+      'Flow basics and type checking for reading React source code. Such as mixed, empty, and more.',
+    url: 'https://dev.to/nyaomaru/i-tried-reading-reacts-source-code-and-flow-beat-me-up-so-lets-learn-4jf0',
+  },
+  {
+    title: 'Generate CHANGELOG.md Automatically',
+    summary:
+      'Introduce changelog-bot, a tool that automatically generates a polished CHANGELOG.md from your release notes!',
+    url: 'https://dev.to/nyaomaru/generate-changelogmd-automatically-26g1',
+  },
+  {
+    title:
+      'Understanding Variance in TypeScript: Flow, Covariant, Contravariant, Invariant, Bivariant',
+    summary: 'A deep dive into variance concepts in TypeScript and their practical implications',
+    url: 'https://dev.to/nyaomaru/understanding-variance-in-typescript-flow-covariant-contravariant-invariant-bivariant-4fbi',
+  },
+  {
+    title: 'Escaping the Forest of if Statements',
+    summary: 'Building Logical Type Guards with is-kit',
+    url: 'https://dev.to/nyaomaru/escaping-the-forest-of-if-statements-building-logical-type-guards-with-is-kit-2db3',
+  },
+  {
+    title: 'Compose Type Guards Like Building LEGO Blocks: Reusable Logic with is-kit',
+    summary: 'Design TypeScript type guards as reusable, composable building blocks using is-kit',
+    url: 'https://dev.to/nyaomaru/building-type-guards-like-lego-blocks-making-reusable-logic-with-is-kit-48e4',
+  },
+  {
+    title: 'Introduce my favorite frontend library: mise / Typedoc / tsd',
+    summary: 'An introduction to my favorite frontend libraries and their use cases',
+    url: 'https://dev.to/nyaomaru/my-favorite-frontend-setup-libraries-project-foundation-edition-2j4k',
+  },
+  {
+    title: 'Introduce is-kit',
+    summary: 'An introduction to the is-kit library and its features',
+    url: 'http://dev.to/nyaomaru/build-isxxx-the-easy-way-meet-is-kit-2hpl',
+  },
+  {
+    title: 'Technical Debt Grows from “Just for Now” — A Real-World Code Walkthrough',
+    summary: 'Understanding the fundamentals of technical debt',
+    url: 'https://dev.to/nyaomaru/technical-debt-grows-from-just-for-now-a-real-world-code-walkthrough-5997',
+  },
+  {
+    title:
+      'How Does Technical Debt Pile Up? — Looking at “Just for Now” Examples (Structure Edition)',
+    summary: 'Analyzing the structure of technical debt in software projects',
+    url: 'http://dev.to/nyaomaru/how-does-technical-debt-pile-up-looking-at-just-for-now-examples-structure-edition-2pfk',
+  },
+  {
+    title: 'What the Heck is Technical Debt?',
+    summary: 'Examining code-level technical debt and its implications',
+    url: 'https://dev.to/nyaomaru/what-the-heck-is-technical-debt-e78',
+  },
+  {
+    title: 'Introducing `divider`',
+    summary: 'A handy utility to split strings and arrays',
+    url: 'https://dev.to/nyaomaru/introducing-divider-a-handy-utility-to-split-strings-and-arrays-2di5',
+  },
+  {
+    title: 'FSD * LangChain * Remix * AI portfolio site',
+    summary: 'How to build a portfolio site using FSD, LangChain, Remix, and AI',
+    url: 'https://dev.to/nyaomaru/building-a-portfolio-site-with-fsd-langchain-remix-ai-c9h',
+  },
+  {
+    title: 'FSD (Feature-Sliced Design) overview',
+    summary: 'An overview of Feature-Sliced Design principles',
+    url: 'https://dev.to/nyaomaru/lets-learn-feature-sliced-design-fsd-15bb',
+  },
+];

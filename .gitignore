@@ -1,0 +1,11 @@
+node_modules
+
+/.cache
+/build
+.env
+
+/.pnpm-store
+/.serena
+
+.react-router/
+.vercel/
