@@ -434,5 +434,38 @@ const Sound = (() => {
   }
   ['pointerdown', 'keydown'].forEach(ev => window.addEventListener(ev, unlock, { capture: true }));
 
-  return { play, bgm, title, town, dungeon, boss, special, scene, fanfare, refresh, importMusic, removeMusic, loopInfo, previewLoop, endPreview, setLoop, get uploaded() { return uploadedKeys; }, get playingFile() { return fileUrl; }, get player() { return player; } };
+  const api = { play, bgm, title, town, dungeon, boss, special, scene, fanfare, refresh, importMusic, removeMusic, loopInfo, previewLoop, endPreview, setLoop, get uploaded() { return uploadedKeys; }, get playingFile() { return fileUrl; }, get player() { return player; } };
+
+  // ── 합성 배경음 스케줄링 감사(js/bgmaudit.js) 연동. 기존 export·동작은 바꾸지 않는다 ──
+  // 실제 makeTheme·SCALES 훅만 비열거로 노출하고, 감사 모듈이 음계/화성 공식을 중복 구현하지 않게 한다.
+  Object.defineProperty(api, '__bgmAuditHooks', {
+    value: { makeTheme, SCALES }, enumerable: false, configurable: false, writable: false,
+  });
+  // 읽기 전용 진입: 현재 실제로 쓰는 want 테마 파라미터로 BgmAudit 를 호출한다.
+  // 배경음이 꺼져 있거나 활성 테마가 없으면 예외 대신 '미사용' 결과를 돌려준다.
+  Object.defineProperty(api, 'auditBgm', {
+    enumerable: false, configurable: false, writable: false,
+    value(key) {
+      const fallback = (status, reason, extra) => {
+        const out = { schema: 'bgm-audit/v1', kind: 'theme', status, ok: false, degraded: true, reason, affected: ['theme'], checks: [] };
+        if (extra) for (const k of Object.keys(extra)) out[k] = extra[k];
+        return out;
+      };
+      try {
+        if (set().bgm === false) return fallback('disabled', 'synthesized background music is disabled in settings (settings.bgm === false)', { disabled: true });
+        if (!want) return fallback('disabled', 'no synthesized background music theme is currently active (no want)', { disabled: true });
+        const k = typeof key === 'string' && key !== '' ? key : want.key;
+        if (k !== want.key) return fallback('disabled', 'no active synthesized theme for key "' + k + '" (current want key is "' + want.key + '")', { disabled: true, key: k });
+        if (typeof BgmAudit === 'undefined' || !BgmAudit || typeof BgmAudit.auditTheme !== 'function') {
+          return fallback('unavailable', 'BgmAudit module (js/bgmaudit.js) is not loaded');
+        }
+        return BgmAudit.auditTheme(want.key, want.o || {});
+      } catch (e) {
+        return fallback('error', 'auditBgm failed: ' + (e && e.message ? e.message : String(e)));
+      }
+    },
+  });
+  // bgmaudit.js 가 audio.js 보다 먼저 로드된 경우에도 즉시 훅을 연결한다.
+  if (typeof BgmAudit !== 'undefined' && BgmAudit && typeof BgmAudit.attach === 'function') BgmAudit.attach({ makeTheme, SCALES });
+  return api;
 })();

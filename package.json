@@ -1,0 +1,9 @@
+{
+  "name": "pmd-web-fan-game",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fan-made web game; local zero-dependency tests (node tests/run-tests.js)",
+  "scripts": {
+    "test": "node tests/run-tests.js"
+  }
+}
