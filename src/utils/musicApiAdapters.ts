@@ -1,0 +1,138 @@
+import {
+    FALLBACK_API_TIMEOUT_MS,
+    MUSIC_API_URLS,
+    PRIMARY_API_TIMEOUT_MS,
+} from "../constants";
+import type { MusicTrack } from "../hooks/useMusicData";
+
+/**
+ * 上游以 HTTP 200 返回空数组或 `{ error: ... }` 时抛出。
+ * 与网络/超时/HTTP 错误区分开，使调用方能分辨「歌单无效」与「服务不可用」。
+ */
+export class EmptyPlaylistError extends Error {
+    constructor(message = "Empty playlist") {
+        super(message);
+        this.name = "EmptyPlaylistError";
+    }
+}
+
+export interface MusicAPIAdapter {
+    buildUrl(params: { server: string; type: string; id: string }): string;
+
+    buildTrackUrl?(params: { server: string; id: string }): string;
+
+    parseResponse(data: unknown): MusicTrack[];
+
+    fetchOptions?: RequestInit;
+
+    /**
+     * 该数据源的请求超时（毫秒）。省略时使用 API_TIMEOUT_MS。
+     * 各源的响应特征与数据价值不同，超时预算据此分配。
+     */
+    timeoutMs?: number;
+}
+
+const withQuery = (baseUrl: string, params: Record<string, string>): string => {
+    const query = new URLSearchParams(params).toString();
+    return `${baseUrl}?${query}`;
+};
+
+/**
+ * 这些上游的歌单响应都不含 id/song_id 字段，歌曲 id 只存在于 url 的查询参数里
+ * （形如 `...?server=netease&type=url&id=<songId>`）。单曲级回退依赖该 id。
+ */
+const trackIdFromUrl = (url: unknown): string => {
+    if (typeof url !== "string" || url === "") return "";
+    try {
+        return new URL(url).searchParams.get("id") ?? "";
+    } catch {
+        return "";
+    }
+};
+
+/**
+ * 将单个 http 地址改写为 https；IP 地址、localhost 与非地址文本（如内联歌词）保持原样。
+ */
+export const upgradeToHttps = (url: string): string => {
+    if (!/^http:\/\/\S+$/i.test(url)) return url;
+    try {
+        const parsed = new URL(url);
+        const host = parsed.hostname;
+        if (
+            host === "localhost" ||
+            host.startsWith("[") ||
+            /^\d{1,3}(\.\d{1,3}){3}$/.test(host)
+        ) {
+            return url;
+        }
+        parsed.protocol = "https:";
+        return parsed.toString();
+    } catch {
+        return url;
+    }
+};
+
+const asText = (value: unknown): string =>
+    typeof value === "string" ? value : "";
+
+const asId = (value: unknown): string =>
+    typeof value === "number" && Number.isFinite(value)
+        ? String(value)
+        : asText(value);
+
+const parseMetingResponse = (data: unknown): MusicTrack[] => {
+    if (!Array.isArray(data) || data.length === 0) {
+        throw new EmptyPlaylistError();
+    }
+    return data.map((raw: unknown) => {
+        const item: Record<string, unknown> =
+            raw !== null && typeof raw === "object"
+                ? (raw as Record<string, unknown>)
+                : {};
+        const url = asText(item.url);
+        return {
+            id: asId(item.id) || asId(item.song_id) || trackIdFromUrl(url),
+            name: asText(item.name) || asText(item.title) || "Unknown Track",
+            artist:
+                asText(item.artist) || asText(item.author) || "Unknown Artist",
+            url: upgradeToHttps(url),
+            cover: upgradeToHttps(asText(item.pic) || asText(item.cover)),
+            lrc: upgradeToHttps(asText(item.lrc)),
+            theme: typeof item.theme === "string" ? item.theme : undefined,
+        };
+    });
+};
+
+const createMetingAdapter = (
+    baseUrl: string,
+    timeoutMs: number,
+): MusicAPIAdapter => ({
+    buildUrl: ({ server, type, id }) =>
+        withQuery(baseUrl, { server, type, id }),
+
+    buildTrackUrl: ({ server, id }) =>
+        withQuery(baseUrl, {
+            server,
+            type: "song",
+            id,
+        }),
+
+    parseResponse: parseMetingResponse,
+    timeoutMs,
+});
+
+export const metingAdapter = createMetingAdapter(
+    MUSIC_API_URLS[0],
+    PRIMARY_API_TIMEOUT_MS,
+);
+export const metingFallbackAdapter = createMetingAdapter(
+    MUSIC_API_URLS[1],
+    FALLBACK_API_TIMEOUT_MS,
+);
+export const metingBackupAdapters = MUSIC_API_URLS.slice(2).map((url) =>
+    createMetingAdapter(url, FALLBACK_API_TIMEOUT_MS),
+);
+
+export const getAdapters = (): MusicAPIAdapter[] => {
+    return [metingAdapter, metingFallbackAdapter, ...metingBackupAdapters];
+};

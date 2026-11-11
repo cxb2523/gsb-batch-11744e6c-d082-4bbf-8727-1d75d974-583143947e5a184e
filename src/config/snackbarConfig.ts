@@ -1,0 +1,2 @@
+export const SNACKBAR_DEFAULT_DURATION_MS = 4000;
+export const SNACKBAR_MAX_VISIBLE = 3;

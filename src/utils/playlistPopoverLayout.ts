@@ -1,0 +1,14 @@
+export const PLAYLIST_MIN_VISIBLE_ROWS = 5;
+
+/** 单行曲目近似高度（设计稿 px：p-2 上下 + text-ui-xs） */
+export const PLAYLIST_ROW_DESIGN_PX = 36;
+
+export const PLAYLIST_HEADER_DESIGN_PX = 40;
+
+export const PLAYLIST_MIN_HEIGHT_DESIGN_PX =
+    PLAYLIST_HEADER_DESIGN_PX +
+    PLAYLIST_MIN_VISIBLE_ROWS * PLAYLIST_ROW_DESIGN_PX;
+
+export const PLAYLIST_MAX_HEIGHT_CAP_DESIGN_PX = 240;
+
+export const PLAYLIST_POSITIONED_CLASS = "is-positioned";

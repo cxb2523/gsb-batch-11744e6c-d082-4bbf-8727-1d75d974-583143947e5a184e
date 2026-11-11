@@ -1,0 +1,123 @@
+import { type ThemeColors, ThemePreset } from "../types";
+
+export const ThemeMode = {
+    DARK: "DARK",
+    LIGHT: "LIGHT",
+} as const;
+export type ThemeMode = (typeof ThemeMode)[keyof typeof ThemeMode];
+
+export const THEME_MODES: Record<ThemePreset, ThemeMode> = {
+    [ThemePreset.ORIGIN]: ThemeMode.DARK,
+    [ThemePreset.ABYSSAL]: ThemeMode.DARK,
+    [ThemePreset.NEON]: ThemeMode.DARK,
+    [ThemePreset.MATRIX]: ThemeMode.DARK,
+    [ThemePreset.TACTICAL]: ThemeMode.DARK,
+    [ThemePreset.INDUSTRIAL]: ThemeMode.LIGHT,
+    [ThemePreset.AZURE]: ThemeMode.LIGHT,
+    [ThemePreset.MIKU]: ThemeMode.LIGHT,
+};
+
+/** 无存档时的默认主题（与 index.css :root 默认变量一致） */
+export const DEFAULT_THEME: ThemePreset = ThemePreset.INDUSTRIAL;
+
+export const themeModeOf = (theme: ThemePreset): ThemeMode =>
+    THEME_MODES[theme];
+
+export const THEMES: Record<ThemePreset, ThemeColors> = {
+    [ThemePreset.ORIGIN]: {
+        "--color-base": "#0d0e10",
+        "--color-surface": "#16171a",
+        "--color-highlight": "#2c2e33",
+        "--color-primary": "#ffd60a",
+        "--color-secondary": "#ff8a1f",
+        "--color-accent": "#3dd6e0",
+        "--color-text": "#ecebe4",
+        "--color-dim": "#8b8c92",
+        "--color-success": "#3ddc84",
+        "--color-error": "#ff4d4f",
+    },
+    [ThemePreset.ABYSSAL]: {
+        "--color-base": "#050b12",
+        "--color-surface": "#0a1826",
+        "--color-highlight": "#1c3446",
+        "--color-primary": "#38bdf8",
+        "--color-secondary": "#94a3b8",
+        "--color-accent": "#f472b6",
+        "--color-text": "#f1f5f9",
+        "--color-dim": "#8290a5",
+        "--color-success": "#22c55e",
+        "--color-error": "#ef4444",
+    },
+    [ThemePreset.NEON]: {
+        "--color-base": "#180024",
+        "--color-surface": "#2e0242",
+        "--color-highlight": "#ad39ff",
+        "--color-primary": "#ff00ff",
+        "--color-secondary": "#00ffff",
+        "--color-accent": "#ffff00",
+        "--color-text": "#f5d0fe",
+        "--color-dim": "#d13de0",
+        "--color-success": "#00ff00",
+        "--color-error": "#ff0000",
+    },
+    [ThemePreset.MATRIX]: {
+        "--color-base": "#000000",
+        "--color-surface": "#031403",
+        "--color-highlight": "#082908",
+        "--color-primary": "#d0ff4b",
+        "--color-secondary": "#3cf551",
+        "--color-accent": "#ccffcc",
+        "--color-text": "#e0fce0",
+        "--color-dim": "#77fbac",
+        "--color-success": "#00ff00",
+        "--color-error": "#ff0000",
+    },
+    [ThemePreset.TACTICAL]: {
+        "--color-base": "#1c1917",
+        "--color-surface": "#292524",
+        "--color-highlight": "#44403c",
+        "--color-primary": "#d97706",
+        "--color-secondary": "#a8a29e",
+        "--color-accent": "#78716c",
+        "--color-text": "#f6f6df",
+        "--color-dim": "#918b84",
+        "--color-success": "#16a34a",
+        "--color-error": "#dc2626",
+    },
+    [ThemePreset.INDUSTRIAL]: {
+        "--color-base": "#e5e5e5",
+        "--color-surface": "#d4d4d4",
+        "--color-highlight": "#a3a3a3",
+        "--color-primary": "#f97316",
+        "--color-secondary": "#a16207",
+        "--color-accent": "#44403c",
+        "--color-text": "#141414",
+        "--color-dim": "#5b5b5b",
+        "--color-success": "#16a34a",
+        "--color-error": "#dc2626",
+    },
+    [ThemePreset.AZURE]: {
+        "--color-base": "#f4f9ff",
+        "--color-surface": "#ffffff",
+        "--color-highlight": "#d3e6fb",
+        "--color-primary": "#128afa",
+        "--color-secondary": "#5c7594",
+        "--color-accent": "#3fd0ff",
+        "--color-text": "#1b2a47",
+        "--color-dim": "#5a6f8f",
+        "--color-success": "#059669",
+        "--color-error": "#dc2626",
+    },
+    [ThemePreset.MIKU]: {
+        "--color-base": "#fefef8",
+        "--color-surface": "#fdfef8",
+        "--color-highlight": "#fdd1ff",
+        "--color-primary": "#39C5BB",
+        "--color-secondary": "#f6b8da",
+        "--color-accent": "#E91E63",
+        "--color-text": "#263238",
+        "--color-dim": "#617985",
+        "--color-success": "#00E676",
+        "--color-error": "#FF5252",
+    },
+};

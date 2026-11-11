@@ -1,0 +1,226 @@
+import { describe, expect, it } from "vitest";
+import {
+    EmptyPlaylistError,
+    getAdapters,
+    metingAdapter,
+    metingFallbackAdapter,
+    upgradeToHttps,
+} from "./musicApiAdapters";
+
+/**
+ * 复刻上游真实响应：id 只在 url 查询参数里，i-meto 还在 id 之后附加签名参数（用占位符代替）。
+ */
+const injahowPlaylistItem = {
+    name: "ヨヅリナ - STUDY WITH MIKU ver. -",
+    artist: "STUDY WITH MIKU",
+    url: "https://api.injahow.cn/meting/?server=netease&type=url&id=3322640395",
+    pic: "https://api.injahow.cn/meting/?server=netease&type=pic&id=109951172354364941",
+    lrc: "https://api.injahow.cn/meting/?server=netease&type=lrc&id=3322640395",
+};
+
+const imetoPlaylistItem = {
+    title: "三日月ステップ - STUDY WITH MIKU ver. -",
+    author: "STUDY WITH MIKU",
+    url: "https://api.i-meto.com/meting/api?server=netease&type=url&id=3406945542&auth=placeholder-signature",
+    pic: "https://api.i-meto.com/meting/api?server=netease&type=pic&id=109951173564186500&auth=placeholder-signature",
+    lrc: "https://api.i-meto.com/meting/api?server=netease&type=lrc&id=3406945542&auth=placeholder-signature",
+};
+
+describe("track id recovery from real upstream payloads", () => {
+    it("recovers the song id from the injahow url when no id field is present", () => {
+        const [track] = metingFallbackAdapter.parseResponse([
+            injahowPlaylistItem,
+        ]);
+
+        expect(track.id).toBe("3322640395");
+        expect(track.name).toBe("ヨヅリナ - STUDY WITH MIKU ver. -");
+    });
+
+    it("recovers the song id from the i-meto signed url", () => {
+        const [track] = metingAdapter.parseResponse([imetoPlaylistItem]);
+
+        expect(track.id).toBe("3406945542");
+        expect(track.name).toBe("三日月ステップ - STUDY WITH MIKU ver. -");
+    });
+
+    it("prefers an explicit id field over the url derived one", () => {
+        const [track] = metingAdapter.parseResponse([
+            { ...injahowPlaylistItem, id: "explicit" },
+        ]);
+
+        expect(track.id).toBe("explicit");
+    });
+
+    it("yields an empty id rather than throwing on an unparsable url", () => {
+        const [track] = metingAdapter.parseResponse([
+            { name: "No url", artist: "A", url: "not-a-url" },
+        ]);
+
+        expect(track.id).toBe("");
+    });
+});
+
+describe("empty playlist is distinguishable from service failure", () => {
+    it("throws EmptyPlaylistError for the upstream 200 + error object", () => {
+        expect(() =>
+            metingFallbackAdapter.parseResponse({
+                error: "unknown playlist id",
+            }),
+        ).toThrow(EmptyPlaylistError);
+    });
+});
+
+describe("adapter priority", () => {
+    it("queries verified sources in fallback order", () => {
+        const hosts = getAdapters().map(
+            (adapter) =>
+                new URL(
+                    adapter.buildUrl({
+                        server: "netease",
+                        type: "playlist",
+                        id: "1",
+                    }),
+                ).hostname,
+        );
+
+        expect(hosts).toEqual([
+            "api.injahow.cn",
+            "meting.furwolf.com",
+            "meting.api.418121.xyz",
+            "meting.jinghuashang.cn",
+        ]);
+    });
+});
+
+describe("metingAdapter.parseResponse", () => {
+    it("maps primary fields", () => {
+        const tracks = metingAdapter.parseResponse([
+            {
+                id: "1",
+                name: "Song A",
+                artist: "Artist A",
+                url: "https://example.com/a.mp3",
+                pic: "https://example.com/a.jpg",
+                lrc: "[00:00.00]hi",
+                theme: "#fff",
+            },
+        ]);
+
+        expect(tracks).toEqual([
+            {
+                id: "1",
+                name: "Song A",
+                artist: "Artist A",
+                url: "https://example.com/a.mp3",
+                cover: "https://example.com/a.jpg",
+                lrc: "[00:00.00]hi",
+                theme: "#fff",
+            },
+        ]);
+    });
+
+    it("falls back to alternate field names and defaults", () => {
+        const tracks = metingAdapter.parseResponse([
+            {
+                song_id: "9",
+                title: "Alt",
+                author: "Writer",
+                cover: "https://example.com/c.jpg",
+            },
+        ]);
+
+        expect(tracks[0]).toMatchObject({
+            id: "9",
+            name: "Alt",
+            artist: "Writer",
+            url: "",
+            cover: "https://example.com/c.jpg",
+            lrc: "",
+        });
+    });
+
+    it("upgrades http links to https", () => {
+        const [track] = metingAdapter.parseResponse([
+            {
+                name: "Song",
+                url: "http://meting.jinghuashang.cn/?server=netease&type=url&id=1",
+                pic: "http://meting.jinghuashang.cn/?server=netease&type=pic&id=1",
+                lrc: "http://meting.jinghuashang.cn/?server=netease&type=lrc&id=1",
+            },
+        ]);
+
+        expect(track.url).toBe(
+            "https://meting.jinghuashang.cn/?server=netease&type=url&id=1",
+        );
+        expect(track.cover).toBe(
+            "https://meting.jinghuashang.cn/?server=netease&type=pic&id=1",
+        );
+        expect(track.lrc).toBe(
+            "https://meting.jinghuashang.cn/?server=netease&type=lrc&id=1",
+        );
+    });
+
+    it("leaves localhost, IP addresses and inline lyrics unchanged", () => {
+        expect(upgradeToHttps("http://localhost/a.mp3")).toBe(
+            "http://localhost/a.mp3",
+        );
+        expect(upgradeToHttps("http://127.0.0.1/a.mp3")).toBe(
+            "http://127.0.0.1/a.mp3",
+        );
+        const lyric = "http://example.com\n[00:00.00]hi";
+        expect(upgradeToHttps(lyric)).toBe(lyric);
+    });
+
+    it("throws on empty array", () => {
+        expect(() => metingAdapter.parseResponse([])).toThrow("Empty playlist");
+    });
+});
+
+describe("music API URL builders", () => {
+    it("encodes reserved characters in playlist query params", () => {
+        const url = metingAdapter.buildUrl({
+            server: "netease",
+            type: "playlist",
+            id: "a&b=c d",
+        });
+        const parsed = new URL(url);
+        expect(parsed.origin + parsed.pathname).toBe(
+            "https://api.injahow.cn/meting/",
+        );
+        expect(parsed.searchParams.get("server")).toBe("netease");
+        expect(parsed.searchParams.get("type")).toBe("playlist");
+        expect(parsed.searchParams.get("id")).toBe("a&b=c d");
+        expect(url).not.toContain("id=a&b=c");
+    });
+
+    it("encodes track URL params on both adapters", () => {
+        const dirtyId = "song&id=1 x";
+        const primary = metingAdapter.buildTrackUrl!({
+            server: "tencent",
+            id: dirtyId,
+        });
+        const fallback = metingFallbackAdapter.buildTrackUrl!({
+            server: "tencent",
+            id: dirtyId,
+        });
+
+        expect(new URL(primary).searchParams.get("type")).toBe("song");
+        expect(new URL(primary).searchParams.get("id")).toBe(dirtyId);
+        expect(new URL(fallback).searchParams.get("id")).toBe(dirtyId);
+        expect(primary).not.toContain("id=song&id=");
+        expect(fallback).not.toContain("id=song&id=");
+        expect(fallback.startsWith("https://meting.furwolf.com/api?")).toBe(
+            true,
+        );
+    });
+
+    it("encodes reserved characters on fallback playlist URLs", () => {
+        const url = metingFallbackAdapter.buildUrl({
+            server: "netease",
+            type: "playlist",
+            id: "a&b=c d",
+        });
+        expect(new URL(url).searchParams.get("id")).toBe("a&b=c d");
+        expect(url).not.toContain("id=a&b=c");
+    });
+});
