@@ -5,8 +5,9 @@
 // The game never knows a mod was involved.
 import aesjs from 'aes-js';
 import yaml from 'js-yaml';
-import { formatOfGamePath, loadMod, type ClientScript, type Edit, type ModDef } from './manifest.ts';
+import { formatOfGamePath, loadMod, type ClientScript, type Edit, type ModDef, type Target } from './manifest.ts';
 import { PatchError, applyJsonPatch, applyMergePatch, applyTextPatch } from './patch.ts';
+import { auditEdits, type AuditEditInput, type AuditResult } from './audit.ts';
 import type { Tree } from './vfs.ts';
 
 export interface Diagnostic { level: 'error' | 'warn' | 'info'; mod?: string; file?: string; message: string; time: number }
@@ -42,6 +43,29 @@ export function assetKeyFromSystem(systemJson: { encryptionKey?: string }): Uint
     const out = new Uint8Array(Math.floor(hex.length / 2));
     for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
     return out;
+}
+
+/** The source-content validation resolve() performs for each edit kind, without applying anything. */
+function sourceProblem(edit: Edit, target: Target, src: Uint8Array): string | null {
+    try {
+        switch (edit.kind) {
+            case 'replace':
+                if (target.fmt === 'json') JSON.parse(dec.decode(src).replace(BOM, ''));
+                else if (target.fmt === 'yaml') yaml.safeLoad(dec.decode(src));
+                break;
+            case 'jsonpatch':
+                if (!Array.isArray(JSON.parse(dec.decode(src).replace(BOM, '')))) throw new PatchError('a JSON patch must be an array of operations');
+                break;
+            case 'merge': JSON.parse(dec.decode(src).replace(BOM, '')); break;
+            case 'text':
+                if (!Array.isArray(JSON.parse(dec.decode(src)))) throw new PatchError('a text patch must be an array of {find, replace} operations');
+                break;
+            default: break; // raw and append need no source validation
+        }
+        return null;
+    } catch (e) {
+        return e instanceof SyntaxError ? `invalid JSON/YAML in ${edit.source}: ${e.message}` : (e as Error).message;
+    }
 }
 
 export class ModEngine {
@@ -294,6 +318,22 @@ export class ModEngine {
 
     /** True when any active edit needs the original file (patches), as opposed to pure replacements. */
     needsBase(gamePath: string) { return !!this.edits.get(gamePath.toLowerCase())?.some(e => e.edit.kind !== 'replace' && e.edit.kind !== 'raw'); }
+
+    /**
+     * Read-only audit of what resolve() would do with `gamePath`: per-edit verdicts, whether new bytes
+     * would be produced or the original file served, and an ordered checklist. Pure data in, pure data
+     * out — nothing is applied, decrypted, or written. Files no mod touches yield a "no changes" result.
+     */
+    auditFile(gamePath: string, baseExists: boolean): AuditResult {
+        const target = formatOfGamePath(gamePath);
+        const list = this.edits.get(gamePath.toLowerCase()) ?? [];
+        const edits: AuditEditInput[] = list.map(({ mod, edit }) => {
+            let src: Uint8Array | null = null;
+            try { src = mod.tree.files.includes(edit.source) ? mod.tree.read(edit.source) : null; } catch { src = null; }
+            return { mod: mod.id, kind: edit.kind, source: edit.source, sourceReadable: src !== null, failReason: src ? sourceProblem(edit, target, src) : null };
+        });
+        return auditEdits({ gamePath, baseExists, edits });
+    }
 
     /** Does any active mod touch a file the page can't serve itself (images, audio, plain scripts)? */
     hasAssetEdits() { for (const k of this.edits.keys()) if (!this.isEncrypted(k)) return true; return this.generated.size > 0; }
