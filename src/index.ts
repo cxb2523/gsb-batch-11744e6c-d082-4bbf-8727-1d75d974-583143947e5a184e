@@ -26,6 +26,16 @@ export {
   DEFAULT_UPLOAD_DIR,
 } from './security.js';
 export type { BrowserNavigationPolicyOptions, BrowserNavigationRequestLike, LookupFn } from './security.js';
+export { diagnoseBrowserNavigationPolicy } from './navigation-diagnostics.js';
+export type {
+  NavigationDiagnosticsInput,
+  NavigationDiagnosticsResult,
+  NavigationDiagnosticsVerdict,
+  NavigationDiagnosticsPolicy,
+  NavigationDiagnosticsCheck,
+  NavigationCheckName,
+  NavigationBlockReason,
+} from './navigation-diagnostics.js';
 export {
   ensureContextState,
   forceDisconnectPlaywrightConnection,
