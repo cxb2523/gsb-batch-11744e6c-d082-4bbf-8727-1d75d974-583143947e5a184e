@@ -71,6 +71,9 @@ libsodium_test: src/libsodium_test.cpp
 radiotap_test: src/radiotap_test.cpp src/wifibroadcast.o
 	$(CXX) $(_CFLAGS) -o $@ $^ $(_LDFLAGS) $(shell pkg-config --libs catch2-with-main)
 
+wfb_audit_test: src/wfb_audit_test.cpp src/wfb_audit.o
+	$(CXX) $(_CFLAGS) -o $@ $^ $(LDFLAGS)
+
 wfb_keygen: src/keygen.o
 	$(CC) -o $@ $^ $(_LDFLAGS)
 
@@ -83,10 +86,11 @@ wfb_tun: src/wfb_tun.o
 wfb_rtsp: src/rtsp_server.c
 	$(CC) $(_CFLAGS) $(shell pkg-config --cflags gstreamer-rtsp-server-1.0) -o $@ $^ $(LDFLAGS) $(shell pkg-config --libs gstreamer-rtsp-server-1.0)
 
-test: all_bin fec_test libsodium_test radiotap_test
+test: all_bin fec_test libsodium_test radiotap_test wfb_audit_test
 	./fec_test
 	./libsodium_test
 	./radiotap_test
+	./wfb_audit_test
 	PYTHONPATH=`pwd` $(PYTHON) -m twisted.trial wfb_ng.tests
 
 rpm:  all_bin wfb_rtsp $(ENV)
@@ -114,7 +118,7 @@ pylint:
 	pylint --disable=R,C wfb_ng/*.py
 
 clean:
-	rm -rf env wfb_rx wfb_tx wfb_tx_cmd wfb_tun wfb_rtsp wfb_keygen dist deb_dist build wfb_ng.egg-info wfb_ng-*.tar.gz _trial_temp *~ src/*.o fec_test libsodium_test radiotap_test
+	rm -rf env wfb_rx wfb_tx wfb_tx_cmd wfb_tun wfb_rtsp wfb_keygen dist deb_dist build wfb_ng.egg-info wfb_ng-*.tar.gz _trial_temp *~ src/*.o fec_test libsodium_test radiotap_test wfb_audit_test
 
 deb_docker:  $(if $(filter yes,$(DOCKER_QEMU)),/opt/qemu/bin)
 ifeq ($(DOCKER_QEMU),yes)
