@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ph-stocks — PSE snapshot</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230d1117'/%3E%3Cg fill='%2326a69a'%3E%3Crect x='6' y='18' width='4' height='8'/%3E%3Crect x='12' y='13' width='4' height='13'/%3E%3Crect x='18' y='9' width='4' height='17'/%3E%3Crect x='24' y='14' width='4' height='12' fill='%23ef5350'/%3E%3C/g%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-soft: #161b22;
+    --line: #21262d;
+    --fg: #e6edf3;
+    --fg-dim: #8b949e;
+    --fg-mute: #6e7681;
+    --up: #2ea043;
+    --down: #da3633;
+    --flat: #8b949e;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
+    background: var(--bg);
+    color: var(--fg);
+    font-size: 14px;
+    line-height: 1.5;
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 32px 24px 64px; }
+
+  header { border-bottom: 1px solid var(--line); padding-bottom: 24px; margin-bottom: 32px; }
+  .brand-row { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  .brand { font-size: 22px; font-weight: 600; letter-spacing: -0.5px; color: var(--fg); }
+  .brand .dot { color: var(--up); }
+  .brand small { color: var(--fg-dim); font-weight: 400; margin-left: 10px; font-size: 13px; letter-spacing: 0; }
+  .brand .src-link {
+    margin-left: 14px; color: var(--fg-mute); font-size: 12px; text-decoration: none;
+    border-bottom: 1px dotted var(--fg-mute); padding-bottom: 1px;
+  }
+  .brand .src-link:hover { color: var(--up); border-bottom-color: var(--up); }
+  .meta { font-size: 12px; color: var(--fg-mute); display: flex; gap: 16px; align-items: center; }
+  .meta .pill {
+    border: 1px solid var(--line); padding: 2px 8px; font-size: 11px;
+    letter-spacing: 0.5px; color: var(--fg-dim); border-radius: 2px;
+  }
+  .meta .pill.open { color: var(--up); border-color: rgba(46,160,67,0.4); }
+  .meta .pill.closed { color: var(--flat); }
+  .lede { margin-top: 14px; color: var(--fg-dim); font-size: 13px; max-width: 60ch; }
+
+  section { margin-bottom: 40px; }
+  .section-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+  .section-head h2 { font-size: 11px; font-weight: 600; letter-spacing: 1.5px; text-transform: uppercase; color: var(--fg-dim); margin: 0; }
+  .section-head .note { font-size: 11px; color: var(--fg-mute); }
+
+  .hero { display: grid; grid-template-columns: 1.4fr 1fr; gap: 32px; padding: 24px 0; border-bottom: 1px solid var(--line); margin-bottom: 32px; }
+  .hero .primary { display: flex; align-items: center; gap: 28px; }
+  .hero .label { font-size: 11px; letter-spacing: 1.5px; text-transform: uppercase; color: var(--fg-mute); margin-bottom: 6px; }
+  .hero .value { font-size: 44px; font-weight: 600; letter-spacing: -1.5px; line-height: 1; color: var(--fg); }
+  .hero .chg { font-size: 14px; margin-top: 10px; }
+  .hero .secondary { display: flex; flex-direction: column; justify-content: center; gap: 14px; padding-left: 32px; border-left: 1px solid var(--line); }
+  .hero .secondary .row { display: flex; justify-content: space-between; gap: 16px; font-size: 13px; }
+  .hero .secondary .row .k { color: var(--fg-mute); }
+  .hero .secondary .row .v { color: var(--fg); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: right; font-weight: 500; font-size: 11px; letter-spacing: 0.8px; text-transform: uppercase; color: var(--fg-mute); padding: 8px 10px 8px 0; border-bottom: 1px solid var(--line); }
+  th:first-child { text-align: left; padding-left: 0; }
+  th.day { text-align: center; }
+  th.chart-col { width: 32px; }
+  td { padding: 9px 10px 9px 0; border-bottom: 1px solid rgba(33,38,45,0.6); text-align: right; vertical-align: middle; }
+  td:first-child { text-align: left; padding-left: 0; }
+  tbody tr:hover { background: rgba(255,255,255,0.015); }
+  tbody tr:last-child td { border-bottom: none; }
+  td.sym { font-weight: 600; color: var(--fg); letter-spacing: 0.3px; cursor: pointer; transition: color 0.1s; }
+  td.sym:hover { color: var(--up); }
+  td.sym .logo { width: 20px; height: 20px; border-radius: 3px; margin-right: 8px; vertical-align: -4px; object-fit: contain; background: #fff; }
+  td.day { text-align: center; padding: 6px 4px; }
+  td.up { color: var(--up); }
+  td.down { color: var(--down); }
+  td.flat { color: var(--flat); }
+  td.note { font-size: 11px; color: var(--fg-mute); font-style: italic; }
+  td.muted { color: var(--fg-mute); }
+  td.chart-btn { text-align: center; padding: 6px 0; }
+  td.chart-btn button {
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--fg-mute);
+    font-family: inherit;
+    font-size: 11px;
+    padding: 4px 10px;
+    cursor: pointer;
+    border-radius: 3px;
+    letter-spacing: 0.5px;
+    transition: all 0.1s;
+  }
+  td.chart-btn button:hover { color: var(--fg); border-color: var(--up); background: rgba(46,160,67,0.06); }
+  svg.candle { display: inline-block; vertical-align: middle; }
+
+  .two-col { display: grid; grid-template-columns: 1.3fr 1fr; gap: 40px; }
+  .kv { display: grid; grid-template-columns: 1fr auto; gap: 8px 24px; font-size: 13px; }
+  .kv .k { color: var(--fg-mute); }
+  .kv .v { color: var(--fg); text-align: right; }
+
+  /* Modal */
+  .modal-bg {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+    display: none; align-items: center; justify-content: center;
+    z-index: 100; padding: 20px;
+  }
+  .modal-bg.open { display: flex; }
+  .modal {
+    background: var(--bg-soft);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    width: 100%;
+    max-width: 880px;
+    max-height: 90vh;
+    overflow: auto;
+    padding: 28px;
+  }
+  .modal-head { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; padding-bottom: 18px; border-bottom: 1px solid var(--line); margin-bottom: 18px; }
+  .modal-head .title { display: flex; align-items: baseline; gap: 12px; }
+  .modal-head .title .sym { font-size: 22px; font-weight: 600; }
+  .modal-head .title .name { color: var(--fg-dim); font-size: 13px; }
+  .modal-head .close { background: transparent; border: 1px solid var(--line); color: var(--fg-mute); font-family: inherit; font-size: 16px; width: 28px; height: 28px; border-radius: 3px; cursor: pointer; padding: 0; }
+  .modal-head .close:hover { color: var(--down); border-color: var(--down); }
+  .modal-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 18px; }
+  .modal-stats .stat .k { font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--fg-mute); margin-bottom: 4px; }
+  .modal-stats .stat .v { font-size: 16px; font-weight: 600; }
+  .modal-chart { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 16px; }
+  .modal-foot { font-size: 10px; color: var(--fg-mute); margin-top: 12px; text-align: right; }
+
+  footer { margin-top: 64px; padding-top: 24px; border-top: 1px solid var(--line); font-size: 11px; color: var(--fg-mute); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+  footer a { color: var(--fg-dim); text-decoration: none; border-bottom: 1px dotted var(--fg-mute); }
+  footer a:hover { color: var(--fg); border-bottom-color: var(--fg-dim); }
+
+  @media (max-width: 760px) {
+    .wrap { padding: 20px 16px 48px; }
+    .hero { grid-template-columns: 1fr; gap: 20px; }
+    .hero .secondary { padding-left: 0; border-left: none; border-top: 1px solid var(--line); padding-top: 20px; }
+    .hero .value { font-size: 34px; }
+    .two-col { grid-template-columns: 1fr; gap: 32px; }
+    th, td { padding: 8px 6px 8px 0; }
+    th:nth-child(n+8), td:nth-child(n+8) { display: none; }
+    .brand-row { gap: 8px; }
+    .meta { gap: 10px; }
+    .modal { padding: 16px; }
+    .modal-stats { grid-template-columns: repeat(2, 1fr); }
+  }
+  @media (max-width: 440px) {
+    th:nth-child(n+5), td:nth-child(n+5) { display: none; }
+    th.day, td.day { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="brand-row">
+    <div class="brand">ph-stocks<span class="dot">.</span><small>Philippine Stock Exchange</small><a class="src-link" href="https://github.com/zhameersheraz/ph-stocks" target="_blank" rel="noopener">↗ source</a></div>
+    <div class="meta">
+      <span id="updated">loading…</span>
+      <span id="status" class="pill">…</span>
+    </div>
+  </div>
+  <div class="lede">Live snapshot of 21 PSE blue chips, refreshed every hour. Source: PSE Edge.</div>
+</header>
+
+<section class="hero" id="hero">
+  <div class="primary">
+    <div>
+      <div class="label">PSEi</div>
+      <div class="value" id="hero-value">—</div>
+      <div class="chg" id="hero-change">—</div>
+    </div>
+  </div>
+  <div class="secondary">
+    <div class="row"><span class="k">Generated UTC</span><span class="v" id="gen-utc">—</span></div>
+    <div class="row"><span class="k">As of (PSE)</span><span class="v" id="as-of">—</span></div>
+    <div class="row"><span class="k">Total Volume</span><span class="v" id="m-volume">—</span></div>
+    <div class="row"><span class="k">Total Trades</span><span class="v" id="m-trades">—</span></div>
+    <div class="row"><span class="k">Advances / Declines</span><span class="v" id="m-adv">—</span></div>
+  </div>
+</section>
+
+<div class="two-col">
+  <section>
+    <div class="section-head"><h2>Sector Indices</h2><span class="note">PSE Edge · last close</span></div>
+    <table><thead><tr><th>Index</th><th>Value</th><th>Change</th><th>%</th></tr></thead>
+      <tbody id="idx-body"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <div class="section-head"><h2>Market</h2><span class="note">aggregate</span></div>
+    <div class="kv" id="kv-body"></div>
+  </section>
+</div>
+
+<section>
+  <div class="section-head"><h2>Stocks</h2><span class="note" id="stock-count">— · click any row → 90-day chart</span></div>
+  <table>
+    <thead><tr>
+      <th>Symbol</th><th>Last</th><th>Open</th><th>High</th><th>Low</th>
+      <th>Prev</th><th class="day">Day</th><th>Change</th><th>Volume</th><th>Mkt Cap</th>
+      <th class="chart-col"></th>
+    </tr></thead>
+    <tbody id="stocks-body"></tbody>
+  </table>
+</section>
+
+<footer>
+  <div>auto-updated every hour via <a href="https://github.com/zhameersheraz/ph-stocks/actions">GitHub Actions</a></div>
+  <div>data · <a href="https://edge.pse.com.ph">PSE Edge</a> · source · <a href="https://github.com/zhameersheraz/ph-stocks">repo</a></div>
+</footer>
+
+</div>
+
+<!-- Chart modal -->
+<div class="modal-bg" id="modal">
+  <div class="modal" id="modal-card">
+    <div class="modal-head">
+      <div class="title">
+        <span class="sym" id="m-sym"></span>
+        <span class="name" id="m-name"></span>
+      </div>
+      <button class="close" id="m-close">×</button>
+    </div>
+    <div class="modal-stats">
+      <div class="stat"><div class="k">Last close</div><div class="v" id="m-last">—</div></div>
+      <div class="stat"><div class="k">90-day high</div><div class="v" id="m-high">—</div></div>
+      <div class="stat"><div class="k">90-day low</div><div class="v" id="m-low">—</div></div>
+      <div class="stat"><div class="k">90-day change</div><div class="v" id="m-change">—</div></div>
+    </div>
+    <div class="modal-chart" id="m-chart"></div>
+    <div class="modal-foot" id="m-foot">—</div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const nf = (n, d=2) => n == null ? '—' : Number(n).toLocaleString('en-US', {minimumFractionDigits:d, maximumFractionDigits:d});
+const compact = v => {
+  if (v == null) return '—';
+  const a = Math.abs(v);
+  if (a >= 1e9) return (v/1e9).toFixed(2) + 'B';
+  if (a >= 1e6) return (v/1e6).toFixed(2) + 'M';
+  if (a >= 1e3) return (v/1e3).toFixed(1) + 'K';
+  return nf(v);
+};
+const sign = n => n > 0 ? '+' : n < 0 ? '−' : '';
+const dirCls = pct => pct > 0 ? 'up' : pct < 0 ? 'down' : 'flat';
+const fmtChg = c => {
+  if (!c || !c.change) return { text: '—', cls: 'flat' };
+  const arrow = c.change === 'up' ? '▲' : '▼';
+  const pct = c.change_pct;
+  const amt = c.change_amount;
+  if (pct == null) return { text: `${arrow} ${c.change}`, cls: c.change };
+  return { text: `${arrow} ${sign(amt)}${Math.abs(amt).toFixed(2)}  ${sign(pct)}${Math.abs(pct).toFixed(2)}%`, cls: c.change };
+};
+
+function candleSvg(open, high, low, close, w = 50, h = 24) {
+  if (open == null || high == null || low == null || close == null) return '';
+  const lo = Math.min(low, open, close);
+  const hi = Math.max(high, open, close);
+  const range = hi - lo || 1;
+  const y = v => 2 + (h - 4) - ((v - lo) / range) * (h - 4);
+  const up = close >= open;
+  const c = up ? '#2ea043' : '#da3633';
+  const bodyTop = Math.min(y(open), y(close));
+  const bodyH = Math.max(1, Math.abs(y(close) - y(open)));
+  const mid = w / 2;
+  return `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" class="candle">
+    <line x1="${mid}" y1="${y(high)}" x2="${mid}" y2="${y(low)}" stroke="${c}" stroke-width="1"/>
+    <rect x="${mid - 4}" y="${bodyTop}" width="8" height="${bodyH}" fill="${c}"/>
+  </svg>`;
+}
+
+// Full candlestick + volume chart (used in modal)
+function renderChart(rows, W = 820, H = 360) {
+  if (!rows || !rows.length) return '<div class="empty">No history available</div>';
+  const padL = 8, padR = 56, padT = 10, padB = 26;
+  const innerW = W - padL - padR;
+  const innerH = H - padT - padB;
+  const priceH = Math.round(innerH * 0.70);
+  const gap = Math.round(innerH * 0.05);
+  const volH = innerH - priceH - gap;
+
+  const allHigh = Math.max(...rows.map(r => r.h));
+  const allLow  = Math.min(...rows.map(r => r.l));
+  const range = allHigh - allLow || 1;
+  const maxVol = Math.max(...rows.map(r => r.v)) || 1;
+  const xStep = innerW / rows.length;
+  const candleW = Math.max(2, xStep * 0.7);
+
+  const yPrice = v => padT + priceH - ((v - allLow) / range) * priceH;
+  const yVol   = v => padT + priceH + gap + volH - (v / maxVol) * volH;
+
+  // Price gridlines + labels (5 levels)
+  let grid = '';
+  for (let i = 0; i <= 4; i++) {
+    const v = allLow + (range * i / 4);
+    const y = yPrice(v);
+    grid += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="#21262d" stroke-width="0.5"/>`;
+    grid += `<text x="${W - padR + 6}" y="${y + 4}" fill="#6e7681" font-size="11" font-family="ui-monospace, monospace">${v.toFixed(2)}</text>`;
+  }
+
+  // Candles
+  let candles = '';
+  rows.forEach((r, i) => {
+    const cx = padL + xStep * i + xStep / 2;
+    const yH = yPrice(r.h), yL = yPrice(r.l);
+    const yO = yPrice(r.o), yC = yPrice(r.c);
+    const up = r.c >= r.o;
+    const c = up ? '#2ea043' : '#da3633';
+    const bodyTop = Math.min(yO, yC);
+    const bodyH = Math.max(1, Math.abs(yC - yO));
+    candles += `<line x1="${cx}" y1="${yH}" x2="${cx}" y2="${yL}" stroke="${c}" stroke-width="1"/>`;
+    candles += `<rect x="${cx - candleW/2}" y="${bodyTop}" width="${candleW}" height="${bodyH}" fill="${c}"/>`;
+  });
+
+  // Volume bars (semi-transparent)
+  let vols = '';
+  rows.forEach((r, i) => {
+    const cx = padL + xStep * i + xStep / 2;
+    const y = yVol(r.v);
+    const up = r.c >= r.o;
+    const c = up ? 'rgba(46,160,67,0.55)' : 'rgba(218,54,51,0.55)';
+    const baseY = padT + priceH + gap + volH;
+    vols += `<rect x="${cx - candleW/2}" y="${y}" width="${candleW}" height="${baseY - y}" fill="${c}"/>`;
+  });
+
+  // X-axis date labels (~6 evenly spaced)
+  const dateStep = Math.max(1, Math.ceil(rows.length / 6));
+  let dates = '';
+  for (let i = 0; i < rows.length; i += dateStep) {
+    const cx = padL + xStep * i + xStep / 2;
+    dates += `<text x="${cx}" y="${H - 8}" fill="#6e7681" font-size="11" text-anchor="middle" font-family="ui-monospace, monospace">${rows[i].d.slice(5)}</text>`;
+  }
+  // Last date label always shown
+  if ((rows.length - 1) % dateStep !== 0) {
+    const cx = padL + xStep * (rows.length - 1) + xStep / 2;
+    dates += `<text x="${cx}" y="${H - 8}" fill="#6e7681" font-size="11" text-anchor="middle" font-family="ui-monospace, monospace">${rows[rows.length - 1].d.slice(5)}</text>`;
+  }
+
+  // Volume scale label
+  const volLabel = `<text x="${padL + 4}" y="${padT + priceH + gap + 12}" fill="#6e7681" font-size="9" font-family="ui-monospace, monospace">VOL</text>`;
+
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="xMidYMid meet">
+    ${grid}${candles}${vols}${dates}${volLabel}
+  </svg>`;
+}
+
+let HISTORY = null;
+let QUOTES = [];
+
+async function loadAll() {
+  try {
+    const [snap, hist] = await Promise.all([
+      fetch('./stocks.json', { cache: 'no-store' }),
+      fetch('./history.json', { cache: 'no-store' }),
+    ]);
+    if (!snap.ok) throw new Error('stocks.json HTTP ' + snap.status);
+    if (!hist.ok) throw new Error('history.json HTTP ' + hist.status);
+    const sData = await snap.json();
+    const hData = await hist.json();
+    HISTORY = hData.stocks || {};
+    render(sData);
+  } catch (e) {
+    $('updated').textContent = 'failed to load';
+    $('hero-value').textContent = '—';
+    $('hero-change').innerHTML = '<span class="note">' + e.message + '</span>';
+    $('status').textContent = 'error';
+    $('status').className = 'pill closed';
+  }
+}
+
+function render(d) {
+  QUOTES = d.stocks || [];
+  $('updated').textContent = d.generated_utc || '—';
+  $('gen-utc').textContent = d.generated_utc || '—';
+  if (d.index) {
+    $('as-of').textContent = d.index.as_of || '—';
+    const s = $('status');
+    s.textContent = (d.index.market_status || '—').toUpperCase();
+    s.className = 'pill ' + (d.index.market_status === 'Open' ? 'open' : 'closed');
+
+    const psei = (d.index.indices || []).find(i => /PSEi/i.test(i.name));
+    if (psei) {
+      $('hero-value').textContent = nf(psei.value);
+      const cls = dirCls(psei.change_pct);
+      $('hero-change').innerHTML =
+        `<span class="${cls}">${sign(psei.change)}${nf(Math.abs(psei.change || 0))}  ${sign(psei.change_pct)}${Math.abs(psei.change_pct || 0).toFixed(2)}%</span>`;
+    }
+
+    const ms = d.index.market_summary || {};
+    $('m-volume').textContent = compact(ms['Total Volume']);
+    $('m-trades').textContent = compact(ms['Total Trades']);
+    const adv = ms['Advances'], dec = ms['Declines'];
+    $('m-adv').innerHTML = adv != null ? `<span class="up">${adv}</span> / <span class="down">${dec}</span>` : '—';
+
+    $('idx-body').innerHTML = (d.index.indices || []).map(i => {
+      const c = dirCls(i.change_pct);
+      return `<tr>
+        <td>${i.name}</td>
+        <td>${nf(i.value)}</td>
+        <td class="${c}">${sign(i.change)}${nf(Math.abs(i.change || 0))}</td>
+        <td class="${c}">${sign(i.change_pct)}${Math.abs(i.change_pct || 0).toFixed(2)}%</td>
+      </tr>`;
+    }).join('');
+
+    const kvPairs = Object.entries(ms).filter(([k]) =>
+      !['Total Volume','Total Trades','Advances','Declines','Unchanged'].includes(k));
+    $('kv-body').innerHTML = kvPairs.map(([k,v]) =>
+      `<span class="k">${k}</span><span class="v">${compact(v)}</span>`
+    ).join('');
+  }
+
+  const stocks = QUOTES.slice().sort((a,b) => a.symbol.localeCompare(b.symbol));
+  $('stock-count').textContent = stocks.length + ' symbols · click any row → 90-day chart';
+  $('stocks-body').innerHTML = stocks.map(q => {
+    const ch = fmtChg(q);
+    const suspended = q.status && /suspend/i.test(q.status);
+    const logo = q.logo_url
+      ? `<img src="${q.logo_url}" alt="" class="logo" loading="lazy" onerror="this.style.display='none'">`
+      : '';
+    const cdl = suspended ? '<span class="note">—</span>' : candleSvg(q.open, q.high, q.low, q.last_traded_price);
+    return `<tr data-sym="${q.symbol}" style="cursor:pointer">
+      <td class="sym">${logo}${q.symbol}</td>
+      <td>${nf(q.last_traded_price)}</td>
+      <td>${nf(q.open)}</td>
+      <td>${nf(q.high)}</td>
+      <td>${nf(q.low)}</td>
+      <td>${nf(q.previous_close)}</td>
+      <td class="day">${cdl}</td>
+      <td class="${ch.cls}">${ch.text}${suspended ? ' <span class="note">(suspended)</span>' : ''}</td>
+      <td class="muted">${compact(q.volume)}</td>
+      <td class="muted">${compact(q.market_cap)}</td>
+      <td class="chart-btn"><button data-sym="${q.symbol}" title="Show chart">chart</button></td>
+    </tr>`;
+  }).join('');
+
+  // Click anywhere on a row → open chart
+  document.querySelectorAll('#stocks-body tr[data-sym]').forEach(r => {
+    r.addEventListener('click', () => openChart(r.dataset.sym));
+  });
+}
+
+function openChart(sym) {
+  const q = QUOTES.find(x => x.symbol === sym);
+  const rows = HISTORY[sym] || [];
+  $('m-sym').textContent = sym;
+  $('m-name').textContent = q ? q.name : '';
+  if (q && q.last_traded_price != null) $('m-last').textContent = nf(q.last_traded_price);
+  else $('m-last').textContent = '—';
+  if (rows.length) {
+    const hi = Math.max(...rows.map(r => r.h));
+    const lo = Math.min(...rows.map(r => r.l));
+    const first = rows[0].c;
+    const last = rows[rows.length - 1].c;
+    const pct = (last - first) / first * 100;
+    $('m-high').textContent = nf(hi);
+    $('m-low').textContent = nf(lo);
+    const cls = pct > 0 ? 'up' : pct < 0 ? 'down' : 'flat';
+    $('m-change').innerHTML = `<span class="${cls}">${sign(pct)}${pct.toFixed(2)}%</span>`;
+    $('m-chart').innerHTML = renderChart(rows);
+  } else {
+    $('m-high').textContent = '—';
+    $('m-low').textContent = '—';
+    $('m-change').textContent = '—';
+    $('m-chart').innerHTML = '<div class="empty" style="padding:60px 0;text-align:center;color:var(--fg-mute)">No history available</div>';
+  }
+  $('m-foot').textContent = `${rows.length} trading days · ${q && q.as_of ? 'last close ' + q.as_of : ''} · data via PSE Edge`;
+  $('modal').classList.add('open');
+}
+
+function closeChart() { $('modal').classList.remove('open'); }
+
+$('m-close').addEventListener('click', closeChart);
+$('modal').addEventListener('click', e => { if (e.target.id === 'modal') closeChart(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeChart(); });
+
+loadAll();
+</script>
+</body>
+</html>
