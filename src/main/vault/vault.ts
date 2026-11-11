@@ -218,7 +218,9 @@ async function doPackContainer(): Promise<void> {
     recoveryBlob: currentMetadata.recoveryBlob,
     dbBytes,
     existingVersionMin: currentMetadata.versionMin,
-    devBuild: currentMetadata.devBuild
+    devBuild: currentMetadata.devBuild,
+    // Null (a pre-field vault) stays omitted; anything else is carried through byte-for-byte.
+    createdAtMs: currentMetadata.createdAtMs
   })
   atomicWrite(currentVaultPath, bytes)
 }
@@ -697,7 +699,8 @@ async function doChangePassword(
           recoveryBlob: newRecoveryBlob,
           dbBytes,
           existingVersionMin: currentMetadata.versionMin,
-          devBuild: currentMetadata.devBuild
+          devBuild: currentMetadata.devBuild,
+          createdAtMs: currentMetadata.createdAtMs
         })
       } finally {
         memzero(containerMasterKey)
@@ -790,7 +793,8 @@ async function doRotateVaultCredentials(newPassword: string): Promise<{ mnemonic
           recoveryBlob: newRecoveryBlob,
           dbBytes,
           existingVersionMin: currentMetadata.versionMin,
-          devBuild: currentMetadata.devBuild
+          devBuild: currentMetadata.devBuild,
+          createdAtMs: currentMetadata.createdAtMs
         })
       } finally {
         memzero(containerMasterKey)
@@ -995,7 +999,8 @@ async function doConfigureKeyFile(
           recoveryBlob: newRecoveryBlob,
           dbBytes,
           existingVersionMin: currentMetadata.versionMin,
-          devBuild: currentMetadata.devBuild
+          devBuild: currentMetadata.devBuild,
+          createdAtMs: currentMetadata.createdAtMs
         })
       } finally {
         memzero(containerMasterKey)
@@ -1099,7 +1104,8 @@ async function doRemoveKeyFile(
           recoveryBlob: newRecoveryBlob,
           dbBytes,
           existingVersionMin: currentMetadata.versionMin,
-          devBuild: currentMetadata.devBuild
+          devBuild: currentMetadata.devBuild,
+          createdAtMs: currentMetadata.createdAtMs
         })
       } finally {
         memzero(containerMasterKey)

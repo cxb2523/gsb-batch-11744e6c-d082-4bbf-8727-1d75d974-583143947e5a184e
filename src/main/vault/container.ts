@@ -17,8 +17,11 @@ const FieldId = {
   KdfTier: 0x02,
   RecoveryBlob: 0x03,
   HeaderHmac: 0x04,
-  DevBuild: 0x05
+  DevBuild: 0x05,
+  CreatedAt: 0x06
 } as const
+
+const CREATED_AT_BYTES = 8
 
 export interface ContainerMetadata {
   versionMaj: number
@@ -31,6 +34,9 @@ export interface ContainerMetadata {
   // Set when a development build wrote the header. Absent on disk (so false) for vaults written
   // before the field existed, which therefore need no migration.
   devBuild: boolean
+  // Unix milliseconds at vault creation. Null on vaults written before the field existed; the
+  // absence is a real state, not a zero timestamp.
+  createdAtMs: number | null
 }
 
 function tlvField(id: number, data: Buffer): Buffer {
@@ -39,6 +45,15 @@ function tlvField(id: number, data: Buffer): Buffer {
   field.writeUInt32LE(data.length, 1)
   data.copy(field, 5)
   return field
+}
+
+// 8-byte little-endian unsigned integer. BigInt covers the full u64 range; Number() stays exact
+// for any plausible millisecond timestamp. The TLV framing is added by tlvField() at the call
+// site, matching how every other field's data is built.
+function createdAtData(createdAtMs: number): Buffer {
+  const data = Buffer.alloc(CREATED_AT_BYTES)
+  data.writeBigUInt64LE(BigInt(createdAtMs))
+  return data
 }
 
 export function writeContainer(params: {
@@ -50,6 +65,7 @@ export function writeContainer(params: {
   requiredMinVersion?: number
   existingVersionMin?: number
   devBuild?: boolean
+  createdAtMs?: number | null
 }): Buffer {
   const effectiveMin = Math.max(
     params.requiredMinVersion ?? 0,
@@ -68,6 +84,13 @@ export function writeContainer(params: {
   const devBuildField = params.devBuild
     ? tlvField(FieldId.DevBuild, Buffer.from([0x01]))
     : Buffer.alloc(0)
+  // Three states: an explicit value (including 0) is written as-is; an omitted argument stamps
+  // the current time; an explicit null writes nothing, which only happens when repacking a vault
+  // whose pre-field header has no timestamp to preserve.
+  const omitCreatedAt = params.createdAtMs === null
+  const createdAtField = omitCreatedAt
+    ? Buffer.alloc(0)
+    : tlvField(FieldId.CreatedAt, createdAtData(params.createdAtMs ?? Date.now()))
 
   const headerWithoutHmac = Buffer.concat([
     MAGIC_NVX,
@@ -75,7 +98,8 @@ export function writeContainer(params: {
     saltField,
     tierField,
     recoveryField,
-    devBuildField
+    devBuildField,
+    createdAtField
   ])
   const hmac = computeHeaderHmac(headerWithoutHmac, params.masterKey)
   const hmacField = tlvField(FieldId.HeaderHmac, Buffer.from(hmac))
@@ -125,6 +149,13 @@ function parseHeaderV1(fileBytes: Buffer, versionMin: number): ContainerMetadata
   const kdfTier = tierBuf.readUInt8(0)
   if (!isValidKdfTier(kdfTier)) throw new Error('HEADER_UNKNOWN_KDF_TIER')
 
+  const createdAtBuf = fields[FieldId.CreatedAt]
+  if (createdAtBuf !== undefined && createdAtBuf.length !== CREATED_AT_BYTES) {
+    throw new Error('HEADER_BAD_CREATED_AT')
+  }
+  // Missing on vaults written before the field existed: null, never 0, and never an error.
+  const createdAtMs = createdAtBuf === undefined ? null : Number(createdAtBuf.readBigUInt64LE(0))
+
   // Bytes the HMAC covers: everything before the HeaderHmac TLV field
   const hmacCoveredBytes = Buffer.from(fileBytes.subarray(0, hmacFieldStart))
 
@@ -136,7 +167,8 @@ function parseHeaderV1(fileBytes: Buffer, versionMin: number): ContainerMetadata
     storedHmac: hmacBuf,
     hmacCoveredBytes,
     dbOffset: offset,
-    devBuild: fields[FieldId.DevBuild] !== undefined
+    devBuild: fields[FieldId.DevBuild] !== undefined,
+    createdAtMs
   }
 }
 
