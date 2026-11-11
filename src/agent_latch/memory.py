@@ -49,17 +49,17 @@ def memory_write_findings(flows: Sequence[MemoryFlow], path: str) -> list[Findin
             title="Untrusted content written to agent memory",
             severity="medium",
             message=(
-                f"Web or tool output reaches {flow.sink} without validation, so instructions hidden in "
-                "that content are replayed as context in a later turn or session (memory poisoning). "
-                "Validate or summarise the text before storing it, keep its source as metadata, and "
-                "scope the write to the current session or user."
+                f"Web or tool output reaches {flow.sink} without validation ({flow.label}), so instructions "
+                "hidden in that content are replayed as context in a later turn or session (memory "
+                "poisoning). Validate or summarise the text before storing it, keep its source as "
+                "metadata, and scope the write to the current session or user."
             ),
             path=path,
             line=flow.line,
             column=flow.column,
             owasp=("ASI06",),
             confidence="low",
-            evidence=f"web/tool output reaches {flow.sink}",
+            evidence=f"web/tool output reaches {flow.sink} [{flow.label}]",
         )
         for flow in flows
     ]

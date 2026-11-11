@@ -3,7 +3,8 @@
 Tracks values from known web-search tools, web loaders, and HTTP clients through
 assignments, loops, function returns, call arguments, and dict state keys (as used by
 LangGraph nodes). Sinks are LLM message content (AG003) and memory or vector-store writes
-(ALR13-S01). It is a heuristic: no aliasing, no cross-module flow, no sanitizer model.
+(ALR13-S01). It is a heuristic: no aliasing, no cross-module flow. Whether a tainted value is
+sanitised is decided by the shared policy layer in :mod:`agent_latch.flowpolicy`.
 """
 
 from __future__ import annotations
@@ -13,6 +14,13 @@ import re
 from dataclasses import dataclass
 
 from agent_latch.astutil import walk
+from agent_latch.flowpolicy import (
+    LABEL_UNVALIDATED,
+    VALIDATION_NAME,
+    ScopeInfo,
+    evaluate_arguments,
+    flatten_text_parts,
+)
 
 SOURCE_CLASSES = {
     "TavilySearch",
@@ -82,8 +90,6 @@ _MEMORY_WRITE_METHODS = {
 _MEMORY_WRITE_CALLS = {"add_memory", "memorize", "remember", "save_memory"}
 # The receiver has to look like a memory, store or index, so session.add() and list.append() stay out.
 _MEMORY_RECEIVER = re.compile(r"(?i)memor|memory|vector|store|collection|knowledge|retriev|embedding|recall")
-# A value passed through a validating or sanitising helper is treated as mitigated.
-_VALIDATION = re.compile(r"(?i)validat|saniti|sanitiz|sanitise|filter|clean")
 
 _Scope = ast.AST  # a FunctionDef/AsyncFunctionDef, or the Module for top-level code
 
@@ -100,6 +106,8 @@ class MemoryFlow:
     line: int
     column: int
     sink: str
+    # "unvalidated" (no tainted argument is sanitised) or "partially-validated" (some are).
+    label: str = LABEL_UNVALIDATED
 
 
 @dataclass(frozen=True)
@@ -159,6 +167,7 @@ class _Analysis:
         self.scopes: list[_Scope] = [tree, *self.functions.values()]
         self.tainted: dict[int, set[str]] = {id(scope): set() for scope in self.scopes}
         self.scope_nodes: dict[int, list[ast.AST]] = {}
+        self.sanitised_names: dict[int, set[str]] = {id(scope): set() for scope in self.scopes}
         self.tool_objects: set[str] = set()
         self.tainted_returns: set[str] = set()
         self.tainted_keys: set[str] = set()
@@ -169,6 +178,29 @@ class _Analysis:
         if cached is None:
             cached = self.scope_nodes[id(scope)] = _collect_scope_nodes(scope)
         return cached
+
+    def _collect_sanitised(self, scope: _Scope) -> frozenset[str]:
+        """Variables assigned the result of a validator call (safe = sanitize(x)).
+
+        Only plain name/attribute targets are tracked, and the assignment has to precede the
+        sink; a validator call whose result is discarded is intentionally absent.
+        """
+        cached = self.sanitised_names[id(scope)]
+        if cached:
+            return frozenset(cached)
+        for node in self._nodes(scope):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            if not (isinstance(value, ast.Call) and VALIDATION_NAME.search(_dotted(value.func) or "")):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, (ast.Name, ast.Attribute)):
+                    name = _dotted(target)
+                    if name:
+                        cached.add(name)
+        return frozenset(cached)
 
     def is_tainted(self, expr: ast.AST, scope: _Scope) -> bool:
         names = self.tainted[id(scope)]
@@ -271,16 +303,36 @@ class _Analysis:
         flows: dict[tuple[int, int], PromptFlow] = {}
         memory_flows: dict[tuple[int, int], MemoryFlow] = {}
         for scope in self.scopes:
+            scope_info = ScopeInfo(self._nodes(scope), 0, self._collect_sanitised(scope))
             for node in self._nodes(scope):
                 sink_name = _memory_sink(node) if isinstance(node, ast.Call) else None
                 if sink_name is not None:
                     arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
-                    if any(self.is_tainted(argument, scope) for argument in arguments) and not _validated(
-                        arguments
-                    ):
-                        memory_flows.setdefault(
-                            (node.lineno, node.col_offset), MemoryFlow(node.lineno, node.col_offset + 1, sink_name)
+                    tainted_parts = [
+                        part
+                        for argument in arguments
+                        for part in flatten_text_parts(argument)
+                        if self.is_tainted(part, scope)
+                    ]
+                    if tainted_parts:
+                        decision = evaluate_arguments(
+                            tainted_parts,
+                            ScopeInfo(
+                                scope_info.nodes,
+                                node.lineno,
+                                scope_info.sanitised_names,
+                            ),
                         )
+                        if not decision.sanitised:
+                            memory_flows.setdefault(
+                                (node.lineno, node.col_offset),
+                                MemoryFlow(
+                                    node.lineno,
+                                    node.col_offset + 1,
+                                    sink_name,
+                                    decision.label,
+                                ),
+                            )
                 content: ast.AST | None = None
                 sink = ""
                 if isinstance(node, ast.Call) and _dotted(node.func) is not None:
@@ -297,6 +349,14 @@ class _Analysis:
                     if "role" in keys and "content" in keys:
                         sink, content = "chat message content", keys["content"]
                 if content is None or not self.is_tainted(content, scope):
+                    continue
+                # Mitigation first goes through the shared policy layer, then falls back to the
+                # historical literal-marker match so existing behaviour does not regress.
+                decision = evaluate_arguments(
+                    [content],
+                    ScopeInfo(scope_info.nodes, node.lineno, scope_info.sanitised_names),
+                )
+                if decision.sanitised:
                     continue
                 literal_text = "".join(
                     part.value
@@ -324,14 +384,6 @@ def _memory_sink(call: ast.Call) -> str | None:
     if _MEMORY_RECEIVER.search(receiver.rsplit(".", 1)[-1]):
         return f"{receiver}.{method}()"
     return None
-
-
-def _validated(arguments: list[ast.AST]) -> bool:
-    return any(
-        isinstance(node, ast.Call) and bool(_VALIDATION.search(_dotted(node.func) or ""))
-        for argument in arguments
-        for node in ast.walk(argument)
-    )
 
 
 def analyze_untrusted_flows(tree: ast.Module) -> UntrustedFlows:
