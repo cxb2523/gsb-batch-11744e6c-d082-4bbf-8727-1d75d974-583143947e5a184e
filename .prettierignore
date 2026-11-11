@@ -1,0 +1,8 @@
+node_modules/
+out/
+dist/
+*.tsbuildinfo
+*.md
+pnpm-lock.yaml
+tsconfig.json
+tsconfig.*.json

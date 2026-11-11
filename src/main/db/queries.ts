@@ -1,0 +1,576 @@
+import { basename } from 'node:path'
+
+import type sqlite3 from '@journeyapps/sqlcipher'
+import { type ImportResult, type NoteCounts, PRESET_COLORS, TAG_NAME_MAX } from '@shared/types'
+
+import type { MarkdownNote } from '../markdown-io'
+import { decryptField, encryptField } from '../vault/crypto'
+
+// ─── Promise wrappers ───────────────────────────────────────────────────────
+
+export function dbRun(db: sqlite3.Database, sql: string, params: unknown[] = []): Promise<void> {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, (err: Error | null) => (err ? reject(err) : resolve()))
+  })
+}
+
+export function dbGet<T>(
+  db: sqlite3.Database,
+  sql: string,
+  params: unknown[] = []
+): Promise<T | undefined> {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err: Error | null, row: T) => (err ? reject(err) : resolve(row)))
+  })
+}
+
+export function dbAll<T>(db: sqlite3.Database, sql: string, params: unknown[] = []): Promise<T[]> {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err: Error | null, rows: T[]) => (err ? reject(err) : resolve(rows || [])))
+  })
+}
+
+// ─── Types ──────────────────────────────────────────────────────────────────
+
+interface RawNote {
+  id: string
+  title: Buffer
+  title_iv: Buffer
+  content: Buffer
+  content_iv: Buffer
+  is_pinned: number
+  is_trashed: number
+  created_at: number
+  updated_at: number
+  trashed_at: number | null
+}
+
+interface RawNoteListItem {
+  id: string
+  title: Buffer
+  title_iv: Buffer
+  is_pinned: number
+  is_trashed: number
+  created_at: number
+  updated_at: number
+  trashed_at: number | null
+}
+
+export interface Note {
+  id: string
+  title: string
+  content: string
+  isPinned: boolean
+  isTrashed: boolean
+  createdAt: number
+  updatedAt: number
+  trashedAt: number | null
+  tags: Tag[]
+}
+
+export interface NoteListItem {
+  id: string
+  title: string
+  isPinned: boolean
+  isTrashed: boolean
+  createdAt: number
+  updatedAt: number
+  trashedAt: number | null
+  tags: Tag[]
+}
+
+export interface Tag {
+  id: string
+  name: string
+  color: string
+  createdAt: number
+}
+
+export interface CreateNoteInput {
+  title: string
+  content: string
+}
+
+export interface NotePatch {
+  title?: string
+  content?: string
+  isPinned?: boolean
+}
+
+export interface NoteFilter {
+  trashed?: boolean
+  tagId?: string
+}
+
+export interface CreateTagInput {
+  name: string
+  color: string
+}
+
+export interface TagPatch {
+  name?: string
+  color?: string
+}
+
+// ─── Note queries ────────────────────────────────────────────────────────────
+
+function newId(): string {
+  return crypto.randomUUID()
+}
+
+export async function createNote(
+  db: sqlite3.Database,
+  input: CreateNoteInput,
+  masterKey: Uint8Array
+): Promise<NoteListItem> {
+  const id = newId()
+  const now = Date.now()
+  const { ciphertext: titleCipher, nonce: titleIv } = encryptField(
+    input.title || 'Untitled',
+    masterKey
+  )
+  const { ciphertext: contentCipher, nonce: contentIv } = encryptField(
+    input.content || '',
+    masterKey
+  )
+
+  await dbRun(
+    db,
+    `INSERT INTO notes
+      (id, title, title_iv, content, content_iv, is_pinned, is_trashed, created_at, updated_at, trashed_at)
+     VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, NULL)`,
+    [
+      id,
+      Buffer.from(titleCipher),
+      Buffer.from(titleIv),
+      Buffer.from(contentCipher),
+      Buffer.from(contentIv),
+      now,
+      now
+    ]
+  )
+
+  return {
+    id,
+    title: input.title || 'Untitled',
+    isPinned: false,
+    isTrashed: false,
+    createdAt: now,
+    updatedAt: now,
+    trashedAt: null,
+    tags: []
+  }
+}
+
+export async function getNote(
+  db: sqlite3.Database,
+  id: string,
+  masterKey: Uint8Array
+): Promise<Note | null> {
+  const row = await dbGet<RawNote>(db, 'SELECT * FROM notes WHERE id = ?', [id])
+  if (!row) return null
+
+  const tags = await getNoteTags(db, id)
+  return {
+    id: row.id,
+    title: decryptField(new Uint8Array(row.title), new Uint8Array(row.title_iv), masterKey),
+    content: decryptField(new Uint8Array(row.content), new Uint8Array(row.content_iv), masterKey),
+    isPinned: row.is_pinned === 1,
+    isTrashed: row.is_trashed === 1,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    trashedAt: row.trashed_at,
+    tags
+  }
+}
+
+// The title alone, for callers that must not hold decrypted content yet (export's save dialog).
+export async function getNoteTitle(
+  db: sqlite3.Database,
+  id: string,
+  masterKey: Uint8Array
+): Promise<string | null> {
+  const row = await dbGet<{ title: Buffer; title_iv: Buffer }>(
+    db,
+    'SELECT title, title_iv FROM notes WHERE id = ?',
+    [id]
+  )
+  if (!row) return null
+  return decryptField(new Uint8Array(row.title), new Uint8Array(row.title_iv), masterKey)
+}
+
+// The copy goes through createNote, so it gets fresh nonces and timestamps and starts
+// unpinned. Note and tag links share one transaction: a half-made copy without its tags
+// would otherwise survive a failure.
+export async function duplicateNote(
+  db: sqlite3.Database,
+  id: string,
+  masterKey: Uint8Array
+): Promise<NoteListItem> {
+  const source = await getNote(db, id, masterKey)
+  if (!source) throw new Error('Note not found')
+  if (source.isTrashed) throw new Error('Cannot duplicate a trashed note')
+
+  await dbRun(db, 'BEGIN TRANSACTION')
+  try {
+    const copy = await createNote(
+      db,
+      { title: `${source.title || 'Untitled'} (copy)`, content: source.content },
+      masterKey
+    )
+    await dbRun(
+      db,
+      'INSERT INTO note_tags (note_id, tag_id) SELECT ?, tag_id FROM note_tags WHERE note_id = ?',
+      [copy.id, id]
+    )
+    await dbRun(db, 'COMMIT')
+    return { ...copy, tags: source.tags }
+  } catch (err) {
+    await dbRun(db, 'ROLLBACK').catch(() => {})
+    throw err
+  }
+}
+
+export async function listNotes(
+  db: sqlite3.Database,
+  masterKey: Uint8Array,
+  filter: NoteFilter = {}
+): Promise<NoteListItem[]> {
+  let sql: string
+  let params: unknown[]
+
+  if (filter.tagId) {
+    sql = `SELECT n.id, n.title, n.title_iv, n.is_pinned, n.is_trashed, n.created_at, n.updated_at, n.trashed_at
+           FROM notes n JOIN note_tags nt ON n.id = nt.note_id
+           WHERE nt.tag_id = ? AND n.is_trashed = ?
+           ORDER BY n.is_pinned DESC, n.updated_at DESC`
+    params = [filter.tagId, filter.trashed ? 1 : 0]
+  } else {
+    sql = `SELECT id, title, title_iv, is_pinned, is_trashed, created_at, updated_at, trashed_at
+           FROM notes WHERE is_trashed = ?
+           ORDER BY is_pinned DESC, updated_at DESC`
+    params = [filter.trashed ? 1 : 0]
+  }
+
+  const rows = await dbAll<RawNoteListItem>(db, sql, params)
+  if (rows.length === 0) return []
+
+  const noteIds = rows.map((r) => r.id)
+  const placeholders = noteIds.map(() => '?').join(', ')
+  const [noteTags, allTags] = await Promise.all([
+    dbAll<{ noteId: string; tagId: string }>(
+      db,
+      `SELECT note_id as noteId, tag_id as tagId FROM note_tags WHERE note_id IN (${placeholders})`,
+      noteIds
+    ),
+    dbAll<Tag>(db, 'SELECT id, name, color, created_at as createdAt FROM tags')
+  ])
+
+  const tagById = new Map(allTags.map((t) => [t.id, t]))
+  const tagsByNote = new Map<string, Tag[]>()
+  for (const { noteId, tagId } of noteTags) {
+    const tag = tagById.get(tagId)
+    if (!tag) continue
+    const arr = tagsByNote.get(noteId) ?? []
+    arr.push(tag)
+    tagsByNote.set(noteId, arr)
+  }
+
+  return rows.map((row) => ({
+    id: row.id,
+    title: decryptField(new Uint8Array(row.title), new Uint8Array(row.title_iv), masterKey),
+    isPinned: row.is_pinned === 1,
+    isTrashed: row.is_trashed === 1,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    trashedAt: row.trashed_at,
+    tags: tagsByNote.get(row.id) ?? []
+  }))
+}
+
+export async function updateNote(
+  db: sqlite3.Database,
+  id: string,
+  patch: NotePatch,
+  masterKey: Uint8Array
+): Promise<void> {
+  const now = Date.now()
+  const updates: string[] = ['updated_at = ?']
+  const params: unknown[] = [now]
+
+  if (patch.title !== undefined) {
+    const { ciphertext, nonce } = encryptField(patch.title, masterKey)
+    updates.push('title = ?', 'title_iv = ?')
+    params.push(Buffer.from(ciphertext), Buffer.from(nonce))
+  }
+
+  if (patch.content !== undefined) {
+    const { ciphertext, nonce } = encryptField(patch.content, masterKey)
+    updates.push('content = ?', 'content_iv = ?')
+    params.push(Buffer.from(ciphertext), Buffer.from(nonce))
+  }
+
+  if (patch.isPinned !== undefined) {
+    updates.push('is_pinned = ?')
+    params.push(patch.isPinned ? 1 : 0)
+  }
+
+  params.push(id)
+  await dbRun(db, `UPDATE notes SET ${updates.join(', ')} WHERE id = ?`, params)
+}
+
+export async function trashNote(db: sqlite3.Database, id: string): Promise<void> {
+  await dbRun(db, 'UPDATE notes SET is_trashed = 1, trashed_at = ? WHERE id = ?', [Date.now(), id])
+}
+
+// Restore and permanent delete only make sense for a trashed note. The UI can still offer them for
+// one that isn't: a list from the previous view, or an Undo whose note was emptied from the trash.
+async function requireTrashed(db: sqlite3.Database, id: string, action: string): Promise<void> {
+  const row = await dbGet<{ is_trashed: number }>(db, 'SELECT is_trashed FROM notes WHERE id = ?', [
+    id
+  ])
+  if (!row?.is_trashed) throw new Error(`Couldn't ${action} the note: it isn't in the trash`)
+}
+
+export async function restoreNote(db: sqlite3.Database, id: string): Promise<void> {
+  await requireTrashed(db, id, 'restore')
+  await dbRun(db, 'UPDATE notes SET is_trashed = 0, trashed_at = NULL WHERE id = ?', [id])
+}
+
+export async function deleteNote(db: sqlite3.Database, id: string): Promise<void> {
+  await requireTrashed(db, id, 'delete')
+  await dbRun(db, 'DELETE FROM notes WHERE id = ?', [id])
+}
+
+export async function emptyTrash(db: sqlite3.Database): Promise<void> {
+  await dbRun(db, 'DELETE FROM notes WHERE is_trashed = 1')
+}
+
+// ─── Tag queries ─────────────────────────────────────────────────────────────
+// Tag names are intentionally not application-layer encrypted. See migrations.ts migration_v1.
+
+export async function createTag(db: sqlite3.Database, input: CreateTagInput): Promise<Tag> {
+  const id = newId()
+  const now = Date.now()
+  await dbRun(db, 'INSERT INTO tags (id, name, color, created_at) VALUES (?, ?, ?, ?)', [
+    id,
+    input.name,
+    input.color,
+    now
+  ])
+  return { id, name: input.name, color: input.color, createdAt: now }
+}
+
+export async function listTags(db: sqlite3.Database): Promise<Tag[]> {
+  return dbAll<Tag>(db, 'SELECT id, name, color, created_at as createdAt FROM tags ORDER BY name')
+}
+
+export async function updateTag(db: sqlite3.Database, id: string, patch: TagPatch): Promise<void> {
+  const updates: string[] = []
+  const params: unknown[] = []
+
+  if (patch.name !== undefined) {
+    updates.push('name = ?')
+    params.push(patch.name)
+  }
+  if (patch.color !== undefined) {
+    updates.push('color = ?')
+    params.push(patch.color)
+  }
+
+  if (updates.length === 0) return
+  params.push(id)
+  await dbRun(db, `UPDATE tags SET ${updates.join(', ')} WHERE id = ?`, params)
+}
+
+export async function deleteTag(db: sqlite3.Database, id: string): Promise<void> {
+  await dbRun(db, 'DELETE FROM tags WHERE id = ?', [id])
+}
+
+// ─── Note-tag junction ────────────────────────────────────────────────────────
+
+// Creates a tag and assigns it to a note in a single transaction.
+// Use this instead of createTag + addTagToNote when both operations are needed
+// together — a crash between two separate IPC calls would leave an orphaned tag.
+export async function createTagAndAssign(
+  db: sqlite3.Database,
+  input: { noteId: string; name: string; color: string }
+): Promise<Tag> {
+  const id = newId()
+  const now = Date.now()
+
+  await dbRun(db, 'BEGIN TRANSACTION')
+  try {
+    await dbRun(db, 'INSERT INTO tags (id, name, color, created_at) VALUES (?, ?, ?, ?)', [
+      id,
+      input.name,
+      input.color,
+      now
+    ])
+    await dbRun(db, 'INSERT OR IGNORE INTO note_tags (note_id, tag_id) VALUES (?, ?)', [
+      input.noteId,
+      id
+    ])
+    await dbRun(db, 'COMMIT')
+  } catch (err) {
+    await dbRun(db, 'ROLLBACK').catch(() => {})
+    throw err
+  }
+
+  return { id, name: input.name, color: input.color, createdAt: now }
+}
+
+export async function addTagToNote(
+  db: sqlite3.Database,
+  noteId: string,
+  tagId: string
+): Promise<void> {
+  await dbRun(db, 'INSERT OR IGNORE INTO note_tags (note_id, tag_id) VALUES (?, ?)', [
+    noteId,
+    tagId
+  ])
+}
+
+export async function removeTagFromNote(
+  db: sqlite3.Database,
+  noteId: string,
+  tagId: string
+): Promise<void> {
+  await dbRun(db, 'DELETE FROM note_tags WHERE note_id = ? AND tag_id = ?', [noteId, tagId])
+}
+
+export async function getNoteTags(db: sqlite3.Database, noteId: string): Promise<Tag[]> {
+  return dbAll<Tag>(
+    db,
+    `SELECT t.id, t.name, t.color, t.created_at as createdAt
+     FROM tags t JOIN note_tags nt ON t.id = nt.tag_id
+     WHERE nt.note_id = ?`,
+    [noteId]
+  )
+}
+
+// Plaintext flags only: the sidebar badges never need a title decrypted. SUM over no rows is NULL.
+export async function getNoteCounts(db: sqlite3.Database): Promise<NoteCounts> {
+  const row = await dbGet<NoteCounts>(
+    db,
+    `SELECT COALESCE(SUM(is_trashed = 0), 0)                   AS live,
+            COALESCE(SUM(is_pinned = 1 AND is_trashed = 0), 0) AS pinned,
+            COALESCE(SUM(is_trashed = 1), 0)                   AS trashed
+     FROM notes`
+  )
+  return row ?? { live: 0, pinned: 0, trashed: 0 }
+}
+
+export async function getNoteCountPerTag(db: sqlite3.Database): Promise<Record<string, number>> {
+  const rows = await dbAll<{ tag_id: string; count: number }>(
+    db,
+    `SELECT nt.tag_id, COUNT(*) as count FROM note_tags nt
+     JOIN notes n ON n.id = nt.note_id
+     WHERE n.is_trashed = 0 GROUP BY nt.tag_id`
+  )
+  return Object.fromEntries(rows.map((r) => [r.tag_id, r.count]))
+}
+
+export async function getAllNoteTags(
+  db: sqlite3.Database
+): Promise<Array<{ noteId: string; tagId: string }>> {
+  return dbAll<{ noteId: string; tagId: string }>(
+    db,
+    `SELECT note_id as noteId, tag_id as tagId FROM note_tags
+     WHERE note_id IN (SELECT id FROM notes WHERE is_trashed = 0)`
+  )
+}
+
+// ─── Markdown import ─────────────────────────────────────────────────────────
+
+export type ImportRead = { note: MarkdownNote } | { skip: string }
+
+// An imported file is untrusted and could name a million tags; every one would become a row the
+// sidebar loads on each unlock.
+const IMPORT_TAGS_PER_NOTE = 50
+const IMPORT_NEW_TAGS_MAX = 200
+
+interface ImportTagState {
+  /** Keyed by lowercased name: an import should not add "work" next to an existing "Work". */
+  ids: Map<string, string>
+  /** Tags this import has created so far. */
+  created: number
+}
+
+// Returns how many tags were left off the note, per reason.
+async function assignImportedTags(
+  db: sqlite3.Database,
+  noteId: string,
+  names: string[],
+  tags: ImportTagState
+): Promise<Map<string, number>> {
+  const dropped = new Map<string, number>()
+  const drop = (reason: string): void => void dropped.set(reason, (dropped.get(reason) ?? 0) + 1)
+  const onNote = new Set<string>()
+  for (const raw of names) {
+    const name = raw.trim()
+    const key = name.toLowerCase()
+    if (!name || onNote.has(key)) continue
+    if (name.length > TAG_NAME_MAX) {
+      drop(`longer than ${TAG_NAME_MAX} characters`)
+      continue
+    }
+    if (onNote.size >= IMPORT_TAGS_PER_NOTE) {
+      drop(`over the ${IMPORT_TAGS_PER_NOTE}-tag limit for one note`)
+      continue
+    }
+    let tagId = tags.ids.get(key)
+    if (!tagId) {
+      if (tags.created >= IMPORT_NEW_TAGS_MAX) {
+        drop(`over the ${IMPORT_NEW_TAGS_MAX}-new-tag limit for one import`)
+        continue
+      }
+      const color = PRESET_COLORS[tags.created++ % PRESET_COLORS.length]
+      tagId = (await createTag(db, { name, color })).id
+      tags.ids.set(key, tagId)
+    }
+    await addTagToNote(db, noteId, tagId)
+    onNote.add(key)
+  }
+  return dropped
+}
+
+// One transaction for the whole import, so a failure never leaves part of it behind. Files are
+// read one at a time inside it (via `read`) to keep at most one file in memory. Must run inside
+// withVaultLock: the caller's lock is what keeps other writes out of this transaction.
+export async function importNotes(
+  db: sqlite3.Database,
+  files: string[],
+  masterKey: Uint8Array,
+  read: (file: string) => Promise<ImportRead>
+): Promise<ImportResult> {
+  const result: ImportResult = { imported: 0, skipped: [], droppedTags: [] }
+  const tags: ImportTagState = { ids: new Map(), created: 0 }
+  for (const tag of await listTags(db)) {
+    if (!tags.ids.has(tag.name.toLowerCase())) tags.ids.set(tag.name.toLowerCase(), tag.id)
+  }
+
+  await dbRun(db, 'BEGIN TRANSACTION')
+  try {
+    for (const file of files) {
+      const outcome = await read(file)
+      if ('skip' in outcome) {
+        result.skipped.push({ file: basename(file), reason: outcome.skip })
+        continue
+      }
+
+      const { title, content } = outcome.note
+      const note = await createNote(db, { title, content }, masterKey)
+      const dropped = await assignImportedTags(db, note.id, outcome.note.tags, tags)
+      for (const [reason, count] of dropped) {
+        result.droppedTags.push({ file: basename(file), count, reason })
+      }
+      result.imported++
+    }
+    await dbRun(db, 'COMMIT')
+  } catch (err) {
+    await dbRun(db, 'ROLLBACK').catch(() => {})
+    throw err
+  }
+  return result
+}

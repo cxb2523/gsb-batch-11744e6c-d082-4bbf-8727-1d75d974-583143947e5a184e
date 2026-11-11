@@ -1,0 +1,175 @@
+// @vitest-environment jsdom
+import { createElement } from 'react'
+
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+
+const ipc = vi.hoisted(() => ({
+  close: vi.fn(),
+  isDev: vi.fn(),
+  prefsGet: vi.fn()
+}))
+
+vi.mock('@/lib/ipc', () => ({
+  notvex: {
+    platform: 'win32',
+    app: { isDev: ipc.isDev },
+    prefs: { get: ipc.prefsGet },
+    updater: { getCurrentVersion: async () => ({ success: true, data: '1.0.0' }) },
+    vault: { close: ipc.close }
+  }
+}))
+
+// The dialog itself is covered by settings-dialog.test.ts; here only the wiring matters, and
+// mounting the real dialog on top of the whole sidebar is slow enough to time out.
+vi.mock('@/components/settings-dialog', () => ({
+  SettingsDialog: ({ open, initialTab }: { open: boolean; initialTab?: string }) =>
+    open ? createElement('h2', null, `Settings: ${initialTab ?? 'security'}`) : null
+}))
+
+const { Sidebar } = await import('@/components/sidebar')
+const { SidebarProvider } = await import('@/components/ui/sidebar')
+const { useUiStore } = await import('@/store/ui.store')
+const { useVaultStore } = await import('@/store/vault.store')
+const { TooltipProvider } = await import('@/components/ui/tooltip')
+
+// Radix positions tooltips with ResizeObserver, which jsdom doesn't implement.
+vi.stubGlobal(
+  'ResizeObserver',
+  class {
+    observe = vi.fn()
+    unobserve = vi.fn()
+    disconnect = vi.fn()
+  }
+)
+
+beforeAll(() => {
+  // SidebarProvider's mobile detection needs matchMedia, which jsdom lacks.
+  window.matchMedia ??= ((query: string) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    addListener: () => {},
+    removeListener: () => {},
+    dispatchEvent: () => false
+  })) as typeof window.matchMedia
+})
+
+beforeEach(() => {
+  // From the second Radix menu opened in a file, jsdom reads the menu's own auto-focus as a focus
+  // outside it and closes it at once (see note-list-sort.test.ts). Browsers don't.
+  vi.spyOn(HTMLElement.prototype, 'focus').mockImplementation(() => {})
+  ipc.close.mockResolvedValue({ success: true, data: null })
+  ipc.isDev.mockResolvedValue({ success: true, data: false })
+  ipc.prefsGet.mockResolvedValue({ success: false, error: 'not needed' })
+  useUiStore.setState({ searchQuery: '' })
+  useVaultStore.setState({
+    status: 'unlocked',
+    currentVaultPath: 'C:/vaults/work.nvx',
+    notes: [],
+    tags: [],
+    tagCounts: {},
+    loadTags: vi.fn(async () => undefined),
+    loadTagCounts: vi.fn(async () => undefined)
+  })
+})
+
+afterEach(() => {
+  cleanup()
+  vi.clearAllMocks()
+  vi.restoreAllMocks()
+})
+
+async function renderSidebar(): Promise<void> {
+  await act(async () => {
+    render(createElement(SidebarProvider, null, createElement(Sidebar)), {
+      wrapper: TooltipProvider
+    })
+  })
+}
+
+describe('Sidebar entry points', () => {
+  it('shows the new-note shortcut in its tooltip', async () => {
+    await renderSidebar()
+
+    fireEvent.focus(screen.getByRole('button', { name: 'New note' }))
+
+    expect((await screen.findByRole('tooltip')).textContent).toBe('New note Ctrl N')
+  })
+
+  it('shows the search shortcut in its tooltip', async () => {
+    await renderSidebar()
+
+    fireEvent.focus(screen.getByPlaceholderText('Search…'))
+
+    expect((await screen.findByRole('tooltip')).textContent).toBe('Search Ctrl Shift F')
+  })
+
+  it('names the search clear button "Clear search"', async () => {
+    useUiStore.setState({ searchQuery: 'groceries' })
+    await renderSidebar()
+
+    expect(screen.getByRole('button', { name: 'Clear search' })).toBeTruthy()
+  })
+
+  it('shows only the "Clear search" tooltip when the clear button is hovered', async () => {
+    useUiStore.setState({ searchQuery: 'groceries' })
+    await renderSidebar()
+
+    fireEvent.pointerMove(screen.getByRole('button', { name: 'Clear search' }))
+
+    expect((await screen.findByRole('tooltip')).textContent).toBe('Clear search')
+  })
+
+  it('opens Settings straight from the gear button', async () => {
+    await renderSidebar()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+
+    expect(await screen.findByRole('heading', { name: 'Settings: security' })).toBeTruthy()
+  })
+
+  it('opens Settings on About from the Help menu', async () => {
+    await renderSidebar()
+
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Help' }), { key: 'Enter' })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'About Notvex' }))
+
+    expect(await screen.findByRole('heading', { name: 'Settings: about' })).toBeTruthy()
+  })
+
+  it('locks the vault from the vault menu and drops the decrypted notes and tags', async () => {
+    useVaultStore.setState({
+      tags: [{ id: 't1', name: 'secret tag', color: '#888888', createdAt: 0 }],
+      tagCounts: { t1: 1 },
+      noteTagsMap: { n1: ['t1'] },
+      notes: [
+        {
+          id: 'n1',
+          title: 'secret plan',
+          isPinned: false,
+          isTrashed: false,
+          createdAt: 0,
+          updatedAt: 0,
+          trashedAt: null,
+          tags: []
+        }
+      ],
+      activeNoteId: 'n1'
+    })
+    await renderSidebar()
+
+    fireEvent.keyDown(screen.getByRole('button', { name: /work\.nvx/ }), { key: 'Enter' })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Lock vault' }))
+
+    await waitFor(() => expect(useVaultStore.getState().status).toBe('locked'))
+    expect(ipc.close).toHaveBeenCalledOnce()
+    expect(useVaultStore.getState().notes).toEqual([])
+    expect(useVaultStore.getState().activeNoteId).toBeNull()
+    expect(useVaultStore.getState().tags).toEqual([])
+    expect(useVaultStore.getState().tagCounts).toEqual({})
+    expect(useVaultStore.getState().noteTagsMap).toEqual({})
+  })
+})

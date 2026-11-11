@@ -1,0 +1,95 @@
+import type { ReactNode } from 'react'
+import { useEffect } from 'react'
+
+import { CommandPalette } from '@/components/command-palette'
+import { RecoveryKeyUnconfirmedDialog } from '@/components/dialogs/RecoveryKeyUnconfirmedDialog'
+import { NoteEditor } from '@/components/note-editor'
+import { NoteList } from '@/components/note-list'
+import { Sidebar } from '@/components/sidebar'
+import { SidebarInset, SidebarProvider } from '@/components/ui/sidebar'
+import { useCreateNote } from '@/hooks/use-create-note'
+import { notvex } from '@/lib/ipc'
+import { flushAllPending } from '@/lib/pending-save'
+import { useUiStore } from '@/store/ui.store'
+import { useVaultStore } from '@/store/vault.store'
+
+export function Main(): ReactNode {
+  const { refreshAll, lock } = useVaultStore()
+  const { setShowTrash, toggleEditorMode, requestFocusSearch } = useUiStore()
+  const handleNewNote = useCreateNote()
+
+  // Load initial data
+  useEffect(() => {
+    void refreshAll()
+  }, [refreshAll])
+
+  // Persist pending autosaves before the main process closes the vault
+  useEffect(() => {
+    return notvex.onWillLock(() => flushAllPending())
+  }, [])
+
+  // Global keyboard shortcuts
+  useEffect(() => {
+    const handler = (e: KeyboardEvent): void => {
+      const mod = e.ctrlKey || e.metaKey
+      if (!mod) return
+
+      if (e.shiftKey) {
+        switch (e.key.toLowerCase()) {
+          case 'f':
+            e.preventDefault()
+            requestFocusSearch()
+            return
+          case 't':
+            e.preventDefault()
+            setShowTrash(true)
+            return
+          case 'e': {
+            e.preventDefault()
+            const { notes, activeNoteId } = useVaultStore.getState()
+            // A trashed note only has the reading view.
+            if (notes.find((n) => n.id === activeNoteId)?.isTrashed) return
+            toggleEditorMode()
+            return
+          }
+          default:
+            break
+        }
+      }
+
+      switch (e.key.toLowerCase()) {
+        case 'l':
+          e.preventDefault()
+          if (useUiStore.getState().settingsLocked) return
+          void lock()
+          break
+        case 'n':
+          e.preventDefault()
+          void handleNewNote()
+          break
+        case 'k':
+          // Handled by CommandPalette component itself
+          break
+        default:
+          break
+      }
+    }
+
+    window.addEventListener('keydown', handler)
+    return (): void => window.removeEventListener('keydown', handler)
+  }, [handleNewNote, lock, toggleEditorMode, setShowTrash, requestFocusSearch])
+
+  return (
+    <div className="bg-background flex h-screen flex-col overflow-hidden">
+      <SidebarProvider className="min-h-0! flex-1 overflow-hidden">
+        <Sidebar />
+        <SidebarInset className="flex min-w-0 flex-row">
+          <NoteList />
+          <NoteEditor />
+        </SidebarInset>
+      </SidebarProvider>
+      <CommandPalette />
+      <RecoveryKeyUnconfirmedDialog />
+    </div>
+  )
+}

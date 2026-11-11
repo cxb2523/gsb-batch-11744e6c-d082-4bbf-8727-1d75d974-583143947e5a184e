@@ -1,0 +1,331 @@
+export interface Note {
+  id: string
+  title: string
+  content: string
+  isPinned: boolean
+  isTrashed: boolean
+  createdAt: number
+  updatedAt: number
+  trashedAt: number | null
+  tags: Tag[]
+}
+
+export interface NoteListItem {
+  id: string
+  title: string
+  isPinned: boolean
+  isTrashed: boolean
+  createdAt: number
+  updatedAt: number
+  trashedAt: number | null
+  tags: Tag[]
+}
+
+export interface Tag {
+  id: string
+  name: string
+  color: string
+  createdAt: number
+}
+
+// Roughly what fits in the sidebar row before truncating.
+export const TAG_NAME_MAX = 24
+
+// For a password being set (create, change, reset). Unlock never checks it, so older vaults open.
+export const PASSWORD_MIN_LENGTH = 12
+
+// Files are reported by basename only: full paths never go back to the renderer.
+export interface ImportResult {
+  imported: number
+  /** Files that were not imported. */
+  skipped: Array<{ file: string; reason: string }>
+  /** Tags left off a note that was imported: one entry per file and reason, with a count. */
+  droppedTags: Array<{ file: string; count: number; reason: string }>
+}
+
+// Shared because main colours the tags it creates during a Markdown import.
+export const PRESET_COLORS = [
+  '#10b981',
+  '#3b82f6',
+  '#8b5cf6',
+  '#f59e0b',
+  '#ef4444',
+  '#ec4899',
+  '#14b8a6',
+  '#f97316',
+  '#6366f1',
+  '#84cc16'
+]
+
+export interface CreateNoteInput {
+  title: string
+  content: string
+}
+export interface NotePatch {
+  title?: string
+  content?: string
+  isPinned?: boolean
+}
+export interface NoteFilter {
+  trashed?: boolean
+  tagId?: string
+}
+export interface NoteCounts {
+  live: number
+  pinned: number
+  trashed: number
+}
+export interface CreateTagInput {
+  name: string
+  color: string
+}
+export interface CreateTagAndAssignInput {
+  noteId: string
+  name: string
+  color: string
+}
+export interface TagPatch {
+  name?: string
+  color?: string
+}
+
+export interface NoteTagPair {
+  noteId: string
+  tagId: string
+}
+
+export type VaultStatus = { isOpen: true; vaultPath: string } | { isOpen: false }
+// A vault main queued for the next renderer that boots: Unlock it, or create it in Setup.
+export interface PendingVault {
+  path: string
+  mode: 'open' | 'create'
+}
+export interface RecentVault {
+  path: string
+  hasKeyFile: boolean
+  lastOpenedAt: number
+}
+export interface CreateVaultResult {
+  mnemonic: string
+}
+export interface ChangePasswordResult {
+  mnemonic: string
+}
+export interface KeyFileOperationResult {
+  mnemonic: string
+}
+export interface KeyFileSelection {
+  contents: Uint8Array
+  filename: string
+  sizeBytes: number
+}
+export interface GeneratedKeyFile {
+  path: string
+  contents: Uint8Array
+  filename: string
+}
+
+export type NoteSortField = 'updatedAt' | 'createdAt' | 'title'
+
+export interface NoteSort {
+  field: NoteSortField
+  direction: 'asc' | 'desc'
+}
+
+export interface Prefs {
+  recentVaults: RecentVault[]
+  unconfirmedRecoveryVaults: string[]
+  autoLockMinutes: number
+  allowScreenCapture: boolean
+  lockOnMinimize: boolean
+  clipboardClearSeconds: number
+  clearClipboardOnLock: boolean
+  noteSort: NoteSort
+  checkUpdatesOnStartup: boolean
+}
+
+export interface UnlockThrottleStatus {
+  isThrottled: boolean
+  waitSeconds: number
+  failedAttempts: number
+}
+
+export interface VaultVersion {
+  maj: number
+  min: number
+}
+
+export interface UpdateInfo {
+  version: string
+  releaseNotes: string | null
+}
+
+export interface DownloadProgress {
+  percent: number
+  bytesPerSecond: number
+  transferred: number
+  total: number
+}
+
+export const CURRENT_VERSION_MAJ = 1
+export const CURRENT_VERSION_MIN = 0
+
+export interface BugReportParts {
+  /** Markdown line: app version, Electron version, OS. */
+  environment: string
+  /** Last lines of the local error log, already allowlisted; '' when there is no log. */
+  log: string
+}
+
+export type IpcResult<T> = { success: true; data: T } | { success: false; error: string }
+
+export type Platform = 'darwin' | 'win32' | 'linux'
+
+export interface NotvexAPI {
+  platform: Platform
+  vault: {
+    hasVault(filePath?: string): Promise<IpcResult<boolean>>
+    create(filePath: string, password: string): Promise<IpcResult<CreateVaultResult>>
+    open(
+      filePath: string,
+      password: string,
+      keyFileContents?: Uint8Array
+    ): Promise<IpcResult<VaultVersion | null>>
+    openWithRecovery(
+      filePath: string,
+      mnemonic: string,
+      keyFileContents?: Uint8Array
+    ): Promise<IpcResult<VaultVersion | null>>
+    changePassword(
+      currentPassword: string,
+      newPassword: string,
+      keyFileContents?: Uint8Array
+    ): Promise<IpcResult<ChangePasswordResult>>
+    rotateCredentials(newPassword: string): Promise<IpcResult<ChangePasswordResult>>
+    regenerateRecoveryKey(
+      password: string,
+      keyFileContents?: Uint8Array
+    ): Promise<IpcResult<ChangePasswordResult>>
+    confirmRecoverySaved(): Promise<IpcResult<null>>
+    recoveryUnconfirmed(): Promise<IpcResult<boolean>>
+    close(createPath?: string): Promise<IpcResult<null>>
+    clearDecryptedContent(): Promise<IpcResult<null>>
+    status(): Promise<IpcResult<VaultStatus>>
+    switchTo(filePath: string): Promise<IpcResult<null>>
+    chooseFile(mode: 'new' | 'existing'): Promise<IpcResult<string | null>>
+    selectKeyFile(): Promise<IpcResult<KeyFileSelection | null>>
+    getUnlockThrottleStatus(): Promise<IpcResult<UnlockThrottleStatus>>
+    getHasKeyFile(): Promise<IpcResult<boolean>>
+    generateKeyFile(): Promise<IpcResult<GeneratedKeyFile | null>>
+    configureKeyFile(
+      password: string,
+      keyFileContents: Uint8Array
+    ): Promise<IpcResult<KeyFileOperationResult>>
+    removeKeyFile(
+      password: string,
+      keyFileContents: Uint8Array
+    ): Promise<IpcResult<KeyFileOperationResult>>
+    saveCopyAs(): Promise<IpcResult<string | null>>
+    confirmMigration(createBackup: boolean): Promise<IpcResult<null>>
+    cancelMigration(): Promise<IpcResult<null>>
+    getPendingFile(): Promise<IpcResult<PendingVault | null>>
+    openBackupsFolder(): Promise<IpcResult<null>>
+    onMigrationRequired(
+      callback: (data: {
+        reason: 'header' | 'schema'
+        vaultPath: string
+        backupTimestamp: number
+        fromVersion: number
+        toVersion: number
+      }) => void
+    ): () => void
+    confirmDevBuildWarning(): Promise<IpcResult<null>>
+    cancelDevBuildWarning(): Promise<IpcResult<null>>
+    onDevBuildWarningRequired(callback: (data: { vaultPath: string }) => void): () => void
+  }
+  notes: {
+    create(input: CreateNoteInput): Promise<IpcResult<NoteListItem>>
+    get(id: string): Promise<IpcResult<Note | null>>
+    list(filter?: NoteFilter): Promise<IpcResult<NoteListItem[]>>
+    update(id: string, patch: NotePatch): Promise<IpcResult<null>>
+    duplicate(id: string): Promise<IpcResult<NoteListItem>>
+    trash(id: string): Promise<IpcResult<null>>
+    restore(id: string): Promise<IpcResult<null>>
+    delete(id: string): Promise<IpcResult<null>>
+    emptyTrash(): Promise<IpcResult<null>>
+    /** Global badge counts, independent of the list the renderer is showing. */
+    counts(): Promise<IpcResult<NoteCounts>>
+    /** Writes the note to a user-chosen .md file in main: true once written, null if canceled. */
+    export(id: string): Promise<IpcResult<true | null>>
+    /** Writes every non-trashed note into a user-chosen folder: the count, or null if canceled. */
+    exportAll(): Promise<IpcResult<number | null>>
+    /** Imports user-chosen Markdown files as new notes, all or nothing; null if canceled. */
+    import(): Promise<IpcResult<ImportResult | null>>
+  }
+  tags: {
+    create(input: CreateTagInput): Promise<IpcResult<Tag>>
+    createAndAssign(input: CreateTagAndAssignInput): Promise<IpcResult<Tag>>
+    list(): Promise<IpcResult<Tag[]>>
+    update(id: string, patch: TagPatch): Promise<IpcResult<null>>
+    delete(id: string): Promise<IpcResult<null>>
+  }
+  noteTags: {
+    add(noteId: string, tagId: string): Promise<IpcResult<null>>
+    remove(noteId: string, tagId: string): Promise<IpcResult<null>>
+    list(noteId: string): Promise<IpcResult<Tag[]>>
+    counts(): Promise<IpcResult<Record<string, number>>>
+    all(): Promise<IpcResult<NoteTagPair[]>>
+  }
+  prefs: {
+    get(): Promise<IpcResult<Prefs>>
+    set<K extends keyof Prefs>(key: K, value: Prefs[K]): Promise<IpcResult<void>>
+  }
+  clipboard: {
+    /** Main clears it after the auto-clear pref, or after a fixed 30 s when `secret`.
+     *  `fromUnlockedView`: copied from a view showing vault content; refused once main has locked. */
+    write(
+      text: string,
+      opts?: { secret?: boolean; fromUnlockedView?: boolean }
+    ): Promise<IpcResult<null>>
+  }
+  shell: {
+    openExternal(url: string): Promise<IpcResult<null>>
+  }
+  log: {
+    /** Main validates, truncates and rate-limits this; past the limit it is dropped silently. */
+    error(payload: { name: string; stack: string }): Promise<IpcResult<null>>
+    buildReport(): Promise<IpcResult<BugReportParts>>
+    /** Creates the log folder if needed, then opens it in the OS file manager. */
+    openFolder(): Promise<IpcResult<null>>
+    clear(): Promise<IpcResult<null>>
+  }
+  app: {
+    isDev(): Promise<IpcResult<boolean>>
+    /** Drains, locks and reloads; data is false when the vault failed to pack and only locked. */
+    reloadWindow(): Promise<IpcResult<boolean>>
+  }
+  updater: {
+    onUpdateAvailable(callback: (info: UpdateInfo) => void): () => void
+    onUpdateNotAvailable(callback: () => void): () => void
+    onDownloadProgress(callback: (progress: DownloadProgress) => void): () => void
+    onUpdateDownloaded(callback: () => void): () => void
+    onError(callback: (error: { message: string }) => void): () => void
+    checkNow(): Promise<IpcResult<string | null>>
+    /** Like checkNow, but main skips it (data null) when checkUpdatesOnStartup is off. */
+    checkOnStartup(): Promise<IpcResult<string | null>>
+    download(): Promise<IpcResult<null>>
+    installNow(): Promise<IpcResult<null>>
+    getCurrentVersion(): Promise<IpcResult<string>>
+  }
+  /**
+   * Fires just before the vault is locked, so pending work can be persisted
+   * while the database is still open. The main process waits for the callback
+   * to settle, but only briefly — it locks regardless.
+   */
+  onWillLock(callback: () => Promise<void>): () => void
+  onAutoLocked(callback: () => void): () => void
+  /** Fires when a close couldn't pack the vault, so the latest changes were lost. */
+  onPackFailed(callback: () => void): () => void
+  onReloadRequested(callback: () => void): () => void
+  onOpenFile(callback: (filePath: string) => void): () => void
+}

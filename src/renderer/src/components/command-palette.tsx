@@ -1,0 +1,271 @@
+import { type JSX, type ReactNode, useCallback, useEffect, useState } from 'react'
+
+import { toast } from 'sonner'
+
+import {
+  BugIcon,
+  CopyIcon,
+  CopyPlusIcon,
+  ExternalLinkIcon,
+  EyeIcon,
+  FileTextIcon,
+  FolderOpenIcon,
+  LockIcon,
+  PlusIcon,
+  RotateCwIcon,
+  TagIcon,
+  Trash2Icon,
+  XIcon
+} from 'lucide-react'
+
+import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
+import { useCreateNote } from '@/hooks/use-create-note'
+import { useDuplicateNote } from '@/hooks/use-duplicate-note'
+import { loadDebugInfo, openBugReport, openLogsFolder } from '@/lib/bug-report'
+import { requestReload } from '@/lib/reload-window'
+import { useUiStore } from '@/store/ui.store'
+import { useVaultStore } from '@/store/vault.store'
+import { Shortcut } from './Shortcut'
+import {
+  CommandDialog,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+  CommandSeparator,
+  CommandShortcut
+} from './ui/command'
+
+const RECENT_NOTES = 8
+const ZERO_WIDTH_DIGITS = [0x200b, 0x200c, 0x200d, 0x2060].map((c) => String.fromCharCode(c))
+// Every note value ends in one of ZERO_WIDTH_DIGITS; this character is not one of them.
+const CREATE_NOTE_VALUE = String.fromCharCode(0x2063)
+
+// cmdk keys items by `value`, so notes sharing a title would highlight together. Appending the
+// index written with zero-width digits (which cmdk doesn't trim and nobody types) keeps each value
+// unique while matching still runs on the title alone. Those characters are stripped from the title
+// first, or a pasted title ending in one could produce another note's value.
+function noteValue(title: string, index: number): string {
+  const base = [...title].filter((c) => !ZERO_WIDTH_DIGITS.includes(c)).join('')
+  const digits = index.toString(ZERO_WIDTH_DIGITS.length)
+  return base + [...digits].map((d) => ZERO_WIDTH_DIGITS[Number(d)]).join('')
+}
+
+export function CommandPalette(): JSX.Element | null {
+  const { commandPaletteOpen, setCommandPaletteOpen } = useUiStore()
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+        e.preventDefault()
+        setCommandPaletteOpen(true)
+      }
+      if (e.key === 'Escape') setCommandPaletteOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return (): void => window.removeEventListener('keydown', onKey)
+  }, [setCommandPaletteOpen])
+
+  return (
+    // Wider than the confirmation dialogs: it lists note titles next to shortcuts.
+    <CommandDialog
+      title="Command palette"
+      description="Search notes, run commands or create a note from your search."
+      open={commandPaletteOpen}
+      onOpenChange={setCommandPaletteOpen}
+      className="sm:max-w-lg"
+    >
+      <PaletteContent />
+    </CommandDialog>
+  )
+}
+
+// Mounted only while the dialog is open, so the query resets on every close.
+function PaletteContent(): ReactNode {
+  const {
+    setCommandPaletteOpen,
+    toggleEditorMode,
+    setShowTrash,
+    setTagSelectorNoteId,
+    setRemoveTagNoteId
+  } = useUiStore()
+  const { notes, lock, setActiveNoteId: selectNote, activeNoteId, noteTagsMap } = useVaultStore()
+  const handleNewNote = useCreateNote()
+  const duplicateNote = useDuplicateNote()
+  const [query, setQuery] = useState('')
+
+  const { copyToClipboard } = useCopyToClipboard()
+
+  const run = useCallback(
+    (action: () => void | Promise<void>): void => {
+      setCommandPaletteOpen(false)
+      void action()
+    },
+    [setCommandPaletteOpen]
+  )
+
+  const handleCreate = async (title?: string): Promise<void> => {
+    try {
+      await handleNewNote(title)
+    } catch {
+      toast.error("Couldn't create the note")
+    }
+  }
+
+  // notes includes trashed ones, and a trashed note can be open from the Trash view.
+  const activeNote = notes.find((n) => n.id === activeNoteId)
+  // A trashed note is read-only: reading view only, and its tags can't change.
+  const canEdit = !activeNote?.isTrashed
+  const noteHasTags = activeNoteId ? (noteTagsMap[activeNoteId] ?? []).length > 0 : false
+  const activeNotes = notes.filter((n) => !n.isTrashed)
+  const shownNotes = query ? activeNotes : activeNotes.slice(0, RECENT_NOTES)
+  const newTitle = query.trim()
+
+  return (
+    <>
+      <CommandInput
+        placeholder="Search notes, run commands…"
+        value={query}
+        onValueChange={setQuery}
+      />
+      <CommandList>
+        {!newTitle && <CommandEmpty>No results found.</CommandEmpty>}
+        <CommandGroup heading="Commands">
+          <CommandItem
+            keywords={['create note', 'add note', 'blank']}
+            onSelect={() => run(handleCreate)}
+          >
+            <PlusIcon />
+            <span>New note</span>
+            <CommandShortcut>
+              <Shortcut keys="Mod-n" />
+            </CommandShortcut>
+          </CommandItem>
+          {canEdit && (
+            <CommandItem
+              keywords={['preview', 'read mode', 'edit mode', 'markdown']}
+              onSelect={() => run(toggleEditorMode)}
+            >
+              <EyeIcon />
+              <span>Toggle reading view</span>
+              <CommandShortcut>
+                <Shortcut keys="Mod-Shift-e" />
+              </CommandShortcut>
+            </CommandItem>
+          )}
+          <CommandItem
+            keywords={['deleted notes', 'bin', 'recycle', 'restore']}
+            onSelect={() => run(() => setShowTrash(true))}
+          >
+            <Trash2Icon />
+            <span>Show trash</span>
+          </CommandItem>
+          <CommandItem
+            keywords={['close vault', 'logout', 'sign out', 'exit']}
+            onSelect={() => run(lock)}
+          >
+            <LockIcon />
+            <span>Lock vault</span>
+            <CommandShortcut>
+              <Shortcut keys="Mod-l" />
+            </CommandShortcut>
+          </CommandItem>
+          <CommandItem keywords={['refresh', 'restart']} onSelect={() => run(requestReload)}>
+            <RotateCwIcon />
+            <span>Reload window</span>
+            <CommandShortcut>
+              <Shortcut keys="Mod-r" />
+            </CommandShortcut>
+          </CommandItem>
+          {activeNoteId && canEdit && (
+            <CommandItem
+              keywords={['add tag', 'assign tag', 'label']}
+              onSelect={() => run(() => setTagSelectorNoteId(activeNoteId))}
+            >
+              <TagIcon />
+              <span>Tag note with…</span>
+            </CommandItem>
+          )}
+          {activeNoteId && canEdit && noteHasTags && (
+            <CommandItem
+              keywords={['untag', 'delete tag', 'unlabel']}
+              onSelect={() => run(() => setRemoveTagNoteId(activeNoteId))}
+            >
+              <XIcon />
+              <span>Remove tag from note…</span>
+            </CommandItem>
+          )}
+          {activeNote && !activeNote.isTrashed && (
+            <CommandItem
+              keywords={['copy note', 'clone']}
+              onSelect={() => run(() => duplicateNote(activeNote.id))}
+            >
+              <CopyPlusIcon />
+              <span>Duplicate note</span>
+            </CommandItem>
+          )}
+        </CommandGroup>
+
+        <CommandGroup heading="Help">
+          <CommandItem
+            keywords={['bug', 'issue', 'feedback', 'problem', 'support']}
+            onSelect={() => run(openBugReport)}
+            aria-label="Report a bug (opens in your browser)"
+          >
+            <BugIcon />
+            <span>Report a bug</span>
+            <ExternalLinkIcon className="ml-auto" aria-hidden />
+          </CommandItem>
+          <CommandItem
+            keywords={['diagnostics', 'debug', 'version', 'system info']}
+            onSelect={() => run(async () => copyToClipboard(await loadDebugInfo()))}
+          >
+            <CopyIcon />
+            <span>Copy debug info</span>
+          </CommandItem>
+          <CommandItem
+            keywords={['logs', 'errors', 'diagnostics']}
+            onSelect={() => run(openLogsFolder)}
+          >
+            <FolderOpenIcon />
+            <span>Open logs folder</span>
+          </CommandItem>
+        </CommandGroup>
+
+        {shownNotes.length > 0 && (
+          <>
+            <CommandSeparator />
+            <CommandGroup heading="Notes">
+              {shownNotes.map((note, i) => (
+                <CommandItem
+                  key={note.id}
+                  value={noteValue(note.title || 'Untitled', i)}
+                  onSelect={() => run(() => selectNote(note.id))}
+                >
+                  <FileTextIcon />
+                  <span>{note.title || 'Untitled'}</span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </>
+        )}
+
+        {/* Must stay last in JSX: cmdk doesn't reorder groups, and Enter has to keep picking a real
+            match. Its value never matches, so without forceMount cmdk would hide item and group. */}
+        {newTitle && (
+          <CommandGroup forceMount>
+            <CommandItem
+              forceMount
+              value={CREATE_NOTE_VALUE}
+              onSelect={() => run(() => handleCreate(newTitle))}
+            >
+              <PlusIcon />
+              <span>{`Create note "${newTitle}"`}</span>
+            </CommandItem>
+          </CommandGroup>
+        )}
+      </CommandList>
+    </>
+  )
+}

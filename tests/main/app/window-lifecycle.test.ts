@@ -1,0 +1,459 @@
+import type { EventEmitter } from 'node:events'
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+// createWindow() runs once per window, and on macOS `activate` can run it many
+// times in one process. Anything it hangs on an app-wide emitter must come off
+// again when the window closes, or listeners pile up still pointing at dead
+// windows.
+
+vi.mock('electron', async () => {
+  const { EventEmitter } = await import('node:events')
+  class MockBrowserWindow extends EventEmitter {
+    constructor(readonly options: Electron.BrowserWindowConstructorOptions) {
+      super()
+    }
+    webContents = Object.assign(new EventEmitter(), {
+      openDevTools: vi.fn(),
+      reload: vi.fn()
+    })
+    loadURL = vi.fn(async () => undefined)
+    loadFile = vi.fn(async () => undefined)
+    setTitle = vi.fn()
+    setMenuBarVisibility = vi.fn()
+    setContentProtection = vi.fn()
+    isDestroyed = vi.fn(() => false)
+    close = vi.fn()
+  }
+  return {
+    app: { isPackaged: true },
+    BrowserWindow: MockBrowserWindow,
+    powerMonitor: new EventEmitter()
+  }
+})
+
+vi.mock('@main/ipc-handlers', () => ({
+  cancelPendingConfirmations: vi.fn(),
+  closeVaultDrained: vi.fn(async () => undefined),
+  isRecoveryConfirmPending: vi.fn(() => false),
+  lockVaultAndNotify: vi.fn(async () => undefined),
+  markRendererReplaced: vi.fn(),
+  registerIpcHandlers: vi.fn(),
+  takeRecycleMark: vi.fn(() => false)
+}))
+
+vi.mock('@main/error-log', () => ({ appendError: vi.fn() }))
+vi.mock('@main/prefs', () => ({ getPref: vi.fn(() => false) }))
+vi.mock('@main/updater', () => ({ initAutoUpdater: vi.fn() }))
+vi.mock('@main/vault/vault', () => ({ isVaultOpen: vi.fn(() => false) }))
+
+const POWER_EVENTS = ['suspend', 'lock-screen', 'user-did-resign-active'] as const
+
+describe('createWindow: powerMonitor listeners (issue #36)', () => {
+  let powerMonitor: EventEmitter
+  let createWindow: typeof import('@main/window').createWindow
+
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    const electron = await import('electron')
+    powerMonitor = electron.powerMonitor as unknown as EventEmitter
+    powerMonitor.removeAllListeners()
+    ;({ createWindow } = await import('@main/window'))
+  })
+
+  it('removes its powerMonitor listeners when the window closes', () => {
+    const win = createWindow(() => null)
+    win.emit('closed')
+
+    for (const event of POWER_EVENTS) expect(powerMonitor.listenerCount(event)).toBe(0)
+  })
+
+  it('settles any pending confirmation prompt when the window closes', async () => {
+    const { cancelPendingConfirmations } = await import('@main/ipc-handlers')
+    const win = createWindow(() => null)
+
+    win.emit('closed')
+
+    expect(cancelPendingConfirmations).toHaveBeenCalledTimes(1)
+  })
+
+  it('locks through the reopened window, not the closed one, on every lock event', async () => {
+    const { lockVaultAndNotify } = await import('@main/ipc-handlers')
+    createWindow(() => null).emit('closed')
+    const second = createWindow(() => null)
+
+    for (const event of POWER_EVENTS) powerMonitor.emit(event)
+
+    expect(lockVaultAndNotify).toHaveBeenCalledTimes(POWER_EVENTS.length)
+    for (const call of vi.mocked(lockVaultAndNotify).mock.calls) expect(call[0]).toBe(second)
+  })
+
+  it('leaves one listener per event after a close and reopen', () => {
+    createWindow(() => null).emit('closed')
+    createWindow(() => null)
+
+    for (const event of POWER_EVENTS) expect(powerMonitor.listenerCount(event)).toBe(1)
+  })
+})
+
+describe('createWindow: lock on minimize', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    const electron = await import('electron')
+    ;(electron.powerMonitor as unknown as EventEmitter).removeAllListeners()
+    const { getPref } = await import('@main/prefs')
+    const { isVaultOpen } = await import('@main/vault/vault')
+    vi.mocked(getPref).mockReturnValue(true)
+    vi.mocked(isVaultOpen).mockReturnValue(true)
+  })
+
+  afterEach(async () => {
+    const { getPref } = await import('@main/prefs')
+    const { isVaultOpen } = await import('@main/vault/vault')
+    const { isRecoveryConfirmPending } = await import('@main/ipc-handlers')
+    vi.mocked(getPref).mockReturnValue(false)
+    vi.mocked(isVaultOpen).mockReturnValue(false)
+    vi.mocked(isRecoveryConfirmPending).mockReturnValue(false)
+  })
+
+  it('locks when minimized', async () => {
+    const { createWindow } = await import('@main/window')
+    const { lockVaultAndNotify } = await import('@main/ipc-handlers')
+    const win = createWindow(() => null)
+
+    win.emit('minimize')
+    win.emit('closed')
+
+    expect(lockVaultAndNotify).toHaveBeenCalledExactlyOnceWith(win)
+  })
+
+  it('waits while a new recovery key is on screen, but the lock screen still locks', async () => {
+    const { createWindow } = await import('@main/window')
+    const { isRecoveryConfirmPending, lockVaultAndNotify } = await import('@main/ipc-handlers')
+    const electron = await import('electron')
+    vi.mocked(isRecoveryConfirmPending).mockReturnValue(true)
+    const win = createWindow(() => null)
+
+    win.emit('minimize')
+    expect(lockVaultAndNotify).not.toHaveBeenCalled()
+
+    ;(electron.powerMonitor as unknown as EventEmitter).emit('lock-screen')
+    win.emit('closed')
+
+    expect(lockVaultAndNotify).toHaveBeenCalledExactlyOnceWith(win)
+  })
+})
+
+describe('createWindow: webPreferences', () => {
+  it('runs the renderer sandboxed and isolated from Node', async () => {
+    const { createWindow } = await import('@main/window')
+    const win = createWindow(() => null) as Electron.BrowserWindow & {
+      options: Electron.BrowserWindowConstructorOptions
+    }
+    win.emit('closed')
+
+    expect(win.options.webPreferences).toMatchObject({
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false
+    })
+  })
+
+  // The OS spellchecker would receive every typed word, recovery phrase included,
+  // and on Linux Electron fetches Hunspell dictionaries from a remote CDN.
+  it('disables the spellchecker', async () => {
+    const { createWindow } = await import('@main/window')
+    const win = createWindow(() => null) as Electron.BrowserWindow & {
+      options: Electron.BrowserWindowConstructorOptions
+    }
+    win.emit('closed')
+
+    expect(win.options.webPreferences?.spellcheck).toBe(false)
+  })
+
+  // The default app menu's Toggle Developer Tools accelerator stays live even
+  // with the menu bar hidden, and a console reaches window.notvex directly.
+  describe('devTools', () => {
+    let app: { isPackaged: boolean }
+
+    beforeEach(async () => {
+      app = (await import('electron')).app as unknown as { isPackaged: boolean }
+    })
+
+    afterEach(() => {
+      app.isPackaged = true
+    })
+
+    it.each([
+      [true, false],
+      [false, true]
+    ])('isPackaged=%s → devTools=%s', async (isPackaged, devTools) => {
+      app.isPackaged = isPackaged
+      const { createWindow } = await import('@main/window')
+      const win = createWindow(() => null) as Electron.BrowserWindow & {
+        options: Electron.BrowserWindowConstructorOptions
+      }
+      win.emit('closed')
+
+      expect(win.options.webPreferences?.devTools).toBe(devTools)
+    })
+  })
+})
+
+// A reload or renderer crash leaves the BrowserWindow alive, so 'closed' never
+// fires, yet the prompt was sent to a renderer that no longer exists — and the
+// new renderer starts with no vault UI, so the key must not stay in memory.
+describe('createWindow: renderer reload / crash (issue #51)', () => {
+  let createWindow: typeof import('@main/window').createWindow
+
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    ;({ createWindow } = await import('@main/window'))
+  })
+
+  it('settles the pending prompt and closes the vault when the renderer crashes', async () => {
+    const { cancelPendingConfirmations, closeVaultDrained, markRendererReplaced } =
+      await import('@main/ipc-handlers')
+    const win = createWindow(() => null)
+
+    win.webContents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 1 })
+
+    expect(cancelPendingConfirmations).toHaveBeenCalledTimes(1)
+    expect(closeVaultDrained).toHaveBeenCalledExactlyOnceWith(null)
+    expect(markRendererReplaced).toHaveBeenCalledTimes(1)
+  })
+
+  it('settles the pending prompt and closes the vault once a reload commits', async () => {
+    const { cancelPendingConfirmations, closeVaultDrained, markRendererReplaced } =
+      await import('@main/ipc-handlers')
+    const win = createWindow(() => null)
+
+    win.webContents.emit('did-navigate')
+
+    expect(cancelPendingConfirmations).toHaveBeenCalledTimes(1)
+    expect(closeVaultDrained).toHaveBeenCalledExactlyOnceWith(null)
+    expect(markRendererReplaced).toHaveBeenCalledTimes(1)
+  })
+
+  // did-start-navigation fires before will-navigate can block the navigation
+  // (e.g. a plain external <a href>), so the old page may well survive it —
+  // closing the vault there would drop unsaved edits under a live UI.
+  it('leaves the vault alone when a navigation only starts', async () => {
+    const { cancelPendingConfirmations, closeVaultDrained, markRendererReplaced } =
+      await import('@main/ipc-handlers')
+    const win = createWindow(() => null)
+
+    win.webContents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+
+    expect(cancelPendingConfirmations).not.toHaveBeenCalled()
+    expect(closeVaultDrained).not.toHaveBeenCalled()
+    expect(markRendererReplaced).not.toHaveBeenCalled()
+  })
+})
+
+// A crashed renderer leaves Chromium's sad-tab page, so the window reloads to Unlock itself.
+describe('createWindow: renderer crash recovery', () => {
+  let createWindow: typeof import('@main/window').createWindow
+
+  const crash = (win: Electron.BrowserWindow, reason = 'crashed'): void => {
+    win.webContents.emit('render-process-gone', {}, { reason, exitCode: 7 })
+  }
+
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    vi.useFakeTimers()
+    ;({ createWindow } = await import('@main/window'))
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('logs the crash reason and exit code', async () => {
+    const { appendError } = await import('@main/error-log')
+    crash(createWindow(() => null))
+
+    expect(appendError).toHaveBeenCalledExactlyOnceWith('render-process-gone', {
+      reason: 'crashed',
+      exitCode: 7
+    })
+  })
+
+  it('reloads only once the vault has closed', async () => {
+    const { closeVaultDrained } = await import('@main/ipc-handlers')
+    let finishClose = (): void => {}
+    vi.mocked(closeVaultDrained).mockImplementationOnce(
+      () => new Promise((resolve) => (finishClose = () => resolve({ packFailed: false })))
+    )
+    const win = createWindow(() => null)
+
+    crash(win)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(win.webContents.reload).not.toHaveBeenCalled()
+
+    finishClose()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(win.webContents.reload).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not reload after a clean exit', async () => {
+    const win = createWindow(() => null)
+    crash(win, 'clean-exit')
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(win.webContents.reload).not.toHaveBeenCalled()
+  })
+
+  it('logs but does not reload a second crash within 30 s', async () => {
+    const { appendError } = await import('@main/error-log')
+    const win = createWindow(() => null)
+
+    crash(win)
+    await vi.advanceTimersByTimeAsync(29_999)
+    crash(win)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(appendError).toHaveBeenCalledTimes(2)
+    expect(win.webContents.reload).toHaveBeenCalledTimes(1)
+  })
+
+  it('reloads again once 30 s have passed', async () => {
+    const win = createWindow(() => null)
+
+    crash(win)
+    await vi.advanceTimersByTimeAsync(30_000)
+    crash(win)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(win.webContents.reload).toHaveBeenCalledTimes(2)
+  })
+
+  it('reloads after a kill from a lock without logging it or using up the guard', async () => {
+    const { appendError } = await import('@main/error-log')
+    const { cancelPendingConfirmations, takeRecycleMark } = await import('@main/ipc-handlers')
+    const win = createWindow(() => null)
+
+    vi.mocked(takeRecycleMark).mockReturnValueOnce(true)
+    crash(win, 'killed')
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(appendError).not.toHaveBeenCalled()
+    expect(win.webContents.reload).toHaveBeenCalledTimes(1)
+    expect(cancelPendingConfirmations).toHaveBeenCalledTimes(1)
+
+    // A real crash right after still counts as the first one in its 30 s window
+    crash(win)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(appendError).toHaveBeenCalledTimes(1)
+    expect(win.webContents.reload).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not reload a window destroyed before a kill from a lock', async () => {
+    const { takeRecycleMark } = await import('@main/ipc-handlers')
+    const { appendError } = await import('@main/error-log')
+    const win = createWindow(() => null)
+    vi.mocked(win.isDestroyed).mockReturnValue(true)
+
+    vi.mocked(takeRecycleMark).mockReturnValueOnce(true)
+    crash(win, 'killed')
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(win.webContents.reload).not.toHaveBeenCalled()
+    // Proves the marked branch ran: the crash path would have logged it
+    expect(appendError).not.toHaveBeenCalled()
+  })
+
+  it('does not reload a window destroyed while the vault was closing', async () => {
+    const win = createWindow(() => null)
+    vi.mocked(win.isDestroyed).mockReturnValue(true)
+
+    crash(win)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(win.webContents.reload).not.toHaveBeenCalled()
+  })
+})
+
+// The bundle still reads ELECTRON_RENDERER_URL at runtime, so an installed app
+// launched with it set would load that (remote) page with the preload. Only a
+// dev build may load from the dev server.
+describe('createWindow: dev server url (issue #57)', () => {
+  let createWindow: typeof import('@main/window').createWindow
+  let app: { isPackaged: boolean }
+
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    app = (await import('electron')).app as unknown as { isPackaged: boolean }
+    ;({ createWindow } = await import('@main/window'))
+  })
+
+  afterEach(() => {
+    app.isPackaged = true
+    vi.unstubAllEnvs()
+  })
+
+  it('ignores ELECTRON_RENDERER_URL in a packaged build', async () => {
+    const { rendererIndexPath } = await import('@main/url-guard')
+    vi.stubEnv('ELECTRON_RENDERER_URL', 'https://attacker.example/')
+
+    const win = createWindow(() => null)
+    win.emit('closed')
+
+    expect(win.loadURL).not.toHaveBeenCalled()
+    expect(win.loadFile).toHaveBeenCalledExactlyOnceWith(rendererIndexPath)
+    expect(win.webContents.openDevTools).not.toHaveBeenCalled()
+  })
+
+  it('loads the built renderer in a dev build with no dev server', async () => {
+    const { rendererIndexPath } = await import('@main/url-guard')
+    app.isPackaged = false
+
+    const win = createWindow(() => null)
+    win.emit('closed')
+
+    expect(win.loadURL).not.toHaveBeenCalled()
+    expect(win.loadFile).toHaveBeenCalledExactlyOnceWith(rendererIndexPath)
+  })
+
+  it('loads the dev server in a dev build', () => {
+    app.isPackaged = false
+    vi.stubEnv('ELECTRON_RENDERER_URL', 'http://localhost:5173')
+
+    const win = createWindow(() => null)
+    win.emit('closed')
+
+    expect(win.loadURL).toHaveBeenCalledExactlyOnceWith('http://localhost:5173')
+  })
+})
+
+// Closing twice while the vault is still locking must not let the second close through:
+// it would destroy the window mid-lock, and the first close's re-close would then throw.
+describe('createWindow: close while locking', () => {
+  let createWindow: typeof import('@main/window').createWindow
+
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    const { isVaultOpen } = await import('@main/vault/vault')
+    vi.mocked(isVaultOpen).mockReturnValue(true)
+    ;({ createWindow } = await import('@main/window'))
+  })
+
+  afterEach(async () => {
+    const { isVaultOpen } = await import('@main/vault/vault')
+    vi.mocked(isVaultOpen).mockReturnValue(false)
+  })
+
+  it('ignores a second close while the vault is locking', async () => {
+    const { closeVaultDrained } = await import('@main/ipc-handlers')
+    vi.mocked(closeVaultDrained).mockImplementationOnce(() => new Promise(() => undefined))
+    const win = createWindow(() => null)
+    const first = { preventDefault: vi.fn() }
+    const second = { preventDefault: vi.fn() }
+
+    win.emit('close', first)
+    win.emit('close', second)
+
+    expect(second.preventDefault).toHaveBeenCalledTimes(1)
+    expect(closeVaultDrained).toHaveBeenCalledTimes(1)
+  })
+})

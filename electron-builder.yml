@@ -1,0 +1,64 @@
+appId: com.notvex.app
+productName: Notvex
+copyright: Copyright © 2026 Notvex
+
+asarUnpack:
+  - node_modules/@journeyapps/sqlcipher/**
+  - node_modules/koffi/**
+
+compression: maximum
+
+electronFuses:
+  runAsNode: false
+  enableNodeOptionsEnvironmentVariable: false
+  enableNodeCliInspectArguments: false
+  enableEmbeddedAsarIntegrityValidation: true
+  onlyLoadAppFromAsar: true
+  # No macOS signing identity in CI: the flipped arm64 binary needs a fresh ad-hoc signature to launch
+  resetAdHocDarwinSignature: true
+
+fileAssociations:
+  - ext: nvx
+    name: Notvex Vault
+    description: Notvex Encrypted Vault
+    mimeType: application/x-notvex-vault
+
+files:
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!{.eslintcache,eslint.config.mjs,.prettierrc,.prettierrc.yaml,.prettierignore,.editorconfig,dev-app-update.yml,CHANGELOG.md,README.md,SECURITY.md}'
+  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml,pnpm-workspace.yaml,.mcp.json,commitlint.config.ts,components.json,vitest.config.ts,tsconfig.web.tsbuildinfo}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  - '!.github/**/*'
+  - '!.husky/**/*'
+  - '!.claude/**/*'
+  - '!tests/**/*'
+  - '!**/dxcompiler.dll'
+  - '!**/dxil.dll'
+  - out/**/*
+
+win:
+  executableName: notvex
+nsis:
+  artifactName: ${name}-${version}-setup.${ext}
+  shortcutName: ${productName}
+  uninstallDisplayName: ${productName}
+  createDesktopShortcut: always
+mac:
+  entitlements: build/entitlements.mac.plist
+  notarize: false
+dmg:
+  artifactName: ${name}-${version}.${ext}
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Utility
+appImage:
+  artifactName: ${name}-${version}.${ext}
+npmRebuild: false
+publish:
+  owner: GFrancV
+  provider: github
+  repo: notvex

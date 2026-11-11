@@ -1,0 +1,14 @@
+node_modules/
+out/
+dist/
+*.local
+.DS_Store
+.eslintcache
+Thumbs.db
+*.db
+*.db-shm
+*.db-wal
+*.tsbuildinfo
+coverage/
+build/icon.*
+!build/icon.png

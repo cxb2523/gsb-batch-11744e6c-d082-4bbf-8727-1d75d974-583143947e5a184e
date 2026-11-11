@@ -1,0 +1,499 @@
+import { type CSSProperties, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
+
+import { ChevronDownIcon, ExternalLinkIcon, FolderOpenIcon } from 'lucide-react'
+
+import { AppLogo } from '@/components/AppLogo'
+import { KeyFileInput } from '@/components/KeyFileInput'
+import { PasswordInput } from '@/components/PasswordInput'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
+import {
+  Field,
+  FieldDescription,
+  FieldError,
+  FieldLabel,
+  FieldSeparator
+} from '@/components/ui/field'
+import { Textarea } from '@/components/ui/textarea'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { Spinner } from '@/components/ui/spinner'
+import { useIsDev } from '@/hooks/use-is-dev'
+import { usePickVault } from '@/hooks/use-pick-vault'
+import { openBugReport } from '@/lib/bug-report'
+import { notvex } from '@/lib/ipc'
+import { truncatePath } from '@/lib/utils'
+import { usePrefsStore } from '@/store/prefs.store'
+import { useVaultStore } from '@/store/vault.store'
+import type { UnlockThrottleStatus } from '@shared/types'
+
+type UnlockMode = 'password' | 'recovery'
+
+export function Unlock(): ReactNode {
+  const isDev = useIsDev()
+  const {
+    setStatus,
+    setNeedsRecoveryReset,
+    setPendingNewVaultPath,
+    refreshAll,
+    setVaultVersion,
+    setCurrentVaultPath,
+    setPendingOpenVaultPath
+  } = useVaultStore()
+  const pendingOpenVaultPath = useVaultStore((s) => s.pendingOpenVaultPath)
+
+  const { pickExistingVault } = usePickVault()
+
+  // Prefs already loaded by App.tsx before Unlock mounts — reads are synchronous
+  const lastOpenedVaultPath = usePrefsStore((s) => s.recentVaults[0]?.path ?? null)
+
+  const initialPath = pendingOpenVaultPath ?? lastOpenedVaultPath
+  const [vaultPath, setVaultPath] = useState<string | null>(initialPath)
+  const [vaultExists, setVaultExists] = useState<boolean>(initialPath !== null)
+  const [advancedOpen, setAdvancedOpen] = useState(() =>
+    initialPath !== null ? usePrefsStore.getState().getHasKeyFileForPath(initialPath) : false
+  )
+  const [mode, setMode] = useState<UnlockMode>('password')
+  const [password, setPassword] = useState('')
+  const [mnemonic, setMnemonic] = useState('')
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [throttle, setThrottle] = useState<UnlockThrottleStatus | null>(null)
+  const [countdown, setCountdown] = useState(0)
+
+  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const keyFileContentsRef = useRef<Uint8Array | null>(null)
+  const recoveryKeyFileContentsRef = useRef<Uint8Array | null>(null)
+  const pendingPathRef = useRef(pendingOpenVaultPath)
+  const passwordRef = useRef<HTMLInputElement>(null)
+  const mnemonicRef = useRef<HTMLTextAreaElement>(null)
+
+  // key={mode} mounts one field at a time, so the other ref is always null.
+  const focusInput = useCallback((select = false): void => {
+    const field = passwordRef.current ?? mnemonicRef.current
+    field?.focus()
+    if (select) field?.select()
+  }, [])
+
+  const startCountdown = useCallback((seconds: number): void => {
+    if (countdownRef.current) clearInterval(countdownRef.current)
+    setCountdown(seconds)
+    countdownRef.current = setInterval(() => {
+      setCountdown((prev) => {
+        if (prev <= 1) {
+          clearInterval(countdownRef.current!)
+          countdownRef.current = null
+          setThrottle((t) => (t ? { ...t, isThrottled: false, waitSeconds: 0 } : t))
+          return 0
+        }
+        return prev - 1
+      })
+    }, 1000)
+  }, [])
+
+  const refreshThrottleStatus = useCallback(async (): Promise<void> => {
+    const t = await notvex.vault.getUnlockThrottleStatus()
+    if (!t.success) return
+    setThrottle(t.data)
+    if (t.data.isThrottled && t.data.waitSeconds > 0) {
+      startCountdown(t.data.waitSeconds)
+    }
+  }, [startCountdown])
+
+  // Init: clear pending path from store + fetch throttle status
+  useEffect(() => {
+    void (async (): Promise<void> => {
+      if (pendingPathRef.current) {
+        setPendingOpenVaultPath(null)
+      }
+
+      if (!vaultPath) return
+
+      await refreshThrottleStatus()
+    })()
+    return () => {
+      if (countdownRef.current) clearInterval(countdownRef.current)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshThrottleStatus, setPendingOpenVaultPath])
+
+  // React to vault:open-file push events while Unlock is already mounted
+  useEffect(() => {
+    if (!pendingOpenVaultPath) return
+    void (async (): Promise<void> => {
+      setVaultPath(pendingOpenVaultPath)
+      setVaultExists(true)
+      setAdvancedOpen(usePrefsStore.getState().getHasKeyFileForPath(pendingOpenVaultPath))
+      setError('')
+      setPassword('')
+      setMnemonic('')
+      keyFileContentsRef.current = null
+      recoveryKeyFileContentsRef.current = null
+      setPendingOpenVaultPath(null)
+      await refreshThrottleStatus()
+      focusInput()
+    })()
+  }, [pendingOpenVaultPath, refreshThrottleStatus, setPendingOpenVaultPath, focusInput])
+
+  async function afterUnlock(viaRecovery = false): Promise<void> {
+    await Promise.all([refreshAll(), usePrefsStore.getState().load()])
+    if (viaRecovery) setNeedsRecoveryReset(true)
+    setCurrentVaultPath(vaultPath)
+    setStatus('unlocked')
+  }
+
+  const handleUnlockVault = async (): Promise<void> => {
+    if (!vaultPath) return
+    if (countdown > 0) return
+    setError('')
+    setLoading(true)
+    const res = await notvex.vault.open(
+      vaultPath,
+      password,
+      keyFileContentsRef.current ?? undefined
+    )
+    setLoading(false)
+    if (!res.success) {
+      // User declined the vault-format update prompt, or the dev-build
+      // warning — neither is a credential failure, so return to an idle
+      // unlock form instead of showing an error.
+      if (res.error === 'MIGRATION_CANCELLED' || res.error === 'DEV_BUILD_WARNING_CANCELLED') return
+      setError(res.error)
+      focusInput(true)
+      await refreshThrottleStatus()
+      return
+    }
+    if (res.data === null) {
+      setError('Incorrect password or key file.')
+      focusInput(true)
+      await refreshThrottleStatus()
+      return
+    }
+    setVaultVersion(res.data)
+    await afterUnlock()
+  }
+
+  const handleRecoveryUnlock = async (): Promise<void> => {
+    if (!vaultPath) return
+    setError('')
+    setLoading(true)
+    const res = await notvex.vault.openWithRecovery(
+      vaultPath,
+      mnemonic.trim(),
+      recoveryKeyFileContentsRef.current ?? undefined
+    )
+    setLoading(false)
+    if (!res.success) {
+      // A declined prompt, not a credential failure — see handleUnlockVault.
+      if (res.error === 'MIGRATION_CANCELLED' || res.error === 'DEV_BUILD_WARNING_CANCELLED') return
+      setError(res.error)
+      focusInput()
+      return
+    }
+    if (res.data === null) {
+      setError('Invalid recovery key or key file.')
+      focusInput()
+      return
+    }
+    setVaultVersion(res.data)
+    await afterUnlock(true)
+  }
+
+  const handleOpenOther = async (): Promise<void> => {
+    const selectedPath = await pickExistingVault()
+    if (selectedPath === null) return
+
+    setVaultPath(selectedPath)
+    setAdvancedOpen(usePrefsStore.getState().getHasKeyFileForPath(selectedPath))
+    setVaultExists(true)
+    setError('')
+    keyFileContentsRef.current = null
+    recoveryKeyFileContentsRef.current = null
+    await refreshThrottleStatus()
+    focusInput()
+  }
+
+  const handleCreateNew = async (): Promise<void> => {
+    const res = await notvex.vault.chooseFile('new')
+    if (!res.success || !res.data) return
+    // Setup mounts on the password step with this path; its "Back to unlock" returns here
+    setPendingNewVaultPath(res.data)
+  }
+
+  const switchToRecovery = (): void => {
+    setMode('recovery')
+    setError('')
+  }
+
+  const switchToPassword = (): void => {
+    setMode('password')
+    setError('')
+  }
+
+  const words = mnemonic.trim() === '' ? [] : mnemonic.trim().split(/\s+/)
+  const wordCount = words.length
+  const isThrottled = countdown > 0
+
+  return (
+    <div className="bg-background relative flex min-h-screen items-center justify-center p-8">
+      <div className="w-full max-w-md">
+        {/* Logo */}
+        <div className="mb-8 flex flex-col items-center gap-3">
+          <AppLogo />
+          <div className="text-center">
+            <h1 className="flex items-center justify-center gap-2 text-2xl font-bold tracking-tight">
+              Notvex
+              {isDev && <Badge variant="secondary">Dev</Badge>}
+            </h1>
+            <p className="text-muted-foreground mt-1 text-sm">
+              {vaultExists === true && mode === 'recovery'
+                ? 'Account recovery'
+                : 'Unlock your vault'}
+            </p>
+          </div>
+        </div>
+
+        {/* Vault selector */}
+        {vaultPath && (
+          <div className="mx-auto mb-5 text-center">
+            <Button
+              variant="outline"
+              onClick={handleOpenOther}
+              className="text-muted-foreground mx-auto text-xs"
+            >
+              <FolderOpenIcon />
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span>{truncatePath(vaultPath)}</span>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">{vaultPath}</TooltipContent>
+              </Tooltip>
+            </Button>
+          </div>
+        )}
+
+        {/* Vault file not found */}
+        {vaultExists === false && (
+          <div className="space-y-4 rounded-lg border p-4">
+            <p className="text-muted-foreground text-sm">
+              The vault file couldn&apos;t be found at the saved location.
+            </p>
+
+            <div className="flex flex-col gap-4">
+              <Button
+                className="w-full"
+                onClick={(): void => {
+                  void handleCreateNew()
+                }}
+              >
+                Create new vault
+              </Button>
+
+              <FieldSeparator className="my-0 text-xs">or</FieldSeparator>
+
+              <Button variant="outline" className="w-full" onClick={handleOpenOther}>
+                Open existing vault
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Unlock form */}
+        {vaultExists === true && (
+          <div
+            key={mode}
+            className="animate-in fade-in-0 slide-in-from-bottom-2 space-y-4 duration-200"
+          >
+            {mode === 'password' ? (
+              <>
+                <Field>
+                  <FieldLabel htmlFor="unlock-password">Master password</FieldLabel>
+                  <PasswordInput
+                    id="unlock-password"
+                    ref={passwordRef}
+                    autoFocus
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Enter your password"
+                    onKeyDown={(e): void => {
+                      if (e.key === 'Enter' && !isThrottled) void handleUnlockVault()
+                    }}
+                  />
+                </Field>
+
+                <Collapsible
+                  open={advancedOpen}
+                  onOpenChange={setAdvancedOpen}
+                  className="rounded-md border-0 transition duration-300 data-[state=open]:border"
+                >
+                  <CollapsibleTrigger asChild>
+                    <Button variant="ghost" className="group w-full justify-start">
+                      Advanced options
+                      <ChevronDownIcon className="ml-auto transition-transform duration-300 group-data-[state=open]:rotate-180" />
+                    </Button>
+                  </CollapsibleTrigger>
+                  <CollapsibleContent className="px-3 py-4">
+                    <Field>
+                      <FieldLabel>Key file</FieldLabel>
+                      <KeyFileInput
+                        onChange={(c) => (keyFileContentsRef.current = c)}
+                        onClear={() => (keyFileContentsRef.current = null)}
+                      />
+                    </Field>
+                  </CollapsibleContent>
+                </Collapsible>
+
+                {!isThrottled && <FieldError>{error}</FieldError>}
+
+                {isThrottled && (
+                  <div className="space-y-1">
+                    <FieldError>
+                      Too many failed attempts. Please wait {countdown} second
+                      {countdown !== 1 ? 's' : ''} before trying again.
+                    </FieldError>
+                    <div className="bg-muted h-1.5 w-full overflow-hidden rounded-full">
+                      <div
+                        className="bg-destructive h-full w-(--throttle-w,0%) rounded-full transition-all duration-1000"
+                        style={
+                          {
+                            '--throttle-w': `${throttle ? (countdown / throttle.waitSeconds) * 100 : 0}%`
+                          } as CSSProperties
+                        }
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <Button
+                  className="w-full"
+                  onClick={handleUnlockVault}
+                  disabled={loading || !password || isThrottled}
+                >
+                  {loading && <Spinner aria-hidden />}
+                  {loading ? 'Unlocking…' : 'Unlock'}
+                </Button>
+
+                <p className="text-center">
+                  <Button
+                    variant="link"
+                    size="sm"
+                    type="button"
+                    onClick={switchToRecovery}
+                    className="text-muted-foreground h-auto p-0 text-xs"
+                  >
+                    Forgot your password? <span className="text-foreground">Use recovery key</span>
+                  </Button>
+                </p>
+
+                <p className="text-center">
+                  <Button
+                    variant="link"
+                    className="text-muted-foreground h-auto p-0 text-xs font-normal"
+                    onClick={(): void => {
+                      void handleCreateNew()
+                    }}
+                  >
+                    Create a new vault
+                  </Button>
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-muted-foreground text-sm">
+                  Enter your 24 recovery words to regain access to your vault.
+                </p>
+
+                <Field>
+                  <FieldLabel htmlFor="unlock-recovery" className="sr-only">
+                    Recovery phrase
+                  </FieldLabel>
+                  <Textarea
+                    id="unlock-recovery"
+                    ref={mnemonicRef}
+                    autoFocus
+                    autoComplete="off"
+                    value={mnemonic}
+                    onChange={(e) => setMnemonic(e.target.value)}
+                    placeholder="Enter your 24-word recovery phrase…"
+                    rows={4}
+                    className="h-26 resize-none font-mono"
+                  />
+                  <FieldDescription>
+                    {mnemonic.trim() !== '' && (
+                      <span
+                        className={`block text-right text-xs ${wordCount === 24 ? 'text-primary' : 'text-destructive'}`}
+                      >
+                        {wordCount}/24 words
+                      </span>
+                    )}
+                    <p className="text-muted-foreground text-xs">
+                      Separate each word with a space or new line.
+                    </p>
+                  </FieldDescription>
+                </Field>
+
+                <Collapsible
+                  open={advancedOpen}
+                  onOpenChange={setAdvancedOpen}
+                  className="rounded-md border-0 transition duration-300 data-[state=open]:border"
+                >
+                  <CollapsibleTrigger asChild>
+                    <Button variant="ghost" className="group w-full justify-start">
+                      Advanced options
+                      <ChevronDownIcon className="ml-auto transition-transform duration-300 group-data-[state=open]:rotate-180" />
+                    </Button>
+                  </CollapsibleTrigger>
+                  <CollapsibleContent className="px-3 py-4">
+                    <Field>
+                      <FieldLabel>Key file</FieldLabel>
+                      <KeyFileInput
+                        onChange={(c) => (recoveryKeyFileContentsRef.current = c)}
+                        onClear={() => (recoveryKeyFileContentsRef.current = null)}
+                      />
+                    </Field>
+                  </CollapsibleContent>
+                </Collapsible>
+
+                <FieldError>{error}</FieldError>
+
+                <Button
+                  className="w-full"
+                  onClick={(): void => {
+                    void handleRecoveryUnlock()
+                  }}
+                  disabled={loading || wordCount !== 24}
+                >
+                  {loading && <Spinner aria-hidden />}
+                  {loading ? 'Recovering…' : 'Recover access'}
+                </Button>
+
+                <p className="text-center">
+                  <Button
+                    variant="link"
+                    size="sm"
+                    type="button"
+                    onClick={switchToPassword}
+                    className="text-muted-foreground h-auto p-0 text-xs"
+                  >
+                    ← Back to unlock
+                  </Button>
+                </p>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+      {/* The sidebar's Help menu doesn't exist while the vault is locked. */}
+      <Button
+        variant="link"
+        className="text-muted-foreground absolute bottom-6 h-auto gap-1 p-0 text-xs font-normal"
+        onClick={() => void openBugReport()}
+        aria-label="Report a bug (opens in your browser)"
+      >
+        Report a bug
+        <ExternalLinkIcon className="size-3" aria-hidden />
+      </Button>
+    </div>
+  )
+}

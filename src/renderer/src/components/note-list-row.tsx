@@ -1,0 +1,151 @@
+import type { ReactNode } from 'react'
+
+import {
+  CopyPlusIcon,
+  DownloadIcon,
+  PinIcon,
+  PinOffIcon,
+  RotateCcwIcon,
+  Trash2Icon
+} from 'lucide-react'
+import { cn } from 'cn'
+
+import { formatTimeAgo } from '@/lib/utils'
+import type { NoteListItem } from '@shared/types'
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger
+} from './ui/context-menu'
+import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip'
+
+interface NoteListRowProps {
+  note: NoteListItem
+  isActive: boolean
+  inTrash: boolean
+  /** Timestamp of the field the list is sorted by. */
+  date: number
+  onSelect: (id: string) => void
+  onPin: (note: NoteListItem) => Promise<void>
+  onDuplicate: (id: string) => Promise<void>
+  onExport: (note: NoteListItem) => void
+  onTrash: (note: NoteListItem) => Promise<void>
+  onRestore: (note: NoteListItem) => Promise<void>
+  onDelete: (note: NoteListItem) => Promise<void>
+}
+
+export function NoteListRow({
+  note,
+  isActive,
+  inTrash,
+  date,
+  onSelect,
+  onPin,
+  onDuplicate,
+  onExport,
+  onTrash,
+  onRestore,
+  onDelete
+}: NoteListRowProps): ReactNode {
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>
+        <button
+          type="button"
+          aria-current={isActive || undefined}
+          className={cn(
+            'relative mb-1.5 w-full rounded-md px-3 py-3.5 text-left transition-colors',
+            'hover:bg-accent focus:outline-none',
+            isActive && 'bg-accent'
+          )}
+          onClick={() => onSelect(note.id)}
+        >
+          {isActive && <span className="selection-indicator" />}
+          <div className="mb-1 flex min-w-0 items-center gap-1.5">
+            {note.isPinned && <PinIcon className="text-primary fill-primary size-3 shrink-0" />}
+            <h3 className="flex-1 truncate text-sm font-medium text-pretty">
+              {note.title || 'Untitled'}
+            </h3>
+          </div>
+          <div className="text-muted-foreground flex min-w-0 items-center gap-1.5 text-xs">
+            <span className="shrink-0 whitespace-nowrap">{formatTimeAgo(date)}</span>
+            {note.tags.length > 0 && (
+              <>
+                <span className="shrink-0 opacity-50">·</span>
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <span
+                    className="size-1.5 shrink-0 rounded-full"
+                    style={{ backgroundColor: note.tags[0].color }}
+                  />
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span className="truncate">{note.tags[0].name}</span>
+                    </TooltipTrigger>
+                    <TooltipContent>{note.tags[0].name}</TooltipContent>
+                  </Tooltip>
+                </span>
+                {note.tags.length > 1 && (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span className="shrink-0">+{note.tags.length - 1}</span>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      {note.tags
+                        .slice(1)
+                        .map((t) => t.name)
+                        .join(', ')}
+                    </TooltipContent>
+                  </Tooltip>
+                )}
+              </>
+            )}
+          </div>
+        </button>
+      </ContextMenuTrigger>
+
+      <ContextMenuContent>
+        {!inTrash ? (
+          <>
+            <ContextMenuItem onClick={() => void onPin(note)}>
+              {note.isPinned ? (
+                <>
+                  <PinOffIcon />
+                  Unpin
+                </>
+              ) : (
+                <>
+                  <PinIcon />
+                  Pin
+                </>
+              )}
+            </ContextMenuItem>
+            <ContextMenuItem onClick={() => void onDuplicate(note.id)}>
+              <CopyPlusIcon />
+              Duplicate
+            </ContextMenuItem>
+            <ContextMenuItem onClick={() => onExport(note)}>
+              <DownloadIcon />
+              Export note…
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+            <ContextMenuItem variant="destructive" onClick={() => void onTrash(note)}>
+              <Trash2Icon /> Move to trash
+            </ContextMenuItem>
+          </>
+        ) : (
+          <>
+            <ContextMenuItem onClick={() => void onRestore(note)}>
+              <RotateCcwIcon /> Restore
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+            <ContextMenuItem variant="destructive" onClick={() => void onDelete(note)}>
+              <Trash2Icon /> Delete permanently
+            </ContextMenuItem>
+          </>
+        )}
+      </ContextMenuContent>
+    </ContextMenu>
+  )
+}
