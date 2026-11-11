@@ -1,0 +1,85 @@
+@import "tailwindcss";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+
+@theme {
+  --font-sans: 'Geist Variable', 'Inter', system-ui, sans-serif;
+  --font-mono: 'Geist Mono Variable', monospace;
+
+  --color-bg: #09090b;
+  --color-surface: #111113;
+  --color-surface-2: #18181b;
+  --color-surface-hover: #222226;
+  --color-line: rgba(255, 255, 255, 0.08);
+  --color-line-hover: rgba(255, 255, 255, 0.16);
+  --color-fg: #fafafa;
+  --color-fg-muted: #a1a1aa;
+  --color-fg-subtle: #71717a;
+
+  --color-accent: #22d3ee;
+  --color-accent-dim: rgba(34, 211, 238, 0.12);
+  --color-accent-border: rgba(34, 211, 238, 0.28);
+
+  --color-ok: #34d399;
+  --color-ok-dim: rgba(52, 211, 153, 0.15);
+  --color-warn: #fbbf24;
+  --color-warn-dim: rgba(251, 191, 36, 0.15);
+  --color-err: #f87171;
+  --color-err-dim: rgba(248, 113, 113, 0.15);
+
+  /* Chart series colors */
+  --color-chart-1: #22d3ee;
+  --color-chart-2: #a78bfa;
+  --color-chart-3: #fbbf24;
+  --color-chart-4: #34d399;
+  --color-chart-5: #f43f5e;
+  --color-chart-6: #38bdf8;
+
+  /* Backward compatibility aliases */
+  --color-accent-blue: #22d3ee;
+  --color-accent-green: #34d399;
+}
+
+@layer base {
+  :root {
+    --background: 240 10% 3.9%;
+    --foreground: 0 0% 98%;
+    --card: 240 10% 3.9%;
+    --card-foreground: 0 0% 98%;
+    --border: 240 3.7% 15.9%;
+  }
+
+  * {
+    border-color: var(--color-line);
+  }
+
+  body {
+    background-color: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Monospace figures across numeric display */
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Thin minimalist scrollbars */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.12);
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.22);
+  }
+}
