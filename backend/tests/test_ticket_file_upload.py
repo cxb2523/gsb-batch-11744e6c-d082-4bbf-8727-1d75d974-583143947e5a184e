@@ -17,6 +17,11 @@ import pytest
 
 from app.core import settings as settings_mod
 from app.core import storage as storage_mod
+from app.core.file_validation import (
+    DECLARED_MIME_EXTENSION_MISMATCH,
+    EXTENSION_NOT_ALLOWED,
+    REASON_HEADER,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -104,3 +109,45 @@ async def test_nameless_upload_is_rejected(api, seeded):
     # is the backstop for a genuinely None filename. Either way nothing is stored.
     assert resp.status_code in (400, 422)
     assert await seeded.ticket_files.count_documents({"ticket_id": TICKET}) == 0
+
+
+async def test_rejection_exposes_stable_reason_header(api, seeded):
+    # The prose stays in detail (the existing contract); the machine-readable
+    # reason is delivered through a dedicated header so the front end can branch
+    # without parsing human-readable text.
+    resp = await api.post(
+        URL, files=[("files", ("malware.exe", b"MZ...", "image/png"))]
+    )
+    assert resp.status_code == 400
+    assert resp.headers[REASON_HEADER] == EXTENSION_NOT_ALLOWED
+
+    # A declared MIME that contradicts an allowed extension gets its own code.
+    resp = await api.post(
+        URL,
+        files=[("files", ("shot.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 32,
+                           "application/pdf"))],
+    )
+    assert resp.status_code == 400
+    assert resp.headers[REASON_HEADER] == DECLARED_MIME_EXTENSION_MISMATCH
+    assert await seeded.ticket_files.count_documents({"ticket_id": TICKET}) == 0
+
+
+async def test_multi_file_upload_is_atomic_on_rejection(api, seeded):
+    # First file is valid; the second is an executable disguised as a PDF. The
+    # whole request must fail and nothing from either file may be stored or
+    # recorded — validation completes for every file before any write.
+    good_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    resp = await api.post(
+        URL,
+        files=[
+            ("files", ("first.png", good_png, "image/png")),
+            ("files", ("second.pdf", b"MZ\x90\x00" + b"\x00" * 32, "application/pdf")),
+        ],
+    )
+    assert resp.status_code == 400
+    assert await seeded.ticket_files.count_documents({"ticket_id": TICKET}) == 0
+    # And no physical object was left behind in the tickets storage folder.
+    storage = storage_mod.get_storage()
+    folder = storage.local_path("tickets", "probe").parent
+    assert not folder.exists() or not any(folder.iterdir())
+

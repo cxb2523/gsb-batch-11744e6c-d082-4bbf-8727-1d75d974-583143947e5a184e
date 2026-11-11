@@ -16,7 +16,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pymongo import ReturnDocument
 
-from ...core.file_security import signature_mismatch
+from ...core.file_validation import (
+    ALLOWED_FILE_EXTENSIONS,
+    REASON_HEADER,
+    validate_upload,
+)
 from ...core.storage import get_storage, serve_stored_file
 from ...db.mongo import get_mongo_db
 from ...db.queries import NOT_ARCHIVED
@@ -66,21 +70,28 @@ def _storage_key(stored_path: str) -> str:
     """
     return Path(str(stored_path or "").replace("\\", "/")).name
 
-# Curated allowlist of attachment extensions. We validate by extension rather than
-# the browser-supplied content_type (which is trivially spoofable). Downloads default
-# to attachments; the inline/preview path (see download_ticket_file) renders in-browser
-# but ships a sandbox CSP + nosniff so an uploaded SVG/HTML can't run script on our
-# origin, which is what keeps this list safe to broaden beyond images/PDF.
-ALLOWED_FILE_EXTENSIONS = {
-    # Images
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg",
-    # Documents
-    ".pdf", ".md", ".markdown", ".txt", ".log", ".rtf",
-    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    # Data / archives
-    ".csv", ".json", ".zip",
-}
+# Curated allowlist of attachment extensions lives in app.core.file_validation
+# next to the three-way validator that enforces it; re-exported here for
+# backwards compatibility. Downloads default to attachments; the inline/preview
+# path (see download_ticket_file) renders in-browser but ships a sandbox CSP +
+# nosniff so an uploaded SVG/HTML can't run script on our origin, which is what
+# keeps this list safe to broaden beyond images/PDF.
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+# Stable reason code for the size gate, which runs in the route rather than the
+# pure validator (it is a transport limit, not a content-consistency check).
+FILE_TOO_LARGE_REASON = "file_too_large"
+
+
+def _validation_error(message: str, reason: str) -> HTTPException:
+    """Build a 400 whose prose stays in ``detail`` and whose stable,
+    machine-readable reason is exposed via a dedicated response header so the
+    front end never has to parse human-readable text."""
+    return HTTPException(
+        status_code=400,
+        detail=message,
+        headers={REASON_HEADER: reason},
+    )
 
 @router.get("/{project_id}/tickets/{ticket_id}/files", response_model=List[TicketFileOut])
 async def get_ticket_files(
@@ -154,86 +165,107 @@ async def upload_ticket_files(
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
-    uploaded_files = []
-
+    # Phase 1 — read and fully validate EVERY file before touching the counter,
+    # storage or the database. A multi-file upload is atomic at the validation
+    # boundary: any single rejection fails the whole request and, because no
+    # side effects have happened yet, nothing partial is ever left behind.
+    staged = []  # (safe_filename, declared_content_type, file_size, bytes)
     for file in files:
         # Strip any directory components a client may have smuggled into the name
         # so it can never escape the tickets storage folder (path traversal).
         safe_filename = Path(file.filename or "").name
-        if not safe_filename:
-            raise HTTPException(status_code=400, detail="File is missing a name.")
 
-        # Validate by extension against the curated allowlist.
-        file_ext = Path(safe_filename).suffix.lower()
-        if file_ext not in ALLOWED_FILE_EXTENSIONS:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"File {safe_filename} has an unsupported type "
-                    f"({file_ext or 'no extension'})."
-                ),
-            )
-
-        # Check file size (10MB limit)
+        # Read first so the size gate and the pure validator both work on bytes;
+        # nothing is written in this phase regardless of the outcome.
         file_content = await file.read()
         file_size = len(file_content)
         if file_size > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File {safe_filename} exceeds 10MB size limit."
+            raise _validation_error(
+                f"File {safe_filename} exceeds 10MB size limit.",
+                FILE_TOO_LARGE_REASON,
             )
 
-        # The extension check above trusts the (client-chosen) name. Verify the
-        # real content signature so a file renamed to dodge the allowlist — e.g.
-        # an .exe saved as report.pdf — is rejected before it lands on disk.
-        mismatch = signature_mismatch(safe_filename, file_content)
-        if mismatch:
-            raise HTTPException(status_code=400, detail=mismatch)
+        # Three-way consistency check: declared MIME vs extension vs real
+        # content signature. Returns a structured verdict with a stable reason
+        # code; signature semantics (text/OOXML/OLE) come from file_security.
+        verdict = validate_upload(file.filename, file.content_type, file_content)
+        if not verdict.ok:
+            raise _validation_error(verdict.message, verdict.reason)
 
-        # Generate file number
-        counter = await counters_collection.find_one_and_update(
-            {"_id": f"files_{ticket_id}"},
-            {"$inc": {"seq": 1}},
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
+        staged.append(
+            (verdict.filename, file.content_type or "application/octet-stream",
+             file_size, file_content)
         )
-        file_number = int(counter.get("seq", 1))
 
-        # Create unique filename (the bare key we persist and serve by)
-        unique_filename = f"{ticket_id}_{file_number}_{safe_filename}"
+    # Phase 2 — all files passed. Persist them, tracking every object and DB
+    # document created so a failure midway (storage error, DB hiccup) rolls the
+    # whole batch back instead of leaving orphaned blobs or half-written rows.
+    uploaded_files = []
+    stored_keys: List[str] = []
+    inserted_ids: List = []
+    try:
+        for safe_filename, stored_content_type, file_size, file_content in staged:
+            # Generate file number
+            counter = await counters_collection.find_one_and_update(
+                {"_id": f"files_{ticket_id}"},
+                {"$inc": {"seq": 1}},
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+            file_number = int(counter.get("seq", 1))
 
-        # Save via the shared storage backend (see app/core/storage.py).
-        get_storage().save(STORAGE_CATEGORY, unique_filename, file_content)
+            # Create unique filename (the bare key we persist and serve by)
+            unique_filename = f"{ticket_id}_{file_number}_{safe_filename}"
 
-        # Create file document
-        file_doc = {
-            "file_number": file_number,
-            "ticket_id": ticket_id,
-            "project_id": project_id,  # CRITICAL: Include project_id to prevent cross-project contamination
-            "filename": safe_filename,
-            # Store only the relative key, not the absolute path, so it stays
-            # valid on any machine / backend. Resolved via the storage backend.
-            "file_path": unique_filename,
-            "file_type": file.content_type or "application/octet-stream",
-            "file_size": file_size,
-            "uploader_email": current_user.email,
-            "created_at": datetime.now(timezone.utc),
-        }
+            # Save via the shared storage backend (see app/core/storage.py).
+            get_storage().save(STORAGE_CATEGORY, unique_filename, file_content)
+            stored_keys.append(unique_filename)
 
-        await files_collection.insert_one(file_doc)
+            # Create file document
+            file_doc = {
+                "file_number": file_number,
+                "ticket_id": ticket_id,
+                "project_id": project_id,  # CRITICAL: Include project_id to prevent cross-project contamination
+                "filename": safe_filename,
+                # Store only the relative key, not the absolute path, so it stays
+                # valid on any machine / backend. Resolved via the storage backend.
+                "file_path": unique_filename,
+                "file_type": stored_content_type,
+                "file_size": file_size,
+                "uploader_email": current_user.email,
+                "created_at": datetime.now(timezone.utc),
+            }
 
-        uploaded_files.append({
-            "id": file_number,
-            "ticket_id": ticket_id,
-            "filename": safe_filename,
-            # Return the relative key only, never the absolute server path.
-            "file_path": unique_filename,
-            "file_type": file.content_type or "application/octet-stream",
-            "file_size": file_size,
-            "uploader_email": current_user.email,
-            "created_at": file_doc["created_at"].isoformat(),
-        })
-    
+            insert_result = await files_collection.insert_one(file_doc)
+            inserted_ids.append(insert_result.inserted_id)
+
+            uploaded_files.append({
+                "id": file_number,
+                "ticket_id": ticket_id,
+                "filename": safe_filename,
+                # Return the relative key only, never the absolute server path.
+                "file_path": unique_filename,
+                "file_type": stored_content_type,
+                "file_size": file_size,
+                "uploader_email": current_user.email,
+                "created_at": file_doc["created_at"].isoformat(),
+            })
+    except Exception:
+        # Roll back everything this request wrote. The counter increment is
+        # intentionally not rewound: it only governs key uniqueness, and a gap
+        # in the sequence is harmless (rewinding would risk key collisions).
+        for key in reversed(stored_keys):
+            try:
+                get_storage().delete(STORAGE_CATEGORY, key)
+            except Exception:  # best-effort cleanup; never mask the original error
+                logger.exception("Failed to roll back stored ticket file %s", key)
+        for doc_id in inserted_ids:
+            try:
+                await files_collection.delete_one({"_id": doc_id})
+            except Exception:
+                logger.exception("Failed to roll back ticket file document %s", doc_id)
+        raise
+
     # Create notifications for file uploads
     if uploaded_files:
         await create_ticket_notifications(
