@@ -24,6 +24,21 @@ In DSH, open **Settings → Audio Analysis** and follow the Engine installation 
 
 **Scope:** this is an evidence tool, not an automatic composition or mixing-settings recommender. Measurements, recognition candidates, and musical interpretation are different things.
 
+## Development and tests
+
+Stem-separation status (4-stem / 6-stem) lives in the pure module `lib/stem-status.js`. It takes a plain-data snapshot (dependency probe results, model-directory file names, optional byte sizes) and returns a structured diagnosis: per-track availability, missing dependencies and model files, total model size, and an ordered checklist. Both host overview branches (module / legacy) and the settings panel consume this single result.
+
+The automated tests run fully offline — no real Python engine, network, or real model files — using Node's built-in test runner (no dependencies to install):
+
+```bash
+npm test
+```
+
+Tests live in `test/` and are auto-discovered by `node --test`:
+
+- `test/stem-status.test.js` — happy / negative / edge paths of the pure module (missing dependency, 6-stem model only, empty directory, unrelated files, missing byte sizes counted as 0).
+- `test/overview-stem-status.test.js` — host overview wiring, asserting the `stemStatus` field exists and stays consistent with the legacy boolean semantics of `components.stems` (true when at least one stem kind is available).
+
 ## Project and license
 
 [Music Evidence Engine](https://github.com/ALittleLov/music-evidence-engine) · [Latest Soundcheck release](https://github.com/ALittleLov/dsh-soundcheck/releases/latest)

@@ -26,6 +26,9 @@ window.__ModuleLoader__.load({
       loading: '加载中…', loadFailed: '状态读取失败', retry: '重试',
       venv: 'venv', data: '数据目录', temp: '临时目录', writable: '可写', notWritable: '不可写',
       checkedAt: '检查于',
+      stemReady: '已就绪', stemNotReady: '未就绪', stemMissing: '未安装',
+      stemMissingDep: '缺少依赖', stemMissingModel: '缺少模型',
+      stemTotalSize: '已装模型总大小', stemSizeUnknown: '部分大小未知，按 0 统计',
     }
     const en = {
       nav: 'Audio', title: 'dsh-soundcheck', subtitle: 'Local audio engine',
@@ -46,6 +49,9 @@ window.__ModuleLoader__.load({
       loading: 'Loading…', loadFailed: 'Failed to load status', retry: 'Retry',
       venv: 'venv', data: 'Data dir', temp: 'Temp dir', writable: 'writable', notWritable: 'not writable',
       checkedAt: 'checked at',
+      stemReady: 'ready', stemNotReady: 'not ready', stemMissing: 'not installed',
+      stemMissingDep: 'missing dependency', stemMissingModel: 'missing model',
+      stemTotalSize: 'Installed models total', stemSizeUnknown: 'some sizes unknown, counted as 0',
     }
     let t = (k) => k
 
@@ -291,6 +297,41 @@ window.__ModuleLoader__.load({
           ? h('div', { style: { padding: '8px 0 2px 14px' } }, body)
           : null)
 
+      // ── 分轨状态：4 轨 / 6 轨各自的就绪状态与缺失原因（数据来自宿主的 stemStatus 纯诊断）──
+      const stem = d.stemStatus || null
+      // 老宿主不下发 stemStatus 时退回 components.stems 的单布尔语义，面板不崩
+      const stemLine = (s) => {
+        if (!stem) return null
+        const parts = []
+        if (s.missingDependencies && s.missingDependencies.length) {
+          parts.push(t('stemMissingDep') + '：' + s.missingDependencies.join('、'))
+        }
+        if (s.missingModels && s.missingModels.length) {
+          parts.push(t('stemMissingModel') + '：' + s.missingModels.join('、'))
+        }
+        return parts.length ? parts.join('；') : null
+      }
+      const stemSummaryOf = (s) => {
+        if (!stem) return s.available ? t('installed') : t('notInstalled')
+        return s.available ? t('stemReady') : t('stemNotReady')
+      }
+      const renderStemDetail = (s) => h('div', { style: C.detailBox },
+        h('div', { style: C.detailLine },
+          h('span', { style: C.detailName }, s.label),
+          h('span', { style: { ...C.detailVal, ...(s.available ? C.ok : C.bad) } }, stemSummaryOf(s))),
+        h('div', { style: C.detailLine },
+          h('span', { style: C.detailName }, s.modelFile),
+          h('span', { style: { ...C.detailVal, ...(stem && stem.models && stem.models[s.key] && stem.models[s.key].exists ? {} : C.bad) } },
+            stem && stem.models && stem.models[s.key] && stem.models[s.key].exists
+              ? (stem.models[s.key].size_mb ? stem.models[s.key].size_mb + ' MB' : '0 MB')
+              : t('missing'))),
+        stemLine(s)
+          ? h('div', { style: { fontSize: '12px', color: C.bad.color, overflowWrap: 'anywhere' } }, stemLine(s))
+          : null,
+        s.warnings && s.warnings.length
+          ? h('div', { style: { fontSize: '12px', color: C.warn.color, overflowWrap: 'anywhere' } }, s.warnings.join('；'))
+          : null)
+
       return h('div', { style: C.wrap },
         h('div', { style: C.head },
           h('div', null,
@@ -365,10 +406,28 @@ window.__ModuleLoader__.load({
               h('span', { style: { ...C.detailVal, ...(m && m.ok ? {} : C.bad) } }, m && m.ok ? (m.size_mb ? m.size_mb + ' MB' : t('installed')) : t('missing')))
           }))),
           h(Item, {
-            title: '音轨分离（4 轨）',
-            desc: optionalStems ? '已就绪：人声 / 鼓 / 贝斯 / 其他' : '未安装：人声 / 鼓 / 贝斯 / 其他',
+            title: '音轨分离（4 轨 / 6 轨）',
+            desc: stem
+              ? (() => {
+                const s4 = stem.stems4.available ? t('stemReady') : t('stemNotReady')
+                const s6 = stem.stems6.available ? t('stemReady') : t('stemNotReady')
+                return '4 轨：' + s4 + ' · 6 轨：' + s6
+              })()
+              : (optionalStems ? '已就绪：人声 / 鼓 / 贝斯 / 其他' : '未安装：人声 / 鼓 / 贝斯 / 其他'),
             tone: optionalStems ? null : C.bad.color,
-          }, null),
+            onClick: () => setOpenKey((k) => (k === 'stems' ? '' : 'stems')),
+            open: openKey === 'stems',
+          }, stem
+            ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
+                renderStemDetail(stem.stems4),
+                renderStemDetail(stem.stems6),
+                h('div', { style: C.detailLine },
+                  h('span', { style: C.detailName }, t('stemTotalSize')),
+                  h('span', { style: C.detailVal }, stem.totalSizeDisplay || (stem.totalSizeMb + ' MB'))),
+                stem.totalBytesKnown === false
+                  ? h('div', { style: { fontSize: '12px', color: C.warn.color } }, t('stemSizeUnknown'))
+                  : null)
+            : null),
           h(Item, {
             title: t('dirs'),
             desc: d.temp ? '检查通过' : '临时目录不可写',
@@ -388,7 +447,12 @@ window.__ModuleLoader__.load({
           }, h('div', null,
             h(Item, {
               title: '音轨分离（6 轨）',
-              desc: '在 4 轨基础上再分吉他 / 钢琴',
+              desc: stem
+                ? ('在 4 轨基础上再分吉他 / 钢琴 · '
+                  + (stem.stems6.available ? t('stemReady') : t('stemNotReady'))
+                  + (stemLine(stem.stems6) ? '（' + stemLine(stem.stems6) + '）' : ''))
+                : '在 4 轨基础上再分吉他 / 钢琴',
+              tone: stem && !stem.stems6.available ? C.bad.color : null,
               action: h('span', { style: C.btnRow },
                 h('button', { style: C.btn, disabled: !!busy, onClick: (e) => { e.stopPropagation(); act('stems6s') } }, '安装 6 轨')),
             }),

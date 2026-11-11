@@ -24,6 +24,21 @@
 
 **定位**：这是证据工具，不是自动作曲/混音参数推荐器；测量数据、候选识别和音乐意义应加以区分。
 
+## 开发与测试
+
+分轨能力（4 轨 / 6 轨）的判定抽在纯函数模块 `lib/stem-status.js`：只吃依赖探测结果、模型目录文件名与字节数的纯数据快照，输出结构化诊断（各自可用性、缺失的依赖与模型、模型总大小、有序检查项）。宿主两条 overview 分支（module / legacy）与设置面板共用这一份结论。
+
+自动化测试完全离线，不依赖真实 Python 引擎、网络或真实模型文件，使用 Node 内置测试运行器（无需安装依赖）：
+
+```bash
+npm test
+```
+
+测试位于 `test/`，由 `node --test` 自动发现：
+
+- `test/stem-status.test.js`：纯模块的正常 / 负向 / 边界路径（依赖缺失、仅 6 轨模型、空目录、无关文件、字节数缺失按 0 处理等）。
+- `test/overview-stem-status.test.js`：宿主 overview 装配，验证返回对象中的 `stemStatus` 字段存在且与 `components.stems` 的旧布尔语义（至少一种分轨可用）一致。
+
 ## 项目与许可
 
 [Music Evidence Engine（独立引擎）](https://github.com/ALittleLov/music-evidence-engine) · [最新 Soundcheck 版本](https://github.com/ALittleLov/dsh-soundcheck/releases/latest)

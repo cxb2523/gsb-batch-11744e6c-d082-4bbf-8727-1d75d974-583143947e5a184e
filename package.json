@@ -4,6 +4,9 @@
   "description": "Local music analysis for DSH: audio -> a short human-readable verdict",
   "type": "module",
   "main": "lib/index.js",
+  "scripts": {
+    "test": "node --test"
+  },
   "exports": {
     ".": {
       "default": "./lib/index.js"
