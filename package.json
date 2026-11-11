@@ -1,0 +1,52 @@
+{
+    "name": "@feds01/graphika",
+    "version": "1.0.0",
+    "description": "A fast JavaScript library to draw elegant graphs ",
+    "keywords": [
+        "canvas",
+        "charts",
+        "fast",
+        "graphing"
+    ],
+    "homepage": "https://github.com/feds01/Graphika#readme",
+    "bugs": {
+        "url": "https://github.com/feds01/Graphika/issues"
+    },
+    "license": "ISC",
+    "author": "Alexander Fedotov",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/feds01/Graphika.git"
+    },
+    "type": "module",
+    "main": "dist/graphika.js",
+    "scripts": {
+        "test": "vitest run",
+        "build": "rolldown -c",
+        "watch": "rolldown --config rolldown.config.js --watch",
+        "fmt": "oxfmt",
+        "lint": "oxlint",
+        "check": "tsc --noEmit",
+        "docs:dev": "vitepress dev docs",
+        "docs:build": "npm run docs:typedoc && vitepress build docs",
+        "docs:preview": "vitepress preview docs",
+        "docs:typedoc": "typedoc"
+    },
+    "devDependencies": {
+        "globals": "^17.14.0",
+        "oxfmt": "^0.77.0",
+        "oxlint": "^1.90.0",
+        "rolldown": "^1.3.0",
+        "tslib": "^2.9.1",
+        "typedoc": "^0.28.20",
+        "typedoc-plugin-markdown": "^4.14.1",
+        "typescript": "^6.0.3",
+        "vitepress": "^1.6.4",
+        "vitest": "^5.1.0"
+    },
+    "overrides": {
+        "vitepress": {
+            "vite": "^6.4.5"
+        }
+    }
+}

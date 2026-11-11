@@ -1,0 +1,108 @@
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <title>Graphika: Basic example</title>
+
+        <link
+            href="https://fonts.googleapis.com/css?family=Roboto+Mono"
+            rel="stylesheet"
+        />
+        <style>
+            #graph {
+                padding: 1em;
+                display: block;
+                margin: 0 auto;
+                font-family: "Roboto Mono", monospace;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="graph">
+            <canvas width="800" height="600"></canvas>
+        </div>
+
+        <script src="../dist/graphika.js"></script>
+        <script>
+            function getRandomInt(min, max) {
+                return Math.floor(Math.random() * (max - min + 1)) + min;
+            }
+
+            function getRandomArray(length, min, max) {
+                let array = [];
+
+                for (let x = 0; x < length; x++) {
+                    array.push(getRandomInt(min, max));
+                }
+                return array;
+            }
+
+            const dataset = {
+                0: getRandomArray(21, 1000, 2000).sort(),
+                1: getRandomArray(21, 1000, 2000).sort(),
+            };
+
+            const { Colours, Graph: LineGraph } = Graph.default;
+
+            const graph = new LineGraph(
+                "graph",
+                {
+                    x_label: "X-Label",
+                    y_label: "Y-Label",
+                    title: {
+                        content: "Graphika ✨",
+                        position: "top",
+                    },
+                    grid: {
+                        gridded: true,
+                        // Share zero between x & y axis' if applicable.
+                        sharedZero: true,
+                        optimiseSquareSize: true,
+                        gridded: true,
+                        strict: false,
+                    },
+                    scale: {
+                        shorthandNumerics: true,
+                    },
+                    legend: {
+                        draw: true,
+                        position: "top",
+                        alignment: "start",
+                    },
+                    animation: {
+                        enabled: true,
+                        duration: 1200,
+                    },
+                    tooltip: {
+                        enabled: true,
+                    },
+                },
+                [
+                    {
+                        style: "dashed",
+                        label: "student_1",
+                        interpolation: "linear",
+                        data: dataset[0],
+                        colour: Colours.FLAMINGO_RED,
+                        area: {
+                            fill: Colours.FLAMINGO_RED,
+                        },
+                        annotatePoints: true,
+                    },
+                    {
+                        label: "student_2",
+                        interpolation: "cubic",
+                        data: dataset[1],
+                        colour: Colours.ELECTRIC_BLUE,
+                        area: {
+                            fill: Colours.ELECTRIC_BLUE,
+                        },
+                    },
+                ]
+            );
+
+            console.time("graph_draw");
+            graph.draw();
+            console.timeEnd("graph_draw");
+        </script>
+    </body>
+</html>

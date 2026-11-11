@@ -1,0 +1,553 @@
+/* Custom styles for GraphDemo component */
+.graph-demo {
+    border: 1px solid var(--vp-c-divider);
+    border-radius: 8px;
+    margin: 16px 0;
+    overflow: hidden;
+    transition:
+        border-color 0.25s,
+        background-color 0.25s;
+}
+
+.graph-demo-preview {
+    padding: 24px;
+    background: var(--vp-c-bg-soft);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 300px;
+}
+
+.graph-demo-preview .graph-container {
+    max-width: 100%;
+    background: white;
+    border-radius: 4px;
+}
+
+.graph-demo-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 8px 16px;
+    border-top: 1px solid var(--vp-c-divider);
+    border-bottom: 1px solid var(--vp-c-divider);
+    background: var(--vp-c-bg);
+}
+
+.graph-demo-actions button {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    border: none;
+    background: transparent;
+    color: var(--vp-c-text-2);
+    cursor: pointer;
+    font-size: 13px;
+    border-radius: 4px;
+    transition:
+        color 0.2s,
+        background 0.2s;
+}
+
+.graph-demo-actions button:hover {
+    color: var(--vp-c-text-1);
+    background: var(--vp-c-bg-soft);
+}
+
+.graph-demo-actions button.copied {
+    color: var(--vp-c-green-1);
+}
+
+.graph-demo-code {
+    overflow: hidden;
+    transition: max-height 0.3s ease;
+    background: var(--vp-code-block-bg);
+}
+
+.graph-demo-code.collapsed {
+    max-height: 0;
+}
+
+.graph-demo-code.expanded {
+    max-height: 600px;
+}
+
+.graph-demo-code .code-wrapper {
+    max-height: 500px;
+    overflow: auto;
+}
+
+.graph-demo-code .code-wrapper pre {
+    margin: 0;
+    padding: 20px 24px;
+    background: transparent !important;
+    font-size: 14px;
+    line-height: 1.7;
+    overflow: visible;
+    border-radius: 0;
+}
+
+.graph-demo-code .code-wrapper code {
+    font-family: var(--vp-font-family-mono);
+    white-space: pre;
+}
+
+/* ===== Dark Mode Adjustments ===== */
+
+/* Graph container backgrounds */
+.dark .graph-demo-preview .graph-container {
+    background: #1e1e1e;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.dark .graph-demo {
+    border-color: var(--vp-c-divider);
+}
+
+.dark .graph-demo-actions {
+    background: var(--vp-c-bg-alt);
+}
+
+/* Interactive Demo Component */
+.interactive-demo {
+    border: 1px solid var(--vp-c-divider);
+    border-radius: 8px;
+    margin: 16px 0;
+    overflow: hidden;
+}
+
+.interactive-demo-content {
+    display: flex;
+    flex-direction: column;
+}
+
+.interactive-demo-preview {
+    padding: 24px;
+    background: var(--vp-c-bg-soft);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.interactive-demo-preview .graph-container {
+    max-width: 100%;
+    background: white;
+    border-radius: 4px;
+}
+
+.dark .interactive-demo-preview .graph-container {
+    background: #1e1e1e;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.dark .interactive-demo {
+    border-color: var(--vp-c-divider);
+}
+
+.dark .interactive-demo-controls {
+    background: var(--vp-c-bg-alt);
+}
+
+.dark .interactive-demo-actions {
+    background: var(--vp-c-bg-alt);
+}
+
+/* Dark mode for control inputs */
+.dark .control-section {
+    background: var(--vp-c-bg);
+    border: 1px solid var(--vp-c-divider);
+}
+
+.dark .control-group input[type="text"],
+.dark .control-group select {
+    background: var(--vp-c-bg-alt);
+    border-color: var(--vp-c-divider);
+    color: var(--vp-c-text-1);
+}
+
+.dark .control-group input[type="text"]:focus,
+.dark .control-group select:focus {
+    border-color: var(--vp-c-brand-1);
+    box-shadow: 0 0 0 2px rgba(var(--vp-c-brand-1-rgb), 0.2);
+}
+
+.dark .control-group select option {
+    background: var(--vp-c-bg);
+    color: var(--vp-c-text-1);
+}
+
+.interactive-demo-controls {
+    padding: 16px 20px;
+    background: var(--vp-c-bg);
+    border-top: 1px solid var(--vp-c-divider);
+}
+
+.interactive-demo-controls .control-sections {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 20px;
+}
+
+.control-section {
+    padding: 12px;
+    background: var(--vp-c-bg-soft);
+    border-radius: 6px;
+}
+
+.control-section h4 {
+    margin: 0 0 12px 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--vp-c-text-1);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.control-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.control-group label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--vp-c-text-2);
+}
+
+.control-group label span {
+    min-width: 80px;
+    flex-shrink: 0;
+}
+
+.control-group label.checkbox {
+    cursor: pointer;
+}
+
+.control-group label.checkbox span {
+    min-width: auto;
+}
+
+.control-group input[type="text"],
+.control-group select {
+    flex: 1;
+    padding: 4px 8px;
+    border: 1px solid var(--vp-c-divider);
+    border-radius: 4px;
+    background: var(--vp-c-bg);
+    color: var(--vp-c-text-1);
+    font-size: 13px;
+    min-width: 0;
+}
+
+.control-group input[type="text"]:focus,
+.control-group select:focus {
+    outline: none;
+    border-color: var(--vp-c-brand-1);
+}
+
+.control-group input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
+    accent-color: var(--vp-c-brand-1);
+}
+
+.control-group select:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Interactive Demo Actions Bar */
+.interactive-demo-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 8px 16px;
+    border-top: 1px solid var(--vp-c-divider);
+    background: var(--vp-c-bg);
+}
+
+.interactive-demo-actions button {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    border: none;
+    background: transparent;
+    color: var(--vp-c-text-2);
+    cursor: pointer;
+    font-size: 13px;
+    border-radius: 4px;
+    transition:
+        color 0.2s,
+        background 0.2s;
+}
+
+.interactive-demo-actions button:hover {
+    color: var(--vp-c-text-1);
+    background: var(--vp-c-bg-soft);
+}
+
+.interactive-demo-actions button.copied {
+    color: var(--vp-c-green-1);
+}
+
+/* Interactive Demo Code Block */
+.interactive-demo-code {
+    overflow: hidden;
+    transition: max-height 0.3s ease;
+    background: var(--vp-code-block-bg);
+}
+
+.interactive-demo-code.collapsed {
+    max-height: 0;
+}
+
+.interactive-demo-code.expanded {
+    max-height: 500px;
+}
+
+.interactive-demo-code .code-wrapper {
+    max-height: 400px;
+    overflow: auto;
+}
+
+.interactive-demo-code .code-wrapper pre {
+    margin: 0;
+    padding: 20px 24px;
+    background: transparent !important;
+    font-size: 14px;
+    line-height: 1.7;
+    overflow: visible;
+    border-radius: 0;
+}
+
+.interactive-demo-code .code-wrapper code {
+    font-family: var(--vp-font-family-mono);
+    white-space: pre;
+}
+
+/* Shiki dual-theme support - match VitePress theme */
+.shiki,
+.shiki span {
+    color: var(--shiki-light);
+    background-color: transparent;
+}
+
+.dark .shiki,
+.dark .shiki span {
+    color: var(--shiki-dark);
+    background-color: transparent;
+}
+
+/* Dark mode for debug panel */
+.dark .graph-demo-debug {
+    background: var(--vp-c-bg-alt);
+}
+
+/* Debug Panel Styles */
+.graph-demo-debug {
+    overflow: hidden;
+    transition: max-height 0.3s ease;
+    background: var(--vp-c-bg-soft);
+    border-top: 1px solid var(--vp-c-divider);
+}
+
+.graph-demo-debug.collapsed {
+    max-height: 0;
+    border-top: none;
+}
+
+.graph-demo-debug.expanded {
+    max-height: 200px;
+}
+
+.graph-demo-debug .debug-wrapper {
+    padding: 16px 24px;
+}
+
+.graph-demo-debug .debug-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 16px;
+}
+
+.graph-demo-debug .debug-item {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.graph-demo-debug .debug-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--vp-c-text-3);
+}
+
+.graph-demo-debug .debug-value {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--vp-c-text-1);
+    font-family: var(--vp-font-family-mono);
+}
+
+/* ===== Mobile Responsive Styles ===== */
+
+/* Graph Demo Mobile */
+@media (max-width: 768px) {
+    .graph-demo {
+        margin: 12px 0;
+    }
+
+    .graph-demo-preview {
+        padding: 16px 12px;
+        min-height: auto;
+    }
+
+    .graph-demo-preview .graph-container {
+        max-width: 100%;
+        height: auto;
+        aspect-ratio: 16 / 10;
+        min-height: 250px;
+    }
+
+    .graph-demo-preview .graph-container canvas {
+        width: 100% !important;
+        height: 100% !important;
+    }
+
+    .graph-demo-actions {
+        padding: 6px 12px;
+        flex-wrap: wrap;
+        justify-content: center;
+    }
+
+    .graph-demo-actions button {
+        font-size: 12px;
+        padding: 6px 10px;
+    }
+
+    .graph-demo-code .code-wrapper pre {
+        padding: 12px 16px;
+        font-size: 12px;
+    }
+}
+
+/* Interactive Demo Mobile */
+@media (max-width: 768px) {
+    .interactive-demo {
+        margin: 12px 0;
+    }
+
+    .interactive-demo-preview {
+        padding: 16px 12px;
+    }
+
+    .interactive-demo-preview .graph-container {
+        max-width: 100%;
+        height: auto;
+        aspect-ratio: 16 / 10;
+        min-height: 280px;
+    }
+
+    .interactive-demo-preview .graph-container canvas {
+        width: 100% !important;
+        height: 100% !important;
+    }
+
+    .interactive-demo-preview .graph-demo {
+        border: none;
+        margin: 0;
+    }
+
+    .interactive-demo-preview .graph-demo-preview {
+        padding: 0;
+        background: transparent;
+    }
+
+    .interactive-demo-controls {
+        padding: 12px;
+    }
+
+    .interactive-demo-controls .control-sections {
+        grid-template-columns: 1fr;
+        gap: 12px;
+    }
+
+    .control-section {
+        padding: 10px;
+    }
+
+    .control-section h4 {
+        font-size: 12px;
+        margin-bottom: 10px;
+    }
+
+    .control-group {
+        gap: 6px;
+    }
+
+    .control-group label {
+        font-size: 12px;
+        flex-wrap: wrap;
+    }
+
+    .control-group label span {
+        min-width: 70px;
+    }
+
+    .control-group input[type="text"],
+    .control-group select {
+        font-size: 12px;
+        padding: 6px 8px;
+    }
+
+    .interactive-demo-actions {
+        padding: 6px 12px;
+        flex-wrap: wrap;
+        justify-content: center;
+    }
+
+    .interactive-demo-actions button {
+        font-size: 12px;
+        padding: 6px 10px;
+    }
+
+    .interactive-demo-code .code-wrapper pre {
+        padding: 12px 16px;
+        font-size: 11px;
+    }
+}
+
+/* Small mobile devices */
+@media (max-width: 480px) {
+    .graph-demo-preview .graph-container,
+    .interactive-demo-preview .graph-container {
+        min-height: 220px;
+    }
+
+    .interactive-demo-controls .control-sections {
+        gap: 10px;
+    }
+
+    .control-group label {
+        gap: 6px;
+    }
+
+    .control-group label span {
+        min-width: 60px;
+        font-size: 11px;
+    }
+
+    .control-group input[type="text"],
+    .control-group select {
+        font-size: 11px;
+        padding: 5px 6px;
+    }
+}
