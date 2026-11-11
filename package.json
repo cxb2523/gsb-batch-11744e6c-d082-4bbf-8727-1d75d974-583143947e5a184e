@@ -1,0 +1,9 @@
+{
+  "name": "tsparticles-confetti-static-site",
+  "private": true,
+  "type": "module",
+  "description": "Static site for tsParticles Confetti, plus a pure-data EmitterInstance runtime audit module and its local tests.",
+  "scripts": {
+    "test": "node --test tests/EmitterAudit.test.js"
+  }
+}
